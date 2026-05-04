@@ -26,6 +26,25 @@ def get_conn():
     return duckdb.connect(str(config.DB_PATH))
 
 
+def _migrate_trade_log_columns(con):
+    """
+    Add kite_order_id / kite_sl_order_id / kite_status to existing trade_log
+    tables that pre-date this feature.  Idempotent.
+    """
+    kite_cols = [
+        ("kite_order_id",    "VARCHAR"),
+        ("kite_sl_order_id", "VARCHAR"),
+        ("kite_status",      "VARCHAR"),
+    ]
+    for col, dtype in kite_cols:
+        try:
+            con.execute(
+                f"ALTER TABLE trade_log ADD COLUMN IF NOT EXISTS {col} {dtype}"
+            )
+        except Exception:
+            pass
+
+
 def _migrate_signal_columns(con):
     """
     Adds trade-signal columns to computed_metrics for DBs that pre-date this
@@ -201,11 +220,16 @@ def init_schema():
             rec_composite_score DOUBLE,
             rec_ai_score        DOUBLE,
 
-            -- ── ACTUAL TRADE (what user did) ──────────────────────────────
+            -- ── KITE ORDER IDs (set when order placed via Kite API) ───────
+            kite_order_id       VARCHAR,   -- entry order id returned by Kite
+            kite_sl_order_id    VARCHAR,   -- stop-loss order id (optional)
+            kite_status         VARCHAR,   -- last known Kite order status
+
+            -- ── ACTUAL TRADE (what user did / Kite filled) ────────────────
             quantity            INTEGER,
             actual_entry        DOUBLE,
             actual_exit         DOUBLE,    -- NULL = still open
-            status              VARCHAR,   -- OPEN / CLOSED / TARGET_HIT / STOPPED_OUT / CANCELLED
+            status              VARCHAR,   -- OPEN / CLOSED / TARGET_HIT / STOPPED_OUT / CANCELLED / REJECTED
             notes               TEXT,
 
             -- ── CALCULATED OUTCOMES (populated on close) ─────────────────
@@ -215,6 +239,7 @@ def init_schema():
             rr_realised         DOUBLE     -- actual_gain/actual_risk
         );
     """)
+    _migrate_trade_log_columns(con)
     con.close()
 
 
@@ -369,10 +394,13 @@ def get_last_metrics_update() -> str:
 def log_trade(trade: dict) -> int:
     """
     Insert a new trade log entry. Returns the new row id.
-    trade dict keys: tradingsymbol, instrument_token, setup_type, signal_type,
-    trade_date, rec_entry, rec_stop, rec_t1, rec_t2, rec_rr, rec_reason,
-    rec_composite_score, rec_ai_score, quantity, actual_entry, actual_exit (opt),
-    status, notes.
+
+    trade dict keys (all optional unless marked *required*):
+      *tradingsymbol, instrument_token, setup_type, signal_type,
+      trade_date, rec_entry, rec_stop, rec_t1, rec_t2, rec_rr, rec_reason,
+      rec_composite_score, rec_ai_score,
+      quantity, actual_entry, actual_exit, status, notes,
+      kite_order_id, kite_sl_order_id, kite_status.
     """
     outcomes = _compute_outcomes(
         trade.get("quantity") or 1,
@@ -389,9 +417,10 @@ def log_trade(trade: dict) -> int:
             setup_type, signal_type,
             rec_entry, rec_stop, rec_t1, rec_t2, rec_rr, rec_reason,
             rec_composite_score, rec_ai_score,
+            kite_order_id, kite_sl_order_id, kite_status,
             quantity, actual_entry, actual_exit, status, notes,
             pnl_amount, pnl_pct, slippage_entry_pct, rr_realised
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, [
         trade.get("trade_date"),
         trade.get("tradingsymbol"),
@@ -406,6 +435,9 @@ def log_trade(trade: dict) -> int:
         trade.get("rec_reason"),
         trade.get("rec_composite_score"),
         trade.get("rec_ai_score"),
+        trade.get("kite_order_id"),
+        trade.get("kite_sl_order_id"),
+        trade.get("kite_status"),
         trade.get("quantity"),
         trade.get("actual_entry"),
         trade.get("actual_exit"),
@@ -477,6 +509,54 @@ def load_trade_log(status_filter: list = None) -> pd.DataFrame:
         df = con.execute("SELECT * FROM trade_log ORDER BY logged_at DESC").df()
     con.close()
     return df
+
+
+def sync_from_kite_orders(orders: list) -> int:
+    """
+    Given today's Kite order list (from client.get_orders()), update matching
+    OPEN trade_log entries that have a kite_order_id.
+
+    Rules:
+      - If Kite status is COMPLETE: update actual_entry to filled average_price,
+        keep our status as OPEN (still needs an exit to be "closed").
+      - If Kite status is REJECTED or CANCELLED: set status = that value in DB.
+
+    Returns the number of trade_log rows updated.
+    """
+    if not orders:
+        return 0
+    orders_map = {str(o.get("order_id", "")): o for o in orders}
+    con = get_conn()
+    open_rows = con.execute(
+        "SELECT id, kite_order_id, actual_entry, quantity, signal_type, rec_entry, rec_stop "
+        "FROM trade_log WHERE status = 'OPEN' AND kite_order_id IS NOT NULL"
+    ).fetchall()
+    updated = 0
+    for row in open_rows:
+        tid, kid, ae, qty, sig, re, rs = row
+        if not kid:
+            continue
+        k = orders_map.get(str(kid))
+        if not k:
+            continue
+        kstat = k.get("status", "")
+        filled_price = k.get("average_price") or ae
+        if kstat == "COMPLETE":
+            # Update kite_status + actual_entry (fill price); keep trade OPEN
+            # until user records an exit price
+            con.execute(
+                "UPDATE trade_log SET kite_status=?, actual_entry=? WHERE id=?",
+                [kstat, float(filled_price) if filled_price else ae, tid],
+            )
+            updated += 1
+        elif kstat in ("REJECTED", "CANCELLED"):
+            con.execute(
+                "UPDATE trade_log SET status=?, kite_status=? WHERE id=?",
+                [kstat, kstat, tid],
+            )
+            updated += 1
+    con.close()
+    return updated
 
 
 def get_trade_stats() -> dict:

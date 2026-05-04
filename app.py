@@ -569,108 +569,242 @@ def _fv(v):
         return None
 
 
-def _render_log_trade_form(signal_df: pd.DataFrame, setup_type: str, form_key: str):
+def _render_order_panel(signal_df: pd.DataFrame, setup_type: str, form_key: str):
     """
-    Render a compact 'Log a trade' form below a signal table.
-    signal_df must have columns: tradingsymbol, rec_entry, rec_stop, rec_t1, rec_t2,
+    Unified order panel shown below each signal table.
+
+    When Kite is connected (st.session_state["kite_client"] exists):
+      → Shows "🚀 Place Order via Kite" which places the order on the exchange
+        AND auto-logs it to the Activity Log with the Kite order ID.
+      → Optionally places a companion stop-loss order.
+
+    When Kite is not connected:
+      → Falls back to a manual "📝 Log Trade" form (records only in local DB).
+
+    signal_df must include: tradingsymbol, rec_entry, rec_stop, rec_t1, rec_t2,
     rec_rr, rec_reason, instrument_token, composite_score, ai_score, signal_type.
     setup_type: 'SWING' | 'INTRADAY' | 'SCALING'
     """
     if signal_df.empty:
         return
 
-    with st.expander("📝 Log a trade from this list", expanded=False):
-        st.markdown(
-            '<div style="font-size:12px;color:#94a3b8;margin-bottom:8px;">'
-            'Record your actual entry/exit against the recommendation. '
-            'Stored in DB to track win-rate and improve future signals.'
-            '</div>',
-            unsafe_allow_html=True,
-        )
+    _kc = st.session_state.get("kite_client")
+    kite_connected = _kc is not None and getattr(_kc, "authenticated", False)
+
+    expander_label = (
+        "🚀 Place Order via Kite" if kite_connected else "📝 Log a trade from this list"
+    )
+
+    with st.expander(expander_label, expanded=False):
         sym_col, _ = st.columns([2, 5])
         sym_options = sorted(signal_df["tradingsymbol"].dropna().unique().tolist())
         selected_sym = sym_col.selectbox(
             "Select symbol", sym_options, key=f"{form_key}_sym"
         )
 
-        # Pre-fill from the selected signal row
         row = signal_df[signal_df["tradingsymbol"] == selected_sym]
         if row.empty:
             return
         row = row.iloc[0]
-        r_entry  = _fv(row.get("rec_entry")  or row.get("swing_entry") or row.get("intraday_entry") or row.get("scale_entry_1"))
-        r_stop   = _fv(row.get("rec_stop")   or row.get("swing_stop")  or row.get("intraday_stop")  or row.get("scale_stop"))
-        r_t1     = _fv(row.get("rec_t1")     or row.get("swing_t1")    or row.get("intraday_t1")    or row.get("scale_target"))
-        r_t2     = _fv(row.get("rec_t2")     or row.get("swing_t2"))
-        r_rr     = _fv(row.get("rec_rr")     or row.get("swing_rr"))
-        r_reason = str(row.get("rec_reason") or row.get("swing_reason") or row.get("intraday_reason") or row.get("scale_reason") or "")
-        r_token  = int(row.get("instrument_token") or 0)
-        r_cscore = _fv(row.get("composite_score"))
-        r_ai     = _fv(row.get("ai_score"))
+
+        r_entry   = _fv(row.get("rec_entry")  or row.get("swing_entry") or row.get("intraday_entry") or row.get("scale_entry_1"))
+        r_stop    = _fv(row.get("rec_stop")   or row.get("swing_stop")  or row.get("intraday_stop")  or row.get("scale_stop"))
+        r_t1      = _fv(row.get("rec_t1")     or row.get("swing_t1")    or row.get("intraday_t1")    or row.get("scale_target"))
+        r_t2      = _fv(row.get("rec_t2")     or row.get("swing_t2"))
+        r_rr      = _fv(row.get("rec_rr")     or row.get("swing_rr"))
+        r_reason  = str(row.get("rec_reason") or row.get("swing_reason") or row.get("intraday_reason") or row.get("scale_reason") or "")
+        r_token   = int(row.get("instrument_token") or 0)
+        r_cscore  = _fv(row.get("composite_score"))
+        r_ai      = _fv(row.get("ai_score"))
         r_sigtype = str(row.get("signal_type") or row.get("swing_signal") or row.get("intraday_signal") or row.get("scale_signal") or "BUY")
 
-        # Show recommendation snapshot
         cols_rec = st.columns(5)
-        cols_rec[0].metric("Rec Entry",  _fmt(r_entry))
-        cols_rec[1].metric("Rec Stop",   _fmt(r_stop))
-        cols_rec[2].metric("T1",         _fmt(r_t1))
-        cols_rec[3].metric("T2",         _fmt(r_t2) if r_t2 else "—")
-        cols_rec[4].metric("R/R",        f"{r_rr:.1f}×" if r_rr else "—")
+        cols_rec[0].metric("Rec Entry", _fmt(r_entry))
+        cols_rec[1].metric("Rec Stop",  _fmt(r_stop))
+        cols_rec[2].metric("T1",        _fmt(r_t1))
+        cols_rec[3].metric("T2",        _fmt(r_t2) if r_t2 else "—")
+        cols_rec[4].metric("R/R",       f"{r_rr:.1f}×" if r_rr else "—")
 
-        with st.form(key=f"{form_key}_form_{selected_sym}"):
-            c1, c2, c3, c4 = st.columns(4)
-            trade_date   = c1.date_input("Trade date", value=pd.Timestamp.today().date(), key=f"{form_key}_date")
-            quantity     = c2.number_input("Quantity (shares)", min_value=1, value=1, step=1, key=f"{form_key}_qty")
-            actual_entry = c3.number_input("Actual entry ₹", min_value=0.01, value=float(r_entry or 0) or 0.01, step=0.05, format="%.2f", key=f"{form_key}_ae")
-            status       = c4.selectbox("Status", ["OPEN", "CLOSED", "TARGET_HIT", "STOPPED_OUT", "CANCELLED"], key=f"{form_key}_st")
+        # ── Determine smart defaults ────────────────────────────────────
+        is_sell   = r_sigtype in ("SELL", "SELL_BELOW")
+        txn_type  = "SELL" if is_sell else "BUY"
+        # Intraday signals use SL-M (stop-market); others use LIMIT
+        def_otype = "SL-M" if r_sigtype in ("BUY_ABOVE", "SELL_BELOW") else "LIMIT"
+        def_prod  = "MIS" if setup_type == "INTRADAY" else "CNC"
 
-            c5, c6 = st.columns(2)
-            actual_exit  = c5.number_input(
-                "Actual exit ₹ (0 = still open)",
-                min_value=0.0, value=0.0, step=0.05, format="%.2f",
-                key=f"{form_key}_ex",
+        if kite_connected:
+            # ── KITE ORDER FORM ─────────────────────────────────────────
+            st.markdown(
+                '<div style="font-size:12px;color:#22c55e;margin-bottom:8px;">'
+                '⚡ Kite connected — order will be placed directly on NSE and '
+                'auto-logged to your Activity Log.'
+                '</div>',
+                unsafe_allow_html=True,
             )
-            notes = c6.text_input("Notes (optional)", placeholder="e.g. gapped up at open, exited early", key=f"{form_key}_notes")
+            with st.form(key=f"{form_key}_kite_{selected_sym}"):
+                c1, c2, c3, c4 = st.columns(4)
+                qty        = c1.number_input("Qty (shares)", min_value=1, value=1, step=1)
+                order_type = c2.selectbox("Order type", ["LIMIT", "MARKET", "SL-M", "SL"],
+                                          index=["LIMIT", "MARKET", "SL-M", "SL"].index(def_otype))
+                product    = c3.selectbox("Product", ["CNC", "MIS", "NRML"],
+                                          index=["CNC", "MIS", "NRML"].index(def_prod))
+                txn_disp   = c4.selectbox("Transaction", ["BUY", "SELL"],
+                                          index=["BUY", "SELL"].index(txn_type))
 
-            submitted = st.form_submit_button("💾 Save Trade Log", type="primary", use_container_width=True)
+                c5, c6 = st.columns(2)
+                entry_price   = c5.number_input(
+                    "Entry price ₹ (LIMIT / SL)",
+                    min_value=0.0, value=float(r_entry or 0), step=0.05, format="%.2f",
+                )
+                trigger_price = c6.number_input(
+                    "Trigger price ₹ (SL / SL-M)",
+                    min_value=0.0, value=float(r_entry or 0), step=0.05, format="%.2f",
+                )
 
-        if submitted:
-            trade_dict = {
-                "trade_date":          trade_date,
-                "tradingsymbol":       selected_sym,
-                "instrument_token":    r_token,
-                "setup_type":          setup_type,
-                "signal_type":         r_sigtype,
-                "rec_entry":           r_entry,
-                "rec_stop":            r_stop,
-                "rec_t1":              r_t1,
-                "rec_t2":              r_t2,
-                "rec_rr":              r_rr,
-                "rec_reason":          r_reason[:200],
-                "rec_composite_score": r_cscore,
-                "rec_ai_score":        r_ai,
-                "quantity":            quantity,
-                "actual_entry":        float(actual_entry) if actual_entry else None,
-                "actual_exit":         float(actual_exit)  if actual_exit  else None,
-                "status":              status,
-                "notes":               notes or None,
-            }
-            try:
-                new_id = db.log_trade(trade_dict)
-                # Compute quick P&L preview
-                if actual_exit and actual_entry:
-                    direction = -1 if r_sigtype in ("SELL", "SELL_BELOW") else 1
-                    pnl       = direction * (float(actual_exit) - float(actual_entry)) * quantity
-                    pnl_pct   = direction * (float(actual_exit) - float(actual_entry)) / float(actual_entry) * 100
-                    col_r = "green" if pnl >= 0 else "red"
-                    st.success(
-                        f"✅ Trade logged (id={new_id}) — "
-                        f"P&L: ₹{pnl:+,.2f} ({pnl_pct:+.2f}%)"
+                place_sl = st.checkbox(
+                    f"Also place stop-loss order at ₹{r_stop or 0:,.2f}",
+                    value=bool(r_stop),
+                )
+                sl_price = st.number_input(
+                    "Stop-loss trigger ₹",
+                    min_value=0.0, value=float(r_stop or 0), step=0.05, format="%.2f",
+                    disabled=not place_sl,
+                )
+                notes_k = st.text_input("Notes (optional)", placeholder="e.g. R/R 2× trigger on EMA bounce")
+
+                btn_col, warn_col = st.columns([2, 3])
+                submitted_kite = btn_col.form_submit_button(
+                    f"🚀 Place {txn_disp} Order on Kite", type="primary", use_container_width=True
+                )
+                warn_col.markdown(
+                    '<div style="font-size:11px;color:#f59e0b;padding-top:8px;">'
+                    '⚠ Orders are real and go to the exchange. Double-check qty and price.'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+
+            if submitted_kite:
+                try:
+                    ep  = float(entry_price)   if entry_price   else None
+                    tp  = float(trigger_price) if trigger_price else None
+                    # Place entry order
+                    order_id = _kc.place_order(
+                        tradingsymbol   = selected_sym,
+                        qty             = int(qty),
+                        transaction_type= txn_disp,
+                        order_type      = order_type,
+                        product         = product,
+                        price           = ep  if order_type in ("LIMIT", "SL") else None,
+                        trigger_price   = tp  if order_type in ("SL", "SL-M")  else None,
+                        tag             = f"scr_{setup_type[:3].lower()}",
                     )
-                else:
-                    st.success(f"✅ Trade logged as {status} (id={new_id})")
-            except Exception as _e:
-                st.error(f"Failed to save: {_e}")
+
+                    # Optionally place companion SL order
+                    sl_order_id = None
+                    if place_sl and sl_price and sl_price > 0:
+                        sl_txn = "BUY" if txn_disp == "SELL" else "SELL"
+                        try:
+                            sl_order_id = _kc.place_order(
+                                tradingsymbol    = selected_sym,
+                                qty              = int(qty),
+                                transaction_type = sl_txn,
+                                order_type       = "SL-M",
+                                product          = product,
+                                trigger_price    = float(sl_price),
+                                tag              = f"sl_{setup_type[:3].lower()}",
+                            )
+                        except Exception as _sl_err:
+                            st.warning(f"Stop-loss order failed: {_sl_err}. Main order still placed.")
+
+                    # Auto-log to DB
+                    trade_dict = {
+                        "trade_date":          pd.Timestamp.today().date(),
+                        "tradingsymbol":       selected_sym,
+                        "instrument_token":    r_token,
+                        "setup_type":          setup_type,
+                        "signal_type":         r_sigtype,
+                        "rec_entry":           r_entry,
+                        "rec_stop":            r_stop,
+                        "rec_t1":              r_t1,
+                        "rec_t2":              r_t2,
+                        "rec_rr":              r_rr,
+                        "rec_reason":          r_reason[:200],
+                        "rec_composite_score": r_cscore,
+                        "rec_ai_score":        r_ai,
+                        "kite_order_id":       order_id,
+                        "kite_sl_order_id":    sl_order_id,
+                        "kite_status":         "OPEN",
+                        "quantity":            int(qty),
+                        "actual_entry":        ep or r_entry,
+                        "status":              "OPEN",
+                        "notes":               notes_k or None,
+                    }
+                    new_id = db.log_trade(trade_dict)
+                    sl_note = f" + SL order {sl_order_id}" if sl_order_id else ""
+                    st.success(
+                        f"✅ **Order placed!** Kite order ID: `{order_id}`{sl_note}  "
+                        f"— logged to Activity Log (id={new_id}). "
+                        f"Check **📒 Activity Log** tab to track status."
+                    )
+                except Exception as _e:
+                    st.error(f"Order failed: {_e}")
+
+        else:
+            # ── MANUAL LOG FALLBACK ─────────────────────────────────────
+            st.markdown(
+                '<div style="font-size:12px;color:#94a3b8;margin-bottom:8px;">'
+                'Record your actual entry/exit against the recommendation. '
+                'Connect Kite to place orders directly from here.'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+            with st.form(key=f"{form_key}_manual_{selected_sym}"):
+                c1, c2, c3, c4 = st.columns(4)
+                trade_date   = c1.date_input("Trade date", value=pd.Timestamp.today().date())
+                quantity     = c2.number_input("Qty (shares)", min_value=1, value=1, step=1)
+                actual_entry = c3.number_input("Actual entry ₹", min_value=0.01,
+                                               value=float(r_entry or 0) or 0.01, step=0.05, format="%.2f")
+                status_m     = c4.selectbox("Status", ["OPEN", "CLOSED", "TARGET_HIT", "STOPPED_OUT", "CANCELLED"])
+
+                c5, c6 = st.columns(2)
+                actual_exit = c5.number_input("Actual exit ₹ (0 = still open)",
+                                              min_value=0.0, value=0.0, step=0.05, format="%.2f")
+                notes_m     = c6.text_input("Notes (optional)", placeholder="e.g. gapped up at open")
+
+                submitted_manual = st.form_submit_button("💾 Save Trade Log", type="primary", use_container_width=True)
+
+            if submitted_manual:
+                trade_dict = {
+                    "trade_date":          trade_date,
+                    "tradingsymbol":       selected_sym,
+                    "instrument_token":    r_token,
+                    "setup_type":          setup_type,
+                    "signal_type":         r_sigtype,
+                    "rec_entry":           r_entry,
+                    "rec_stop":            r_stop,
+                    "rec_t1":              r_t1,
+                    "rec_t2":              r_t2,
+                    "rec_rr":              r_rr,
+                    "rec_reason":          r_reason[:200],
+                    "rec_composite_score": r_cscore,
+                    "rec_ai_score":        r_ai,
+                    "quantity":            quantity,
+                    "actual_entry":        float(actual_entry) if actual_entry else None,
+                    "actual_exit":         float(actual_exit)  if actual_exit  else None,
+                    "status":              status_m,
+                    "notes":               notes_m or None,
+                }
+                try:
+                    new_id = db.log_trade(trade_dict)
+                    if actual_exit and actual_entry:
+                        direction = -1 if r_sigtype in ("SELL", "SELL_BELOW") else 1
+                        pnl     = direction * (float(actual_exit) - float(actual_entry)) * quantity
+                        pnl_pct = direction * (float(actual_exit) - float(actual_entry)) / float(actual_entry) * 100
+                        st.success(f"✅ Logged (id={new_id}) — P&L: ₹{pnl:+,.2f} ({pnl_pct:+.2f}%)")
+                    else:
+                        st.success(f"✅ Trade logged as {status_m} (id={new_id})")
+                except Exception as _e:
+                    st.error(f"Failed to save: {_e}")
 
 
 # ─── SCREENER TAB ───────────────────────────────────────────
@@ -2500,7 +2634,7 @@ def _intraday_long_live():
         rec_reason=_si.get("intraday_reason"),
         signal_type="BUY_ABOVE",
     ) if not _si.empty else _si
-    _render_log_trade_form(_si_log, setup_type="INTRADAY", form_key="intra_long")
+    _render_order_panel(_si_log, setup_type="INTRADAY", form_key="intra_long")
 
 
 # ── FRAGMENT 2b: intraday SHORT table (live status column) ───────────────────
@@ -2749,7 +2883,7 @@ def _signals_main():
                     "Quality": st.column_config.TextColumn("Quality", help="★★★★★ = best (full EMA stack + ADX confirmed + strong volume)"),
                 },
             )
-            _render_log_trade_form(_sb, setup_type="SWING", form_key="sw_buy")
+            _render_order_panel(_sb, setup_type="SWING", form_key="sw_buy")
 
     # ── EXIT / SELL ───────────────────────────────────────────────
     with _sig_t2:
@@ -2823,7 +2957,7 @@ def _signals_main():
                 rec_reason=_se.get("swing_reason"),
                 signal_type=_se.get("swing_signal"),
             ) if not _se.empty else _se
-            _render_log_trade_form(_se_log, setup_type="SWING", form_key="sw_exit")
+            _render_order_panel(_se_log, setup_type="SWING", form_key="sw_exit")
 
     # ── INTRADAY PLAN ─────────────────────────────────────────────
     with _sig_t3:
@@ -2908,7 +3042,7 @@ def _signals_main():
                 rec_reason=_ssc.get("scale_reason"),
                 signal_type=_ssc.get("scale_signal"),
             ) if not _ssc.empty else _ssc
-            _render_log_trade_form(_ssc_log, setup_type="SCALING", form_key="scaling")
+            _render_order_panel(_ssc_log, setup_type="SCALING", form_key="scaling")
 
 
 with tab_signals:
@@ -2926,18 +3060,43 @@ with tab_signals:
 # ============================================================
 with tab_activity:
     st.subheader("📒 Trade Activity Log")
-    st.caption(
-        "A journal of every trade you've logged against a recommendation. "
-        "All entries include the original signal (entry, stop, targets) alongside "
-        "your actual trade — enabling win-rate analysis and strategy improvement over time."
-    )
+
+    _act_kc = st.session_state.get("kite_client")
+    _act_kite_ok = _act_kc is not None and getattr(_act_kc, "authenticated", False)
+
+    # ── Header row: description + Sync button ──────────────────────────────
+    _act_hdr, _act_btn_col = st.columns([4, 1])
+    with _act_hdr:
+        if _act_kite_ok:
+            st.caption(
+                "Orders placed via Kite appear here automatically. "
+                "Hit **🔄 Sync from Kite** to pull the latest fill status for open orders. "
+                "Once filled, record your exit price to compute P&L."
+            )
+        else:
+            st.caption(
+                "A journal of every trade logged against a recommendation. "
+                "Connect Kite (sidebar) to place orders directly from the Trade Signals tab."
+            )
+    with _act_btn_col:
+        if _act_kite_ok and st.button("🔄 Sync from Kite", use_container_width=True,
+                                       help="Pulls today's Kite orders and updates fill status for open trades"):
+            with st.spinner("Syncing with Kite…"):
+                try:
+                    _today_orders = _act_kc.get_orders()
+                    _n_synced     = db.sync_from_kite_orders(_today_orders)
+                    st.success(f"Synced {_n_synced} trade(s) from Kite." if _n_synced
+                               else "All open trades already up-to-date.")
+                    st.rerun()
+                except Exception as _sync_err:
+                    st.error(f"Sync failed: {_sync_err}")
 
     # ── Summary stats ──────────────────────────────────────────────────────
     _stats = db.get_trade_stats()
     if _stats.get("total", 0) == 0:
         st.info(
-            "No trades logged yet. Go to the **🎯 Trade Signals** tab, "
-            "pick a signal and click **📝 Log a trade** below the table.",
+            "No trades yet. Go to **🎯 Trade Signals** tab and click "
+            "**🚀 Place Order via Kite** (or **📝 Log a trade** if not connected) below any signal table.",
             icon="📒",
         )
     else:
@@ -2998,6 +3157,7 @@ with tab_activity:
                 "rec_t1", "actual_exit",
                 "pnl_amount", "pnl_pct",
                 "rr_realised", "slippage_entry_pct",
+                "kite_order_id", "kite_status",
                 "status", "notes",
             ]
             _disp_cols = [c for c in _disp_cols if c in _log_df.columns]
@@ -3062,6 +3222,8 @@ with tab_activity:
                     "pnl_pct":             st.column_config.TextColumn("P&L %",          help="(Exit − Entry) / Entry × 100"),
                     "rr_realised":         st.column_config.TextColumn("R/R actual",    help="Actual gain ÷ actual risk"),
                     "slippage_entry_pct":  st.column_config.TextColumn("Entry slip %",  help="How far your entry was from the recommended entry"),
+                    "kite_order_id":        st.column_config.TextColumn("Kite Order ID",  help="Order ID from Zerodha Kite — use this to look up the order in your Kite app"),
+                    "kite_status":          st.column_config.TextColumn("Kite Status",   help="Last known order status from Kite (OPEN / COMPLETE / REJECTED / CANCELLED). Hit 'Sync from Kite' to refresh."),
                     "status":              st.column_config.TextColumn("Status"),
                     "notes":               st.column_config.TextColumn("Notes",          width="large"),
                 },
@@ -3073,10 +3235,13 @@ with tab_activity:
                 st.markdown("---")
                 st.subheader("📌 Close an open trade")
                 _cl_ids = _open_trades["id"].tolist()
-                _cl_labels = [
-                    f"#{r['id']} · {r['tradingsymbol']} ({r['setup_type']}) — entered ₹{r['actual_entry']:.2f}"
-                    for _, r in _open_trades.iterrows()
-                ]
+                _cl_labels = []
+                for _, r in _open_trades.iterrows():
+                    _ae  = r.get("actual_entry")
+                    _ae_str = f"₹{float(_ae):.2f}" if _ae and not pd.isna(_ae) else "entry pending"
+                    _kid = r.get("kite_order_id")
+                    _kid_str = f" · Kite#{_kid}" if _kid else ""
+                    _cl_labels.append(f"#{r['id']} · {r['tradingsymbol']} ({r['setup_type']}) — {_ae_str}{_kid_str}")
                 _id_map = dict(zip(_cl_labels, _cl_ids))
                 _selected_label = st.selectbox("Select open trade to close", _cl_labels, key="close_trade_sel")
                 _selected_id    = _id_map.get(_selected_label)

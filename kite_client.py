@@ -190,6 +190,63 @@ class KiteClient:
             result.update(self.kite.quote(chunk))
         return result
 
+    # ----------------------------------------------------------
+    # ORDER MANAGEMENT — place, query, cancel orders
+    # ----------------------------------------------------------
+    def place_order(
+        self,
+        tradingsymbol: str,
+        qty: int,
+        transaction_type: str,          # "BUY" | "SELL"
+        order_type: str = "LIMIT",      # "MARKET" | "LIMIT" | "SL" | "SL-M"
+        product: str = "CNC",           # "CNC" | "MIS" | "NRML"
+        price: float = None,            # required for LIMIT / SL
+        trigger_price: float = None,    # required for SL / SL-M
+        variety: str = "regular",
+        tag: str = None,                # max 20 chars, alphanumeric
+    ) -> str:
+        """
+        Place an equity order on NSE.  Returns the Kite order_id string.
+
+        order_type mapping:
+          LIMIT   — buy/sell at exactly `price` (or better)
+          MARKET  — immediate fill at market price
+          SL-M    — stop-market: triggers when price crosses `trigger_price`
+          SL      — stop-limit: triggers at `trigger_price`, fills at `price`
+
+        For intraday BUY_ABOVE signals, use order_type="SL-M" with
+        trigger_price=entry so the order activates when price crosses entry.
+        """
+        kwargs = dict(
+            variety=variety,
+            exchange="NSE",
+            tradingsymbol=tradingsymbol,
+            transaction_type=transaction_type,
+            quantity=qty,
+            product=product,
+            order_type=order_type,
+            validity="DAY",
+        )
+        if price is not None and order_type in ("LIMIT", "SL"):
+            kwargs["price"] = price
+        if trigger_price is not None and order_type in ("SL", "SL-M"):
+            kwargs["trigger_price"] = trigger_price
+        if tag:
+            kwargs["tag"] = str(tag)[:20]   # Kite max tag length
+        return str(self.kite.place_order(**kwargs))
+
+    def get_orders(self) -> list:
+        """Return all orders (open + executed) for today."""
+        return self.kite.orders() or []
+
+    def cancel_order(self, order_id: str, variety: str = "regular") -> str:
+        """Cancel a pending order.  Returns order_id on success."""
+        return str(self.kite.cancel_order(variety=variety, order_id=order_id))
+
+    def get_positions(self) -> dict:
+        """Return current net + day positions with unrealized P&L."""
+        return self.kite.positions()
+
     def get_ltp_batch(self, instruments: list[str]) -> dict[str, float]:
         """
         Fastest possible price fetch — returns only the last traded price.
