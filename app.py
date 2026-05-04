@@ -145,40 +145,53 @@ if "request_token" in st.query_params:
     st.session_state["_pending_rt"] = st.query_params["request_token"]
     st.query_params.clear()          # clean the URL immediately
 
-# ── Step 0b: seed session-state keys once per session ─────────────────
+# ── Step 0b: seed / refresh session-state keys ────────────────────────
 def _init_session_kite_state():
-    if "kite_ss_initialized" in st.session_state:
+    """
+    Merge localStorage values into session_state.
+
+    On Cloud this runs on EVERY render (no early-exit guard) so that when
+    the localStorage component fires on render-2 after a fresh page load,
+    the values are picked up immediately without a manual st.rerun() loop.
+
+    On local dev it runs only once (env-var seeding is deterministic).
+    """
+    if not _ON_CLOUD:
+        # Local dev: seed once from .env, never re-run.
+        if "kite_ss_initialized" in st.session_state:
+            return
+        st.session_state.setdefault("kite_api_key",       _os.getenv("KITE_API_KEY", ""))
+        st.session_state.setdefault("kite_api_secret",    _os.getenv("KITE_API_SECRET", ""))
+        st.session_state.setdefault("kite_access_token",  "")
+        st.session_state.setdefault("kite_access_date",   "")
+        st.session_state.setdefault("kite_user_id",       "")
+        st.session_state.setdefault("kite_user_name",     "")
+        st.session_state.setdefault("kite_authenticated", False)
+        st.session_state["kite_ss_initialized"] = True
         return
 
-    # On Streamlit Cloud: restore credentials from the user's own browser
-    # cookies (per-domain, per-browser — fully isolated between visitors).
-    # Cookies persist until cleared, so users only enter keys once per browser.
-    #
-    # On local dev: seed from the local .env file for single-user convenience.
-    if _ON_CLOUD:
-        # Restore from browser localStorage (per-user, per-domain).
-        # ls_get returns None on the very first render cycle (before the
-        # component JS fires).  We treat None as "" — the user will see
-        # the key-entry form, and on the second render the real values
-        # populate and trigger a rerun that auto-restores auth.
-        _k     = _ls_get("kite_api_key")      or ""
-        _s     = _ls_get("kite_api_secret")   or ""
-        _token = _ls_get("kite_access_token") or ""
-        _tdate = _ls_get("kite_access_date")  or ""
-    else:
-        _k     = _os.getenv("KITE_API_KEY", "")
-        _s     = _os.getenv("KITE_API_SECRET", "")
-        _token = ""
-        _tdate = ""
+    # ── Cloud path: always re-read from localStorage ────────────────
+    # ls_get returns None until the component JS fires (1 render after
+    # page load).  We only overwrite session_state when we get a real
+    # value so we don't clobber tokens that were just set by complete_auth().
+    _k     = _ls_get("kite_api_key")
+    _s     = _ls_get("kite_api_secret")
+    _token = _ls_get("kite_access_token")
+    _tdate = _ls_get("kite_access_date")
 
-    st.session_state.setdefault("kite_api_key",       _k)
-    st.session_state.setdefault("kite_api_secret",    _s)
-    st.session_state.setdefault("kite_access_token",  _token)
-    st.session_state.setdefault("kite_access_date",   _tdate)
+    if _k:     st.session_state["kite_api_key"]       = _k
+    if _s:     st.session_state["kite_api_secret"]    = _s
+    if _token: st.session_state["kite_access_token"]  = _token
+    if _tdate: st.session_state["kite_access_date"]   = _tdate
+
+    # Ensure defaults exist so later code never gets a KeyError.
+    st.session_state.setdefault("kite_api_key",       "")
+    st.session_state.setdefault("kite_api_secret",    "")
+    st.session_state.setdefault("kite_access_token",  "")
+    st.session_state.setdefault("kite_access_date",   "")
     st.session_state.setdefault("kite_user_id",       "")
     st.session_state.setdefault("kite_user_name",     "")
     st.session_state.setdefault("kite_authenticated", False)
-    st.session_state["kite_ss_initialized"] = True
 
 _init_session_kite_state()
 
@@ -213,13 +226,13 @@ if _pending_rt and _ss_api_key and _ss_api_secret:
             st.stop()
 
 # ── Step 1b — request_token received but localStorage not yet ready ────
-# Show a brief spinner; the localStorage component will fire and trigger
-# a rerun that provides the keys, at which point Step 1 exchanges them.
+# The localStorage component (rendered above by _init_session_kite_state)
+# will fire on the NEXT render cycle and populate the keys automatically —
+# no manual sleep/rerun needed.  We just show a message and stop here;
+# Streamlit will rerun on its own when the component value arrives.
 elif _pending_rt and not (_ss_api_key and _ss_api_secret):
-    with st.spinner("⏳ Loading your credentials, please wait…"):
-        import time as _time
-        _time.sleep(0.5)   # give the localStorage component time to respond
-    st.rerun()
+    st.info("⏳ Completing authentication, please wait…")
+    st.stop()
 
 # ── Step 2b — no keys at all: show onboarding ─────────────────────────
 if not (_ss_api_key and _ss_api_secret):
