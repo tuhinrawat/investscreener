@@ -44,7 +44,11 @@ def _live_quote_fragment(symbol: str):
         return
 
     try:
-        client = KiteClient()
+        client = st.session_state.get("kite_client") or KiteClient(
+            api_key=st.session_state.get("kite_api_key", ""),
+            api_secret=st.session_state.get("kite_api_secret", ""),
+            access_token=st.session_state.get("kite_access_token", ""),
+        )
         quotes  = client.get_ohlc_batch([f"NSE:{symbol}"])
         q       = quotes.get(f"NSE:{symbol}")
     except Exception as err:
@@ -104,79 +108,78 @@ st.set_page_config(
 
 
 # ============================================================
-# KITE AUTH GATE
-# Runs on every page load before any other UI is rendered.
+# KITE AUTH GATE  — multi-user, session-isolated
 #
-# Flow:
-#   a) Kite redirects back here with ?request_token=xxx after login.
-#      We exchange it for an access_token, cache it, then strip the
-#      query param and rerun so the URL is clean.
-#   b) If a valid cached token exists for today, proceed normally.
-#   c) Otherwise render a login page and st.stop() so nothing else runs.
+# Each browser session keeps its own credentials in st.session_state:
+#   kite_api_key      — Kite API key  (entered per-session)
+#   kite_api_secret   — Kite API secret
+#   kite_access_token — OAuth token (set after Zerodha login)
+#   kite_access_date  — date the token was issued (tokens expire daily)
+#   kite_user_id      — Kite user_id fetched from profile (e.g. "ZY1234")
+#   kite_user_name    — Kite display name
+#   kite_authenticated — bool
+#
+# On the very first page load we seed key/secret from env/.env /
+# screener_keys.json so local-dev users don't have to re-enter every time.
+# On Streamlit Cloud each session starts with empty keys and the user
+# enters their own credentials — giving true per-user isolation.
 # ============================================================
 
-def _check_cached_auth() -> bool:
-    """Return True if today's access token is already cached on disk."""
-    try:
-        client = KiteClient()
-        return client.authenticated
-    except Exception:
-        return False
+# ── Step 0: seed session-state keys once per session ──────────────────
+def _init_session_kite_state():
+    if "kite_ss_initialized" in st.session_state:
+        return
+    # Seed from env / screener_keys.json (local dev convenience).
+    # On Streamlit Cloud with no env vars these will be empty strings.
+    _k = config._get_secret("KITE_API_KEY")
+    _s = config._get_secret("KITE_API_SECRET")
+    st.session_state.setdefault("kite_api_key",       _k)
+    st.session_state.setdefault("kite_api_secret",    _s)
+    st.session_state.setdefault("kite_access_token",  "")
+    st.session_state.setdefault("kite_access_date",   "")
+    st.session_state.setdefault("kite_user_id",       "")
+    st.session_state.setdefault("kite_user_name",     "")
+    st.session_state.setdefault("kite_authenticated", False)
+    st.session_state["kite_ss_initialized"] = True
 
+_init_session_kite_state()
 
-# Step 1 — handle Kite OAuth redirect (?request_token=xxx in URL)
-if "request_token" in st.query_params:
-    _req_token = st.query_params["request_token"]
-    with st.spinner("Completing Zerodha authentication…"):
-        try:
-            _client = KiteClient()
-            _client.complete_auth(_req_token)
-            st.session_state["kite_authenticated"] = True
-            st.query_params.clear()
-            st.rerun()
-        except Exception as _auth_err:
-            st.error(f"Authentication failed: {_auth_err}")
-            st.stop()
+_ss_api_key    = st.session_state.get("kite_api_key",    "")
+_ss_api_secret = st.session_state.get("kite_api_secret", "")
 
-# Step 2 — check session state / cached token
-if "kite_authenticated" not in st.session_state:
-    st.session_state["kite_authenticated"] = _check_cached_auth()
-
-# Step 2b — if API keys are missing, show sidebar entry form + instructions
-_tmp_kc = KiteClient()
-if _tmp_kc.missing_keys:
-    # ── Sidebar: key entry (renders before st.stop) ──────────────────────
+# ── Step 2b — no keys in session yet: show onboarding ─────────────────
+if not (_ss_api_key and _ss_api_secret):
     st.sidebar.title("⚙️ Setup")
     st.sidebar.subheader("🔑 Zerodha Kite Connect")
     st.sidebar.caption(
-        "Enter your Kite Connect API credentials below to get started. "
-        "Keys are saved locally in `screener_keys.json` and never leave this machine."
+        "Enter your Kite Connect API credentials below to get started.  \n"
+        "Keys are stored **only in your browser session** and never shared."
     )
-    _setup_saved = _ai.load_keys()
     _setup_k = st.sidebar.text_input(
         "API Key",
-        value=_setup_saved.get("kite_api_key", ""),
+        value="",
         type="password",
         key="setup_kite_key",
         help="Found in your Kite Developer Console → My Apps → API Key",
     )
     _setup_s = st.sidebar.text_input(
         "API Secret",
-        value=_setup_saved.get("kite_api_secret", ""),
+        value="",
         type="password",
         key="setup_kite_secret",
         help="Found in your Kite Developer Console → My Apps → API Secret",
     )
-    if st.sidebar.button("💾 Save & Connect", type="primary", use_container_width=True,
-                         key="setup_kite_save"):
+    if st.sidebar.button("💾 Save & Connect", type="primary",
+                         use_container_width=True, key="setup_kite_save"):
         if _setup_k.strip() and _setup_s.strip():
+            st.session_state["kite_api_key"]    = _setup_k.strip()
+            st.session_state["kite_api_secret"] = _setup_s.strip()
+            # Persist to disk for local-dev token cache convenience
             _ai.save_kite_keys(_setup_k.strip(), _setup_s.strip())
-            st.sidebar.success("Keys saved! Reloading…")
             st.rerun()
         else:
             st.sidebar.error("Both API Key and Secret are required.")
 
-    # ── Main area: onboarding instructions ───────────────────────────────
     _, _oc, _ = st.columns([1, 3, 1])
     with _oc:
         st.markdown(
@@ -194,22 +197,77 @@ if _tmp_kc.missing_keys:
         with st.expander("📋 How to get your API Key & Secret", expanded=True):
             st.markdown(
                 """
-                1. Go to [developers.kite.trade](https://developers.kite.trade) and log in with your Zerodha account
+                1. Go to [developers.kite.trade](https://developers.kite.trade) and log in
                 2. Click **Create new app** → fill in a name (e.g. "Screener")
                 3. Set **Redirect URL** to:
                    - Streamlit Cloud: `https://tuhinrawat-investscreener-app-miqshh.streamlit.app/`
                    - Local dev: `http://127.0.0.1:8501`
-                4. Copy the **API Key** and **API Secret** from the app detail page
+                4. Copy **API Key** and **API Secret** from the app detail page
                 5. Paste them in the **sidebar on the left** and click **Save & Connect**
 
-                Your keys are stored only in `screener_keys.json` on this machine and are never transmitted anywhere except Zerodha's own API.
+                Keys stay only in your browser session and are never shared with other users.
                 """
             )
     st.stop()
 
-# Step 3 — show login page if not authenticated
-if not st.session_state["kite_authenticated"]:
-    _login_client = KiteClient()
+
+# ── Step 1 — handle Kite OAuth redirect (?request_token=xxx in URL) ───
+if "request_token" in st.query_params:
+    _req_token = st.query_params["request_token"]
+    with st.spinner("Completing Zerodha authentication…"):
+        try:
+            _client = KiteClient(
+                api_key=_ss_api_key, api_secret=_ss_api_secret
+            )
+            _acc_token = _client.complete_auth(_req_token)
+            # Fetch profile for user_id / display name
+            _profile = _client.get_profile()
+            st.session_state["kite_access_token"] = _acc_token
+            st.session_state["kite_access_date"]  = date_type.today().isoformat()
+            st.session_state["kite_user_id"]      = _profile.get("user_id", "")
+            st.session_state["kite_user_name"]    = _profile.get("user_name", "")
+            st.session_state["kite_authenticated"] = True
+            st.session_state["kite_client"]       = _client
+            st.query_params.clear()
+            st.rerun()
+        except Exception as _auth_err:
+            st.error(f"Authentication failed: {_auth_err}")
+            st.stop()
+
+# ── Step 2 — restore session token if we have one for today ───────────
+if not st.session_state.get("kite_authenticated"):
+    _ss_token = st.session_state.get("kite_access_token", "")
+    _ss_date  = st.session_state.get("kite_access_date",  "")
+    if _ss_token and _ss_date == date_type.today().isoformat():
+        # Token is from today — restore the KiteClient
+        try:
+            _rc = KiteClient(api_key=_ss_api_key, api_secret=_ss_api_secret,
+                             access_token=_ss_token)
+            if _rc.authenticated:
+                _profile = _rc.get_profile()
+                st.session_state["kite_user_id"]   = _profile.get("user_id",   st.session_state.get("kite_user_id", ""))
+                st.session_state["kite_user_name"] = _profile.get("user_name", st.session_state.get("kite_user_name", ""))
+                st.session_state["kite_authenticated"] = True
+                st.session_state["kite_client"]    = _rc
+        except Exception:
+            pass
+    else:
+        # Try disk cache (local-dev single-user convenience)
+        try:
+            _rc = KiteClient(api_key=_ss_api_key, api_secret=_ss_api_secret)
+            if _rc.authenticated:
+                # Hydrate session_state from the disk token
+                _profile = _rc.get_profile()
+                st.session_state["kite_user_id"]   = _profile.get("user_id",  "")
+                st.session_state["kite_user_name"] = _profile.get("user_name","")
+                st.session_state["kite_authenticated"] = True
+                st.session_state["kite_client"]    = _rc
+        except Exception:
+            pass
+
+# ── Step 3 — show login page if still not authenticated ───────────────
+if not st.session_state.get("kite_authenticated"):
+    _login_client = KiteClient(api_key=_ss_api_key, api_secret=_ss_api_secret)
     _login_url = _login_client.get_login_url()
 
     st.markdown("""
@@ -397,12 +455,18 @@ if not st.session_state["kite_authenticated"]:
 # ============================================================
 db.init_schema()
 
-# Always ensure kite_client is set in session_state so intraday
-# fetches and any other Kite API calls can use it.
-if "kite_client" not in st.session_state:
-    _kc = KiteClient()
+# Ensure kite_client is set for the authenticated session
+if "kite_client" not in st.session_state or not st.session_state["kite_client"]:
+    _kc = KiteClient(
+        api_key=st.session_state.get("kite_api_key",    ""),
+        api_secret=st.session_state.get("kite_api_secret",  ""),
+        access_token=st.session_state.get("kite_access_token", ""),
+    )
     if _kc.authenticated:
         st.session_state["kite_client"] = _kc
+
+# Convenience alias — current Kite user id for per-user DB filtering
+_cur_user_id: str = st.session_state.get("kite_user_id", "")
 
 
 # ============================================================
@@ -427,7 +491,7 @@ if st.sidebar.button("⚡ Quick Scan (~15s)", use_container_width=True,
                           "auto-analyses signal stocks not reviewed in 7 days (max 20)."):
     with st.spinner("Pulling fresh quotes + recomputing signals..."):
         try:
-            result = data_pipeline.quick_refresh()
+            result = data_pipeline.quick_refresh(client=st.session_state.get("kite_client"))
             if "error" in result:
                 st.sidebar.error(result["error"])
             else:
@@ -531,7 +595,10 @@ if st.sidebar.button("🔄 Full Rescan (~3-5 min)", use_container_width=True,
         status.caption(f"{idx+1}/{total}: {symbol}")
 
     try:
-        result = data_pipeline.full_rescan(progress_callback=update_progress)
+        result = data_pipeline.full_rescan(
+            progress_callback=update_progress,
+            client=st.session_state.get("kite_client"),
+        )
         progress_bar.progress(1.0)
         status.caption("Done")
         st.sidebar.success(
@@ -548,12 +615,15 @@ st.sidebar.markdown("---")
 
 # ─── Kite connection status + key management ────────────────
 st.sidebar.subheader("🔑 Zerodha Kite Connect")
-_kc_live = st.session_state.get("kite_client")
+_kc_live     = st.session_state.get("kite_client")
+_ss_uid      = st.session_state.get("kite_user_id",   "")
+_ss_uname    = st.session_state.get("kite_user_name", "")
 if _kc_live and _kc_live.authenticated:
+    _id_label = f" · {_ss_uname or _ss_uid}" if (_ss_uname or _ss_uid) else ""
     st.sidebar.markdown(
-        '<div style="font-size:12px;color:#22c55e;padding:2px 0 6px 0;">'
-        '🟢 <b>Kite connected</b> — intraday candles &amp; live prices active'
-        '</div>',
+        f'<div style="font-size:12px;color:#22c55e;padding:2px 0 6px 0;">'
+        f'🟢 <b>Kite connected{_id_label}</b> — intraday candles &amp; live prices active'
+        f'</div>',
         unsafe_allow_html=True,
     )
 else:
@@ -563,7 +633,10 @@ else:
         '</div>',
         unsafe_allow_html=True,
     )
-    _reauth_client = KiteClient()
+    _reauth_client = KiteClient(
+        api_key=st.session_state.get("kite_api_key",    ""),
+        api_secret=st.session_state.get("kite_api_secret", ""),
+    )
     _reauth_url = _reauth_client.get_login_url()
     if _reauth_url:
         st.sidebar.link_button(
@@ -572,29 +645,32 @@ else:
             use_container_width=True,
         )
 
-# ── Update / rotate API keys ────────────────────────────────
+# ── Update / rotate API keys (per-session; also persisted for local dev) ─
 with st.sidebar.expander("🔄 Update API Keys", expanded=False):
-    _cur_keys = _ai.load_keys()
     _upd_k = st.text_input(
         "API Key",
-        value=_cur_keys.get("kite_api_key", ""),
+        value=st.session_state.get("kite_api_key", ""),
         type="password",
         key="upd_kite_key",
         help="Kite Developer Console → My Apps → API Key",
     )
     _upd_s = st.text_input(
         "API Secret",
-        value=_cur_keys.get("kite_api_secret", ""),
+        value=st.session_state.get("kite_api_secret", ""),
         type="password",
         key="upd_kite_secret",
         help="Kite Developer Console → My Apps → API Secret",
     )
     if st.button("💾 Save Keys", key="upd_kite_save", use_container_width=True):
         if _upd_k.strip() and _upd_s.strip():
+            st.session_state["kite_api_key"]    = _upd_k.strip()
+            st.session_state["kite_api_secret"] = _upd_s.strip()
+            # Persist locally for convenience on local dev
             _ai.save_kite_keys(_upd_k.strip(), _upd_s.strip())
-            # Clear cached auth so the new keys take effect on next rerun
-            st.session_state.pop("kite_authenticated", None)
-            st.session_state.pop("kite_client", None)
+            # Clear auth so new keys are used on next Zerodha login
+            for _k in ("kite_authenticated", "kite_client", "kite_access_token",
+                       "kite_access_date", "kite_user_id", "kite_user_name"):
+                st.session_state.pop(_k, None)
             st.success("Keys updated — please re-authenticate Kite above.")
             st.rerun()
         else:
@@ -934,7 +1010,7 @@ def _render_order_panel(signal_df: pd.DataFrame, setup_type: str, form_key: str)
                         except Exception as _sl_err:
                             st.warning(f"Stop-loss order failed: {_sl_err}. Main order still placed.")
 
-                    # Auto-log to DB
+                    # Auto-log to DB (tagged with current user)
                     trade_dict = {
                         "trade_date":          pd.Timestamp.today().date(),
                         "tradingsymbol":       selected_sym,
@@ -949,6 +1025,7 @@ def _render_order_panel(signal_df: pd.DataFrame, setup_type: str, form_key: str)
                         "rec_reason":          r_reason[:200],
                         "rec_composite_score": r_cscore,
                         "rec_ai_score":        r_ai,
+                        "kite_user_id":        _cur_user_id,
                         "kite_order_id":       order_id,
                         "kite_sl_order_id":    sl_order_id,
                         "kite_status":         "OPEN",
@@ -1006,6 +1083,7 @@ def _render_order_panel(signal_df: pd.DataFrame, setup_type: str, form_key: str)
                     "rec_reason":          r_reason[:200],
                     "rec_composite_score": r_cscore,
                     "rec_ai_score":        r_ai,
+                    "kite_user_id":        _cur_user_id,
                     "quantity":            quantity,
                     "actual_entry":        float(actual_entry) if actual_entry else None,
                     "actual_exit":         float(actual_exit)  if actual_exit  else None,
@@ -2605,7 +2683,11 @@ def _live_signals_header():
     _ltp_err = None
     if _market_open and _signal_syms:
         try:
-            _fc = KiteClient()
+            _fc = st.session_state.get("kite_client") or KiteClient(
+                api_key=st.session_state.get("kite_api_key", ""),
+                api_secret=st.session_state.get("kite_api_secret", ""),
+                access_token=st.session_state.get("kite_access_token", ""),
+            )
             if _fc.authenticated:
                 fresh = _fc.get_ltp_batch([f"NSE:{s}" for s in _signal_syms])
                 # Snapshot current → previous BEFORE overwriting with new prices
@@ -3302,7 +3384,7 @@ with tab_activity:
             with st.spinner("Syncing with Kite…"):
                 try:
                     _today_orders = _act_kc.get_orders()
-                    _n_synced     = db.sync_from_kite_orders(_today_orders)
+                    _n_synced     = db.sync_from_kite_orders(_today_orders, user_id=_cur_user_id)
                     st.success(f"Synced {_n_synced} trade(s) from Kite." if _n_synced
                                else "All open trades already up-to-date.")
                     st.rerun()
@@ -3388,7 +3470,7 @@ with tab_activity:
         st.markdown("---")
 
     # ── Summary stats ──────────────────────────────────────────────────────
-    _stats = db.get_trade_stats()
+    _stats = db.get_trade_stats(user_id=_cur_user_id)
     if _stats.get("total", 0) == 0:
         st.info(
             "No trades yet. Go to **🎯 Trade Signals** tab and click "
@@ -3427,7 +3509,10 @@ with tab_activity:
         _sort_by       = _f4.selectbox("Sort by", ["Newest first", "Oldest first", "P&L ↓", "P&L ↑"])
 
         # ── Load and filter ────────────────────────────────────────────────
-        _log_df = db.load_trade_log(status_filter=_filter_status if _filter_status else None)
+        _log_df = db.load_trade_log(
+            status_filter=_filter_status if _filter_status else None,
+            user_id=_cur_user_id,
+        )
 
         if _filter_setup:
             _log_df = _log_df[_log_df["setup_type"].isin(_filter_setup)]

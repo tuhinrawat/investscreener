@@ -28,15 +28,16 @@ def get_conn():
 
 def _migrate_trade_log_columns(con):
     """
-    Add kite_order_id / kite_sl_order_id / kite_status to existing trade_log
-    tables that pre-date this feature.  Idempotent.
+    Idempotent migration — adds columns introduced after the initial schema.
+    Safe to call on both new and existing databases.
     """
-    kite_cols = [
+    extra_cols = [
+        ("kite_user_id",     "VARCHAR"),   # per-user isolation
         ("kite_order_id",    "VARCHAR"),
         ("kite_sl_order_id", "VARCHAR"),
         ("kite_status",      "VARCHAR"),
     ]
-    for col, dtype in kite_cols:
+    for col, dtype in extra_cols:
         try:
             con.execute(
                 f"ALTER TABLE trade_log ADD COLUMN IF NOT EXISTS {col} {dtype}"
@@ -219,6 +220,9 @@ def init_schema():
             rec_reason          VARCHAR,
             rec_composite_score DOUBLE,
             rec_ai_score        DOUBLE,
+
+            -- ── WHO placed this trade (per-user isolation) ───────────────
+            kite_user_id        VARCHAR,   -- Kite user_id (e.g. "ZY1234")
 
             -- ── KITE ORDER IDs (set when order placed via Kite API) ───────
             kite_order_id       VARCHAR,   -- entry order id returned by Kite
@@ -417,10 +421,10 @@ def log_trade(trade: dict) -> int:
             setup_type, signal_type,
             rec_entry, rec_stop, rec_t1, rec_t2, rec_rr, rec_reason,
             rec_composite_score, rec_ai_score,
-            kite_order_id, kite_sl_order_id, kite_status,
+            kite_user_id, kite_order_id, kite_sl_order_id, kite_status,
             quantity, actual_entry, actual_exit, status, notes,
             pnl_amount, pnl_pct, slippage_entry_pct, rr_realised
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, [
         trade.get("trade_date"),
         trade.get("tradingsymbol"),
@@ -435,6 +439,7 @@ def log_trade(trade: dict) -> int:
         trade.get("rec_reason"),
         trade.get("rec_composite_score"),
         trade.get("rec_ai_score"),
+        trade.get("kite_user_id"),
         trade.get("kite_order_id"),
         trade.get("kite_sl_order_id"),
         trade.get("kite_status"),
@@ -496,22 +501,29 @@ def delete_trade(trade_id: int):
     con.close()
 
 
-def load_trade_log(status_filter: list = None) -> pd.DataFrame:
-    """Load all trade log entries, newest first. Optionally filter by status list."""
+def load_trade_log(status_filter: list = None, user_id: str = "") -> pd.DataFrame:
+    """Load trade log entries for a specific user, newest first."""
     con = get_conn()
+    _uid_clause  = "AND kite_user_id = ?" if user_id else ""
+    _uid_params  = [user_id] if user_id else []
     if status_filter:
         placeholders = ",".join(["?"] * len(status_filter))
+        where = f"WHERE status IN ({placeholders}) {_uid_clause}"
         df = con.execute(
-            f"SELECT * FROM trade_log WHERE status IN ({placeholders}) ORDER BY logged_at DESC",
-            status_filter,
+            f"SELECT * FROM trade_log {where} ORDER BY logged_at DESC",
+            status_filter + _uid_params,
         ).df()
     else:
-        df = con.execute("SELECT * FROM trade_log ORDER BY logged_at DESC").df()
+        where = f"WHERE 1=1 {_uid_clause}" if user_id else ""
+        df = con.execute(
+            f"SELECT * FROM trade_log {where} ORDER BY logged_at DESC",
+            _uid_params,
+        ).df()
     con.close()
     return df
 
 
-def sync_from_kite_orders(orders: list) -> int:
+def sync_from_kite_orders(orders: list, user_id: str = "") -> int:
     """
     Given today's Kite order list (from client.get_orders()), update matching
     OPEN trade_log entries that have a kite_order_id.
@@ -527,9 +539,12 @@ def sync_from_kite_orders(orders: list) -> int:
         return 0
     orders_map = {str(o.get("order_id", "")): o for o in orders}
     con = get_conn()
+    _uid_clause = "AND kite_user_id = ?" if user_id else ""
+    _uid_param  = [user_id] if user_id else []
     open_rows = con.execute(
         "SELECT id, kite_order_id, actual_entry, quantity, signal_type, rec_entry, rec_stop "
-        "FROM trade_log WHERE status = 'OPEN' AND kite_order_id IS NOT NULL"
+        f"FROM trade_log WHERE status = 'OPEN' AND kite_order_id IS NOT NULL {_uid_clause}",
+        _uid_param,
     ).fetchall()
     updated = 0
     for row in open_rows:
@@ -559,10 +574,11 @@ def sync_from_kite_orders(orders: list) -> int:
     return updated
 
 
-def get_trade_stats() -> dict:
-    """Aggregate stats for the Activity Log summary header."""
+def get_trade_stats(user_id: str = "") -> dict:
+    """Aggregate stats for the Activity Log summary header, scoped to user."""
     con = get_conn()
-    row = con.execute("""
+    _uid_clause = "WHERE kite_user_id = ?" if user_id else ""
+    row = con.execute(f"""
         SELECT
             COUNT(*)                                             AS total,
             SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END)   AS open_count,
@@ -572,8 +588,8 @@ def get_trade_stats() -> dict:
             AVG(CASE WHEN rr_realised IS NOT NULL THEN rr_realised END) AS avg_rr,
             MAX(pnl_amount)                                      AS best_trade,
             MIN(pnl_amount)                                      AS worst_trade
-        FROM trade_log
-    """).fetchone()
+        FROM trade_log {_uid_clause}
+    """, [user_id] if user_id else []).fetchone()
     con.close()
     if row is None:
         return {}

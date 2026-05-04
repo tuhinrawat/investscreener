@@ -49,28 +49,52 @@ class KiteClient:
     (app.py) is responsible for driving the OAuth flow via get_login_url() /
     complete_auth(). No blocking CLI prompts.
     """
-    def __init__(self):
-        # Read keys fresh on every instantiation — config.KITE_API_KEY is a
-        # module-level constant set at import time, so it won't reflect keys
-        # saved to screener_keys.json during a st.rerun() within the same
-        # Python process.  Calling _get_secret() directly always hits the
-        # file system and picks up newly saved values.
-        _api_key    = config._get_secret("KITE_API_KEY")
-        _api_secret = config._get_secret("KITE_API_SECRET")
-        self.missing_keys = not (_api_key and _api_secret)
+    def __init__(
+        self,
+        api_key: str = "",
+        api_secret: str = "",
+        access_token: str = "",
+    ):
+        """
+        Create a KiteClient.
+
+        Params (all optional):
+          api_key      — Kite API key.  Falls back to env / screener_keys.json.
+          api_secret   — Kite API secret.  Same fallback chain.
+          access_token — Pre-existing OAuth token for this session.  When
+                         supplied the client is immediately authenticated without
+                         touching the disk cache.  Pass "" to attempt the disk
+                         cache (useful for local single-user dev).
+
+        Multi-user usage (Streamlit Cloud):
+          Pass api_key, api_secret, and access_token from st.session_state so
+          each browser session has fully isolated credentials.
+        """
+        _key    = api_key    or config._get_secret("KITE_API_KEY")
+        _secret = api_secret or config._get_secret("KITE_API_SECRET")
+
+        self._api_key    = _key
+        self._api_secret = _secret
+        self.missing_keys = not (_key and _secret)
+
+        self.hist_limiter  = RateLimiter(config.HIST_REQUESTS_PER_SEC)
+        self.quote_limiter = RateLimiter(config.QUOTE_REQUESTS_PER_SEC)
+
         if self.missing_keys:
-            # No API credentials — mark as unauthenticated and skip SDK init.
-            # The app will show a "configure secrets" prompt instead of crashing.
             self.authenticated = False
             self.kite = None
-            self.hist_limiter  = RateLimiter(config.HIST_REQUESTS_PER_SEC)
-            self.quote_limiter = RateLimiter(config.QUOTE_REQUESTS_PER_SEC)
             return
-        self.kite = KiteConnect(api_key=_api_key)
+
+        self.kite = KiteConnect(api_key=_key)
         self._patch_session()
-        self.hist_limiter = RateLimiter(config.HIST_REQUESTS_PER_SEC)
-        self.quote_limiter = RateLimiter(config.QUOTE_REQUESTS_PER_SEC)
-        self.authenticated = self._try_load_cached_token()
+
+        if access_token:
+            # Caller supplied a session token — use it directly, skip disk cache
+            self.kite.set_access_token(access_token)
+            self.authenticated = True
+        else:
+            # Local dev fallback: try today's token from disk
+            self.authenticated = self._try_load_cached_token()
 
     # ----------------------------------------------------------
     # SESSION PATCH — replace requests with curl_cffi so that
@@ -126,23 +150,38 @@ class KiteClient:
     def complete_auth(self, request_token: str) -> str:
         """
         Exchange a request_token (from Kite's OAuth redirect) for an
-        access_token. Caches it to disk and marks this client as authenticated.
+        access_token.  Also writes a local disk cache (for single-user local
+        dev convenience — ignored on Streamlit Cloud where the caller stores
+        the token in st.session_state).
         Returns the access_token string.
         """
         session = self.kite.generate_session(
-            request_token, api_secret=config._get_secret("KITE_API_SECRET")
+            request_token, api_secret=self._api_secret
         )
         access_token = session["access_token"]
         self.kite.set_access_token(access_token)
         self.authenticated = True
 
-        token_path = Path(config.TOKEN_CACHE)
-        token_path.parent.mkdir(parents=True, exist_ok=True)
-        token_path.write_text(json.dumps({
-            "access_token": access_token,
-            "date": date.today().isoformat(),
-        }))
+        # Keep disk cache for local dev
+        try:
+            token_path = Path(config.TOKEN_CACHE)
+            token_path.parent.mkdir(parents=True, exist_ok=True)
+            token_path.write_text(json.dumps({
+                "access_token": access_token,
+                "date": date.today().isoformat(),
+            }))
+        except Exception:
+            pass
         return access_token
+
+    def get_profile(self) -> dict:
+        """Fetch the logged-in user's profile (user_id, user_name, email)."""
+        if self.kite is None or not self.authenticated:
+            return {}
+        try:
+            return self.kite.profile() or {}
+        except Exception:
+            return {}
 
     # ----------------------------------------------------------
     # INSTRUMENTS — full master list of NSE securities

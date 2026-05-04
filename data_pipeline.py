@@ -381,14 +381,16 @@ def compute_metrics_for_universe(universe_df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 # MAIN ORCHESTRATORS — these are what app.py calls
 # ============================================================
-def full_rescan(progress_callback=None) -> dict:
+def full_rescan(progress_callback=None, client: "KiteClient | None" = None) -> dict:
     """
     The big one. End-to-end refresh.
+    Pass `client` from st.session_state["kite_client"] for multi-user isolation.
     Returns summary dict for UI display.
     """
     t0 = time.time()
     db.init_schema()
-    client = KiteClient()
+    if client is None:
+        client = KiteClient()
 
     # Step 1: Universe (only if stale, or if DB has non-EQ instruments from a
     # previous run that lacked the series filter)
@@ -447,7 +449,7 @@ def full_rescan(progress_callback=None) -> dict:
     }
 
 
-def quick_refresh() -> dict:
+def quick_refresh(client: "KiteClient | None" = None) -> dict:
     """
     Fast intra-day refresh. Updates LTP + today's stats, re-ranks composite,
     AND recomputes all trade signals against the fresh price.
@@ -462,7 +464,8 @@ def quick_refresh() -> dict:
     ~10-15 seconds total (OHLC batch fetch + vectorised signal computation).
     """
     t0 = time.time()
-    client = KiteClient()
+    if client is None:
+        client = KiteClient()
     metrics = db.load_metrics()
     if metrics.empty:
         return {"error": "No cached metrics. Run Full Rescan first."}
