@@ -197,8 +197,8 @@ if _tmp_kc.missing_keys:
                 1. Go to [developers.kite.trade](https://developers.kite.trade) and log in with your Zerodha account
                 2. Click **Create new app** → fill in a name (e.g. "Screener")
                 3. Set **Redirect URL** to:
-                   - Local: `http://127.0.0.1:8501`
-                   - Streamlit Cloud: your app URL (e.g. `https://yourapp.streamlit.app`)
+                   - Streamlit Cloud: `https://tuhinrawat-investscreener-app-miqshh.streamlit.app/`
+                   - Local dev: `http://127.0.0.1:8501`
                 4. Copy the **API Key** and **API Secret** from the app detail page
                 5. Paste them in the **sidebar on the left** and click **Save & Connect**
 
@@ -362,8 +362,12 @@ if not st.session_state["kite_authenticated"]:
         <div class="login-note">
           <strong>One-time setup ·</strong>
           In your <a href="https://developers.kite.trade" target="_blank">Kite Developer Console</a>,
-          set the app Redirect URL to <code>http://127.0.0.1:8501</code>
-          (or your Streamlit Cloud URL). The session token is cached until 6 AM IST next day.
+          set the app <strong style="color:#94a3b8">Redirect URL</strong> to one of:<br><br>
+          <code>https://tuhinrawat-investscreener-app-miqshh.streamlit.app/</code><br>
+          <span style="color:#475569;font-size:0.76rem;">— Streamlit Cloud (production)</span><br><br>
+          <code>http://127.0.0.1:8501</code><br>
+          <span style="color:#475569;font-size:0.76rem;">— Local development</span><br><br>
+          The session token is cached until 6 AM IST the next day.
         </div>
 
         <div class="login-footer">
