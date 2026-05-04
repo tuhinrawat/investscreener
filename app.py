@@ -15,11 +15,17 @@ from plotly.subplots import make_subplots
 import charts as _charts
 from datetime import datetime, timezone, timedelta, date as date_type
 
+import os as _os
+
 import config
 import db
 import data_pipeline
 import ai_analyst as _ai
 from kite_client import KiteClient
+
+# True when running inside a Streamlit Cloud container.
+# Keys must NEVER be written to shared disk in that environment.
+_ON_CLOUD: bool = _os.environ.get("HOME", "").rstrip("/").endswith("appuser")
 
 
 # ============================================================
@@ -130,19 +136,15 @@ def _init_session_kite_state():
     if "kite_ss_initialized" in st.session_state:
         return
 
-    # On Streamlit Cloud (HOME=/home/appuser) st.secrets are SHARED across
-    # ALL users of the deployment, so we must never auto-populate credentials
-    # into session_state from any shared source.  Each user enters their own
-    # keys via the sidebar, which stores them only in their browser session.
+    # On Streamlit Cloud st.secrets are deployment-wide (shared across ALL
+    # users), so we never auto-populate credentials from any shared source.
+    # Each user enters their own keys; they live only in their browser session.
     #
-    # On local dev (HOME != /home/appuser) we seed from the local .env file
-    # as a convenience so the developer doesn't re-enter keys on every restart.
-    import os as _os
-    _on_cloud = _os.environ.get("HOME", "").rstrip("/").endswith("appuser")
-    if _on_cloud:
-        _k, _s = "", ""   # cloud: always start empty — user must enter own keys
+    # On local dev we seed from the local .env file for convenience — the
+    # developer is the only person hitting 127.0.0.1:8501.
+    if _ON_CLOUD:
+        _k, _s = "", ""   # cloud: always start empty
     else:
-        # Local dev only: read from actual process env vars (.env file)
         _k = _os.getenv("KITE_API_KEY", "")
         _s = _os.getenv("KITE_API_SECRET", "")
 
@@ -187,8 +189,10 @@ if not (_ss_api_key and _ss_api_secret):
         if _setup_k.strip() and _setup_s.strip():
             st.session_state["kite_api_key"]    = _setup_k.strip()
             st.session_state["kite_api_secret"] = _setup_s.strip()
-            # Persist to disk for local-dev token cache convenience
-            _ai.save_kite_keys(_setup_k.strip(), _setup_s.strip())
+            # On local dev: persist to disk so keys survive Streamlit restarts.
+            # On Cloud: keys stay in session_state only — no shared disk writes.
+            if not _ON_CLOUD:
+                _ai.save_kite_keys(_setup_k.strip(), _setup_s.strip())
             st.rerun()
         else:
             st.sidebar.error("Both API Key and Secret are required.")
@@ -678,8 +682,9 @@ with st.sidebar.expander("🔄 Update API Keys", expanded=False):
         if _upd_k.strip() and _upd_s.strip():
             st.session_state["kite_api_key"]    = _upd_k.strip()
             st.session_state["kite_api_secret"] = _upd_s.strip()
-            # Persist locally for convenience on local dev
-            _ai.save_kite_keys(_upd_k.strip(), _upd_s.strip())
+            # Only persist to disk on local dev (not Cloud — shared container)
+            if not _ON_CLOUD:
+                _ai.save_kite_keys(_upd_k.strip(), _upd_s.strip())
             # Clear auth so new keys are used on next Zerodha login
             for _k in ("kite_authenticated", "kite_client", "kite_access_token",
                        "kite_access_date", "kite_user_id", "kite_user_name"):
