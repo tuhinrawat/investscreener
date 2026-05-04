@@ -216,32 +216,50 @@ if _pending_rt and _ss_api_key and _ss_api_secret:
             st.session_state["kite_authenticated"] = True
             st.session_state["kite_client"]        = _client
             st.session_state.pop("_pending_rt", None)
+            st.session_state.pop("_kite_ls_waited", None)
             if _ON_CLOUD:
                 _ls_set("kite_access_token", _acc_token,  expires_days=1)
                 _ls_set("kite_access_date",  _today_str,  expires_days=1)
             st.rerun()
         except Exception as _auth_err:
             st.session_state.pop("_pending_rt", None)
+            st.session_state.pop("_kite_ls_waited", None)
             st.error(f"Authentication failed: {_auth_err}. Please try logging in again.")
             st.stop()
 
 # ── Step 1b — request_token received but localStorage not yet ready ────
-# The localStorage component (rendered above by _init_session_kite_state)
-# will fire on the NEXT render cycle and populate the keys automatically —
-# no manual sleep/rerun needed.  We just show a message and stop here;
-# Streamlit will rerun on its own when the component value arrives.
+# _ls_get() returns None on the FIRST render (component JS hasn't fired).
+# On the SECOND render the component returns the real value ("key" or "").
+# We wait exactly ONE render cycle:
+#   • if keys arrive  → Step 1 above handles the exchange on the next pass
+#   • if keys are ""  → localStorage has no saved keys; fall through to
+#                       Step 2b so the user can enter them manually.
+#                       _pending_rt stays set, so Step 1 fires as soon
+#                       as they click "Save & Connect".
 elif _pending_rt and not (_ss_api_key and _ss_api_secret):
-    st.info("⏳ Completing authentication, please wait…")
-    st.stop()
+    if not st.session_state.get("_kite_ls_waited"):
+        # First time here — give the localStorage component one render to fire
+        st.session_state["_kite_ls_waited"] = True
+        st.info("⏳ Completing authentication, please wait…")
+        st.stop()
+    # Second time here (component already fired but keys still empty):
+    # clear the wait flag and fall through to Step 2b (onboarding form).
+    st.session_state.pop("_kite_ls_waited", None)
 
 # ── Step 2b — no keys at all: show onboarding ─────────────────────────
 if not (_ss_api_key and _ss_api_secret):
     st.sidebar.title("⚙️ Setup")
     st.sidebar.subheader("🔑 Zerodha Kite Connect")
-    st.sidebar.caption(
-        "Enter your Kite Connect API credentials below to get started.  \n"
-        "Keys are stored **only in your browser** and never shared."
-    )
+    if _pending_rt:
+        st.sidebar.warning(
+            "🔐 You've authenticated with Zerodha! Enter your API Key & Secret below "
+            "to finish connecting — we'll complete the login automatically."
+        )
+    else:
+        st.sidebar.caption(
+            "Enter your Kite Connect API credentials below to get started.  \n"
+            "Keys are stored **only in your browser** and never shared."
+        )
     _setup_k = st.sidebar.text_input(
         "API Key",
         value="",
