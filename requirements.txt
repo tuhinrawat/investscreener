@@ -1,5 +1,6 @@
 # Core framework
 streamlit>=1.40.0
+extra-streamlit-components>=0.18.0
 pillow>=10.4.0
 
 # Data & analytics
