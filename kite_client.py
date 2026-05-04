@@ -50,7 +50,14 @@ class KiteClient:
     complete_auth(). No blocking CLI prompts.
     """
     def __init__(self):
-        self.missing_keys = not (config.KITE_API_KEY and config.KITE_API_SECRET)
+        # Read keys fresh on every instantiation — config.KITE_API_KEY is a
+        # module-level constant set at import time, so it won't reflect keys
+        # saved to screener_keys.json during a st.rerun() within the same
+        # Python process.  Calling _get_secret() directly always hits the
+        # file system and picks up newly saved values.
+        _api_key    = config._get_secret("KITE_API_KEY")
+        _api_secret = config._get_secret("KITE_API_SECRET")
+        self.missing_keys = not (_api_key and _api_secret)
         if self.missing_keys:
             # No API credentials — mark as unauthenticated and skip SDK init.
             # The app will show a "configure secrets" prompt instead of crashing.
@@ -59,7 +66,7 @@ class KiteClient:
             self.hist_limiter  = RateLimiter(config.HIST_REQUESTS_PER_SEC)
             self.quote_limiter = RateLimiter(config.QUOTE_REQUESTS_PER_SEC)
             return
-        self.kite = KiteConnect(api_key=config.KITE_API_KEY)
+        self.kite = KiteConnect(api_key=_api_key)
         self._patch_session()
         self.hist_limiter = RateLimiter(config.HIST_REQUESTS_PER_SEC)
         self.quote_limiter = RateLimiter(config.QUOTE_REQUESTS_PER_SEC)
@@ -123,7 +130,7 @@ class KiteClient:
         Returns the access_token string.
         """
         session = self.kite.generate_session(
-            request_token, api_secret=config.KITE_API_SECRET
+            request_token, api_secret=config._get_secret("KITE_API_SECRET")
         )
         access_token = session["access_token"]
         self.kite.set_access_token(access_token)
