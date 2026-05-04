@@ -8,10 +8,11 @@ Why DuckDB and not SQLite?
   - Single-file like SQLite, no server
   - Trade-off: single-writer (fine for us, screener is single-user)
 
-Why three tables?
-  - instruments: changes weekly, ~2K rows
-  - daily_ohlcv: changes daily, ~500K rows after 252 days × 2K stocks
+Tables:
+  - instruments:      changes weekly, ~2K rows
+  - daily_ohlcv:      changes daily, ~500K rows after 252 days × 2K stocks
   - computed_metrics: derived, recomputed on full rescan, ~2K rows
+  - trade_log:        user trade journal — recommendation vs actual outcome
 """
 import duckdb
 import pandas as pd
@@ -176,7 +177,70 @@ def init_schema():
         );
     """)
     _migrate_signal_columns(con)
+    # trade_log — must always be created (safe: IF NOT EXISTS)
+    con.execute("""
+        CREATE SEQUENCE IF NOT EXISTS trade_log_id_seq START 1;
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS trade_log (
+            id                  BIGINT DEFAULT nextval('trade_log_id_seq') PRIMARY KEY,
+            logged_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            trade_date          DATE,
+            tradingsymbol       VARCHAR,
+            instrument_token    BIGINT,
+            setup_type          VARCHAR,   -- SWING / INTRADAY / SCALING
+            signal_type         VARCHAR,   -- BUY / SELL / BUY_ABOVE / SELL_BELOW
+
+            -- ── ORIGINAL RECOMMENDATION snapshot ──────────────────────────
+            rec_entry           DOUBLE,
+            rec_stop            DOUBLE,
+            rec_t1              DOUBLE,
+            rec_t2              DOUBLE,
+            rec_rr              DOUBLE,
+            rec_reason          VARCHAR,
+            rec_composite_score DOUBLE,
+            rec_ai_score        DOUBLE,
+
+            -- ── ACTUAL TRADE (what user did) ──────────────────────────────
+            quantity            INTEGER,
+            actual_entry        DOUBLE,
+            actual_exit         DOUBLE,    -- NULL = still open
+            status              VARCHAR,   -- OPEN / CLOSED / TARGET_HIT / STOPPED_OUT / CANCELLED
+            notes               TEXT,
+
+            -- ── CALCULATED OUTCOMES (populated on close) ─────────────────
+            pnl_amount          DOUBLE,    -- (exit-entry)*qty, sign-aware for shorts
+            pnl_pct             DOUBLE,    -- (exit-entry)/entry*100
+            slippage_entry_pct  DOUBLE,    -- (actual_entry-rec_entry)/rec_entry*100
+            rr_realised         DOUBLE     -- actual_gain/actual_risk
+        );
+    """)
     con.close()
+
+
+def _compute_outcomes(quantity: int, actual_entry: float, actual_exit: float,
+                      rec_entry: float, rec_stop: float, signal_type: str) -> dict:
+    """Compute pnl_amount, pnl_pct, slippage_entry_pct, rr_realised from trade data."""
+    direction = -1 if signal_type in ("SELL", "SELL_BELOW") else 1
+    pnl_amount = None
+    pnl_pct    = None
+    rr_realised = None
+    if actual_exit is not None and actual_entry:
+        pnl_amount  = direction * (actual_exit - actual_entry) * (quantity or 1)
+        pnl_pct     = direction * (actual_exit - actual_entry) / actual_entry * 100
+        risk        = abs(actual_entry - rec_stop) if rec_stop else None
+        actual_gain = direction * (actual_exit - actual_entry)
+        if risk and risk > 0:
+            rr_realised = actual_gain / risk
+    slippage = None
+    if rec_entry and actual_entry:
+        slippage = (actual_entry - rec_entry) / rec_entry * 100
+    return {
+        "pnl_amount":         pnl_amount,
+        "pnl_pct":            pnl_pct,
+        "slippage_entry_pct": slippage,
+        "rr_realised":        rr_realised,
+    }
 
 
 def upsert_instruments(df: pd.DataFrame):
@@ -296,3 +360,155 @@ def get_last_metrics_update() -> str:
     if result is None or result[0] is None:
         return "never"
     return result[0].strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TRADE LOG — journal of recommendations vs actual outcomes
+# ═══════════════════════════════════════════════════════════════════════════
+
+def log_trade(trade: dict) -> int:
+    """
+    Insert a new trade log entry. Returns the new row id.
+    trade dict keys: tradingsymbol, instrument_token, setup_type, signal_type,
+    trade_date, rec_entry, rec_stop, rec_t1, rec_t2, rec_rr, rec_reason,
+    rec_composite_score, rec_ai_score, quantity, actual_entry, actual_exit (opt),
+    status, notes.
+    """
+    outcomes = _compute_outcomes(
+        trade.get("quantity") or 1,
+        trade.get("actual_entry"),
+        trade.get("actual_exit"),
+        trade.get("rec_entry"),
+        trade.get("rec_stop"),
+        trade.get("signal_type", ""),
+    )
+    con = get_conn()
+    con.execute("""
+        INSERT INTO trade_log (
+            trade_date, tradingsymbol, instrument_token,
+            setup_type, signal_type,
+            rec_entry, rec_stop, rec_t1, rec_t2, rec_rr, rec_reason,
+            rec_composite_score, rec_ai_score,
+            quantity, actual_entry, actual_exit, status, notes,
+            pnl_amount, pnl_pct, slippage_entry_pct, rr_realised
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, [
+        trade.get("trade_date"),
+        trade.get("tradingsymbol"),
+        trade.get("instrument_token"),
+        trade.get("setup_type"),
+        trade.get("signal_type"),
+        trade.get("rec_entry"),
+        trade.get("rec_stop"),
+        trade.get("rec_t1"),
+        trade.get("rec_t2"),
+        trade.get("rec_rr"),
+        trade.get("rec_reason"),
+        trade.get("rec_composite_score"),
+        trade.get("rec_ai_score"),
+        trade.get("quantity"),
+        trade.get("actual_entry"),
+        trade.get("actual_exit"),
+        trade.get("status", "OPEN"),
+        trade.get("notes"),
+        outcomes["pnl_amount"],
+        outcomes["pnl_pct"],
+        outcomes["slippage_entry_pct"],
+        outcomes["rr_realised"],
+    ])
+    row_id = con.execute("SELECT max(id) FROM trade_log").fetchone()[0]
+    con.close()
+    return row_id
+
+
+def close_trade(trade_id: int, actual_exit: float, status: str, notes: str = None):
+    """Update an OPEN trade with exit price and final status, recompute outcomes."""
+    con = get_conn()
+    row = con.execute(
+        "SELECT quantity, actual_entry, rec_entry, rec_stop, signal_type, notes "
+        "FROM trade_log WHERE id = ?", [trade_id]
+    ).fetchone()
+    if not row:
+        con.close()
+        return
+    qty, ae, re, rs, sig, old_notes = row
+    outcomes = _compute_outcomes(qty or 1, ae, actual_exit, re, rs, sig or "")
+    merged_notes = "\n".join(filter(None, [old_notes, notes]))
+    con.execute("""
+        UPDATE trade_log
+        SET actual_exit         = ?,
+            status              = ?,
+            notes               = ?,
+            pnl_amount          = ?,
+            pnl_pct             = ?,
+            slippage_entry_pct  = ?,
+            rr_realised         = ?
+        WHERE id = ?
+    """, [
+        actual_exit,
+        status,
+        merged_notes,
+        outcomes["pnl_amount"],
+        outcomes["pnl_pct"],
+        outcomes["slippage_entry_pct"],
+        outcomes["rr_realised"],
+        trade_id,
+    ])
+    con.close()
+
+
+def delete_trade(trade_id: int):
+    """Remove a trade log entry (e.g. accidental log)."""
+    con = get_conn()
+    con.execute("DELETE FROM trade_log WHERE id = ?", [trade_id])
+    con.close()
+
+
+def load_trade_log(status_filter: list = None) -> pd.DataFrame:
+    """Load all trade log entries, newest first. Optionally filter by status list."""
+    con = get_conn()
+    if status_filter:
+        placeholders = ",".join(["?"] * len(status_filter))
+        df = con.execute(
+            f"SELECT * FROM trade_log WHERE status IN ({placeholders}) ORDER BY logged_at DESC",
+            status_filter,
+        ).df()
+    else:
+        df = con.execute("SELECT * FROM trade_log ORDER BY logged_at DESC").df()
+    con.close()
+    return df
+
+
+def get_trade_stats() -> dict:
+    """Aggregate stats for the Activity Log summary header."""
+    con = get_conn()
+    row = con.execute("""
+        SELECT
+            COUNT(*)                                             AS total,
+            SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END)   AS open_count,
+            SUM(CASE WHEN pnl_amount > 0   THEN 1 ELSE 0 END)  AS wins,
+            SUM(CASE WHEN pnl_amount <= 0 AND status != 'OPEN' THEN 1 ELSE 0 END) AS losses,
+            COALESCE(SUM(pnl_amount), 0)                        AS total_pnl,
+            AVG(CASE WHEN rr_realised IS NOT NULL THEN rr_realised END) AS avg_rr,
+            MAX(pnl_amount)                                      AS best_trade,
+            MIN(pnl_amount)                                      AS worst_trade
+        FROM trade_log
+    """).fetchone()
+    con.close()
+    if row is None:
+        return {}
+    total, open_c, wins, losses, tot_pnl, avg_rr, best, worst = row
+    closed = (total or 0) - (open_c or 0)
+    win_rate = (wins / closed * 100) if closed > 0 else 0.0
+    return {
+        "total":      total or 0,
+        "open":       open_c or 0,
+        "closed":     closed,
+        "wins":       wins or 0,
+        "losses":     losses or 0,
+        "win_rate":   win_rate,
+        "total_pnl":  tot_pnl or 0.0,
+        "avg_rr":     avg_rr,
+        "best_trade": best,
+        "worst_trade": worst,
+    }

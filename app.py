@@ -535,9 +535,11 @@ col4.metric("Last update", last_update.split()[1] if last_update != "never" else
 
 
 # ============================================================
-# TAB LAYOUT — Screener | Trade Signals
+# TAB LAYOUT — Screener | Trade Signals | Activity Log
 # ============================================================
-tab_screener, tab_signals = st.tabs(["📋 Screener", "🎯 Trade Signals"])
+tab_screener, tab_signals, tab_activity = st.tabs([
+    "📋 Screener", "🎯 Trade Signals", "📒 Activity Log"
+])
 
 # ─── helper used by both tabs ───────────────────────────────
 def _stars(q) -> str:
@@ -556,6 +558,119 @@ def _fmt(v, fmt="₹{:,.2f}", fallback="—"):
         return fmt.format(float(v))
     except Exception:
         return fallback
+
+
+def _fv(v):
+    """Return float or None, safe for NaN."""
+    try:
+        f = float(v)
+        return None if pd.isna(f) else f
+    except Exception:
+        return None
+
+
+def _render_log_trade_form(signal_df: pd.DataFrame, setup_type: str, form_key: str):
+    """
+    Render a compact 'Log a trade' form below a signal table.
+    signal_df must have columns: tradingsymbol, rec_entry, rec_stop, rec_t1, rec_t2,
+    rec_rr, rec_reason, instrument_token, composite_score, ai_score, signal_type.
+    setup_type: 'SWING' | 'INTRADAY' | 'SCALING'
+    """
+    if signal_df.empty:
+        return
+
+    with st.expander("📝 Log a trade from this list", expanded=False):
+        st.markdown(
+            '<div style="font-size:12px;color:#94a3b8;margin-bottom:8px;">'
+            'Record your actual entry/exit against the recommendation. '
+            'Stored in DB to track win-rate and improve future signals.'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        sym_col, _ = st.columns([2, 5])
+        sym_options = sorted(signal_df["tradingsymbol"].dropna().unique().tolist())
+        selected_sym = sym_col.selectbox(
+            "Select symbol", sym_options, key=f"{form_key}_sym"
+        )
+
+        # Pre-fill from the selected signal row
+        row = signal_df[signal_df["tradingsymbol"] == selected_sym]
+        if row.empty:
+            return
+        row = row.iloc[0]
+        r_entry  = _fv(row.get("rec_entry")  or row.get("swing_entry") or row.get("intraday_entry") or row.get("scale_entry_1"))
+        r_stop   = _fv(row.get("rec_stop")   or row.get("swing_stop")  or row.get("intraday_stop")  or row.get("scale_stop"))
+        r_t1     = _fv(row.get("rec_t1")     or row.get("swing_t1")    or row.get("intraday_t1")    or row.get("scale_target"))
+        r_t2     = _fv(row.get("rec_t2")     or row.get("swing_t2"))
+        r_rr     = _fv(row.get("rec_rr")     or row.get("swing_rr"))
+        r_reason = str(row.get("rec_reason") or row.get("swing_reason") or row.get("intraday_reason") or row.get("scale_reason") or "")
+        r_token  = int(row.get("instrument_token") or 0)
+        r_cscore = _fv(row.get("composite_score"))
+        r_ai     = _fv(row.get("ai_score"))
+        r_sigtype = str(row.get("signal_type") or row.get("swing_signal") or row.get("intraday_signal") or row.get("scale_signal") or "BUY")
+
+        # Show recommendation snapshot
+        cols_rec = st.columns(5)
+        cols_rec[0].metric("Rec Entry",  _fmt(r_entry))
+        cols_rec[1].metric("Rec Stop",   _fmt(r_stop))
+        cols_rec[2].metric("T1",         _fmt(r_t1))
+        cols_rec[3].metric("T2",         _fmt(r_t2) if r_t2 else "—")
+        cols_rec[4].metric("R/R",        f"{r_rr:.1f}×" if r_rr else "—")
+
+        with st.form(key=f"{form_key}_form_{selected_sym}"):
+            c1, c2, c3, c4 = st.columns(4)
+            trade_date   = c1.date_input("Trade date", value=pd.Timestamp.today().date(), key=f"{form_key}_date")
+            quantity     = c2.number_input("Quantity (shares)", min_value=1, value=1, step=1, key=f"{form_key}_qty")
+            actual_entry = c3.number_input("Actual entry ₹", min_value=0.01, value=float(r_entry or 0) or 0.01, step=0.05, format="%.2f", key=f"{form_key}_ae")
+            status       = c4.selectbox("Status", ["OPEN", "CLOSED", "TARGET_HIT", "STOPPED_OUT", "CANCELLED"], key=f"{form_key}_st")
+
+            c5, c6 = st.columns(2)
+            actual_exit  = c5.number_input(
+                "Actual exit ₹ (0 = still open)",
+                min_value=0.0, value=0.0, step=0.05, format="%.2f",
+                key=f"{form_key}_ex",
+            )
+            notes = c6.text_input("Notes (optional)", placeholder="e.g. gapped up at open, exited early", key=f"{form_key}_notes")
+
+            submitted = st.form_submit_button("💾 Save Trade Log", type="primary", use_container_width=True)
+
+        if submitted:
+            trade_dict = {
+                "trade_date":          trade_date,
+                "tradingsymbol":       selected_sym,
+                "instrument_token":    r_token,
+                "setup_type":          setup_type,
+                "signal_type":         r_sigtype,
+                "rec_entry":           r_entry,
+                "rec_stop":            r_stop,
+                "rec_t1":              r_t1,
+                "rec_t2":              r_t2,
+                "rec_rr":              r_rr,
+                "rec_reason":          r_reason[:200],
+                "rec_composite_score": r_cscore,
+                "rec_ai_score":        r_ai,
+                "quantity":            quantity,
+                "actual_entry":        float(actual_entry) if actual_entry else None,
+                "actual_exit":         float(actual_exit)  if actual_exit  else None,
+                "status":              status,
+                "notes":               notes or None,
+            }
+            try:
+                new_id = db.log_trade(trade_dict)
+                # Compute quick P&L preview
+                if actual_exit and actual_entry:
+                    direction = -1 if r_sigtype in ("SELL", "SELL_BELOW") else 1
+                    pnl       = direction * (float(actual_exit) - float(actual_entry)) * quantity
+                    pnl_pct   = direction * (float(actual_exit) - float(actual_entry)) / float(actual_entry) * 100
+                    col_r = "green" if pnl >= 0 else "red"
+                    st.success(
+                        f"✅ Trade logged (id={new_id}) — "
+                        f"P&L: ₹{pnl:+,.2f} ({pnl_pct:+.2f}%)"
+                    )
+                else:
+                    st.success(f"✅ Trade logged as {status} (id={new_id})")
+            except Exception as _e:
+                st.error(f"Failed to save: {_e}")
 
 
 # ─── SCREENER TAB ───────────────────────────────────────────
@@ -2376,6 +2491,16 @@ def _intraday_long_live():
         """,
         unsafe_allow_html=True,
     )
+    _si_log = _si.assign(
+        rec_entry=_si.get("intraday_entry"),
+        rec_stop=_si.get("intraday_stop"),
+        rec_t1=_si.get("intraday_t1"),
+        rec_t2=None,
+        rec_rr=None,
+        rec_reason=_si.get("intraday_reason"),
+        signal_type="BUY_ABOVE",
+    ) if not _si.empty else _si
+    _render_log_trade_form(_si_log, setup_type="INTRADAY", form_key="intra_long")
 
 
 # ── FRAGMENT 2b: intraday SHORT table (live status column) ───────────────────
@@ -2624,6 +2749,7 @@ def _signals_main():
                     "Quality": st.column_config.TextColumn("Quality", help="★★★★★ = best (full EMA stack + ADX confirmed + strong volume)"),
                 },
             )
+            _render_log_trade_form(_sb, setup_type="SWING", form_key="sw_buy")
 
     # ── EXIT / SELL ───────────────────────────────────────────────
     with _sig_t2:
@@ -2687,6 +2813,17 @@ def _signals_main():
                     ),
                 },
             )
+            # Enrich _se with field aliases so form pre-fills correctly
+            _se_log = _se.assign(
+                rec_entry=_se.get("swing_entry"),
+                rec_stop=_se.get("swing_stop"),
+                rec_t1=_se.get("swing_t1"),
+                rec_t2=_se.get("swing_t2"),
+                rec_rr=_se.get("swing_rr"),
+                rec_reason=_se.get("swing_reason"),
+                signal_type=_se.get("swing_signal"),
+            ) if not _se.empty else _se
+            _render_log_trade_form(_se_log, setup_type="SWING", form_key="sw_exit")
 
     # ── INTRADAY PLAN ─────────────────────────────────────────────
     with _sig_t3:
@@ -2762,6 +2899,16 @@ def _signals_main():
                     "Quality":            st.column_config.TextColumn("Quality",    help="★★★★★ = best. Requires full EMA stack + positive RS + strong 6M return."),
                 },
             )
+            _ssc_log = _ssc.assign(
+                rec_entry=_ssc.get("scale_entry_1"),
+                rec_stop=_ssc.get("scale_stop"),
+                rec_t1=_ssc.get("scale_target"),
+                rec_t2=None,
+                rec_rr=None,
+                rec_reason=_ssc.get("scale_reason"),
+                signal_type=_ssc.get("scale_signal"),
+            ) if not _ssc.empty else _ssc
+            _render_log_trade_form(_ssc_log, setup_type="SCALING", form_key="scaling")
 
 
 with tab_signals:
@@ -2772,3 +2919,224 @@ with tab_signals:
     else:
         _live_signals_header()   # Fragment: live clock + LTP fetch + metric pills (no tabs)
         _signals_main()          # Stable: all 4 tabs + tables (never re-creates tab widgets)
+
+
+# ============================================================
+# ACTIVITY LOG TAB
+# ============================================================
+with tab_activity:
+    st.subheader("📒 Trade Activity Log")
+    st.caption(
+        "A journal of every trade you've logged against a recommendation. "
+        "All entries include the original signal (entry, stop, targets) alongside "
+        "your actual trade — enabling win-rate analysis and strategy improvement over time."
+    )
+
+    # ── Summary stats ──────────────────────────────────────────────────────
+    _stats = db.get_trade_stats()
+    if _stats.get("total", 0) == 0:
+        st.info(
+            "No trades logged yet. Go to the **🎯 Trade Signals** tab, "
+            "pick a signal and click **📝 Log a trade** below the table.",
+            icon="📒",
+        )
+    else:
+        _s1, _s2, _s3, _s4, _s5, _s6 = st.columns(6)
+        _s1.metric("Total trades",   _stats["total"])
+        _s2.metric("Open",           _stats["open"])
+        _s3.metric("Win rate",
+                   f"{_stats['win_rate']:.1f}%" if _stats["closed"] > 0 else "—",
+                   help="% of closed trades with positive P&L")
+        _s4.metric("Total P&L",
+                   f"₹{_stats['total_pnl']:+,.0f}",
+                   delta=f"{'▲' if _stats['total_pnl'] >= 0 else '▼'} overall")
+        _s5.metric("Best trade",
+                   f"₹{_stats['best_trade']:+,.0f}" if _stats["best_trade"] else "—")
+        _s6.metric("Avg R/R realised",
+                   f"{_stats['avg_rr']:.2f}×" if _stats["avg_rr"] else "—",
+                   help="Actual gain/risk ratio achieved across closed trades")
+
+        st.markdown("---")
+
+        # ── Filters ────────────────────────────────────────────────────────
+        _f1, _f2, _f3, _f4 = st.columns(4)
+        _filter_status = _f1.multiselect(
+            "Status", ["OPEN", "CLOSED", "TARGET_HIT", "STOPPED_OUT", "CANCELLED"],
+            default=[], placeholder="All statuses",
+        )
+        _filter_setup  = _f2.multiselect(
+            "Setup type", ["SWING", "INTRADAY", "SCALING"],
+            default=[], placeholder="All setups",
+        )
+        _filter_sym    = _f3.text_input("Symbol search", placeholder="e.g. RELIANCE")
+        _sort_by       = _f4.selectbox("Sort by", ["Newest first", "Oldest first", "P&L ↓", "P&L ↑"])
+
+        # ── Load and filter ────────────────────────────────────────────────
+        _log_df = db.load_trade_log(status_filter=_filter_status if _filter_status else None)
+
+        if _filter_setup:
+            _log_df = _log_df[_log_df["setup_type"].isin(_filter_setup)]
+        if _filter_sym:
+            _log_df = _log_df[_log_df["tradingsymbol"].str.contains(_filter_sym.upper(), na=False)]
+
+        if _sort_by == "Oldest first":
+            _log_df = _log_df.sort_values("logged_at", ascending=True)
+        elif _sort_by == "P&L ↓":
+            _log_df = _log_df.sort_values("pnl_amount", ascending=False, na_position="last")
+        elif _sort_by == "P&L ↑":
+            _log_df = _log_df.sort_values("pnl_amount", ascending=True,  na_position="last")
+
+        st.caption(f"Showing {len(_log_df)} of {_stats['total']} entries")
+
+        if not _log_df.empty:
+            # ── Render trade log table ──────────────────────────────────────
+            _disp_cols = [
+                "id", "trade_date", "tradingsymbol", "setup_type", "signal_type",
+                "quantity",
+                "rec_entry", "actual_entry",
+                "rec_stop",
+                "rec_t1", "actual_exit",
+                "pnl_amount", "pnl_pct",
+                "rr_realised", "slippage_entry_pct",
+                "status", "notes",
+            ]
+            _disp_cols = [c for c in _disp_cols if c in _log_df.columns]
+            _log_show  = _log_df[_disp_cols].copy()
+
+            def _pnl_color(val):
+                try:
+                    v = float(str(val).replace("₹","").replace(",","").replace("+",""))
+                    if v > 0:  return "color:#22c55e;font-weight:600"
+                    if v < 0:  return "color:#ef4444;font-weight:600"
+                except Exception:
+                    pass
+                return ""
+
+            def _status_badge_color(val):
+                colors = {
+                    "TARGET_HIT":  "color:#22c55e;font-weight:700",
+                    "STOPPED_OUT": "color:#ef4444;font-weight:700",
+                    "OPEN":        "color:#f59e0b;font-weight:600",
+                    "CANCELLED":   "color:#94a3b8",
+                    "CLOSED":      "color:#3b82f6;font-weight:600",
+                }
+                return colors.get(str(val).upper(), "")
+
+            _pnl_sub  = [c for c in ["pnl_amount", "pnl_pct", "rr_realised"] if c in _log_show.columns]
+            _stat_sub = [c for c in ["status"] if c in _log_show.columns]
+
+            styled_log = _log_show.style.format({
+                "rec_entry":   "₹{:,.2f}",
+                "actual_entry":"₹{:,.2f}",
+                "rec_stop":    "₹{:,.2f}",
+                "rec_t1":      "₹{:,.2f}",
+                "actual_exit": "₹{:,.2f}",
+                "pnl_amount":  "₹{:+,.2f}",
+                "pnl_pct":     "{:+.2f}%",
+                "rr_realised": "{:.2f}×",
+                "slippage_entry_pct": "{:+.2f}%",
+            }, na_rep="—")
+            if _pnl_sub:
+                styled_log = styled_log.map(_pnl_color, subset=_pnl_sub)
+            if _stat_sub:
+                styled_log = styled_log.map(_status_badge_color, subset=_stat_sub)
+
+            st.dataframe(
+                styled_log,
+                use_container_width=True,
+                height=min(600, 60 + len(_log_show) * 38),
+                hide_index=True,
+                column_config={
+                    "id":                  st.column_config.NumberColumn("ID",         width="small"),
+                    "trade_date":          st.column_config.DateColumn("Date"),
+                    "tradingsymbol":       st.column_config.TextColumn("Symbol"),
+                    "setup_type":          st.column_config.TextColumn("Setup"),
+                    "signal_type":         st.column_config.TextColumn("Signal"),
+                    "quantity":            st.column_config.NumberColumn("Qty"),
+                    "rec_entry":           st.column_config.TextColumn("Rec Entry",     help="What the screener recommended"),
+                    "actual_entry":        st.column_config.TextColumn("Actual Entry",  help="Your actual execution price"),
+                    "rec_stop":            st.column_config.TextColumn("Rec Stop",      help="Recommended stop-loss"),
+                    "rec_t1":              st.column_config.TextColumn("Rec T1",        help="Recommended first target"),
+                    "actual_exit":         st.column_config.TextColumn("Actual Exit",   help="Your actual exit price"),
+                    "pnl_amount":          st.column_config.TextColumn("P&L ₹",         help="(Exit − Entry) × Qty"),
+                    "pnl_pct":             st.column_config.TextColumn("P&L %",          help="(Exit − Entry) / Entry × 100"),
+                    "rr_realised":         st.column_config.TextColumn("R/R actual",    help="Actual gain ÷ actual risk"),
+                    "slippage_entry_pct":  st.column_config.TextColumn("Entry slip %",  help="How far your entry was from the recommended entry"),
+                    "status":              st.column_config.TextColumn("Status"),
+                    "notes":               st.column_config.TextColumn("Notes",          width="large"),
+                },
+            )
+
+            # ── Close / update open trades ────────────────────────────────
+            _open_trades = _log_df[_log_df["status"] == "OPEN"]
+            if not _open_trades.empty:
+                st.markdown("---")
+                st.subheader("📌 Close an open trade")
+                _cl_ids = _open_trades["id"].tolist()
+                _cl_labels = [
+                    f"#{r['id']} · {r['tradingsymbol']} ({r['setup_type']}) — entered ₹{r['actual_entry']:.2f}"
+                    for _, r in _open_trades.iterrows()
+                ]
+                _id_map = dict(zip(_cl_labels, _cl_ids))
+                _selected_label = st.selectbox("Select open trade to close", _cl_labels, key="close_trade_sel")
+                _selected_id    = _id_map.get(_selected_label)
+                if _selected_id:
+                    _ct1, _ct2, _ct3 = st.columns(3)
+                    _close_exit   = _ct1.number_input("Exit price ₹", min_value=0.01, value=0.01, step=0.05, format="%.2f", key="close_exit")
+                    _close_status = _ct2.selectbox("Outcome", ["CLOSED", "TARGET_HIT", "STOPPED_OUT", "CANCELLED"], key="close_status")
+                    _close_notes  = _ct3.text_input("Notes", key="close_notes")
+                    if st.button("✅ Close Trade", type="primary", key="close_trade_btn"):
+                        db.close_trade(_selected_id, float(_close_exit), _close_status, _close_notes or None)
+                        st.success(f"Trade #{_selected_id} closed as {_close_status} at ₹{_close_exit:.2f}")
+                        st.rerun()
+
+            # ── Delete a trade (accidental log) ──────────────────────────
+            with st.expander("🗑️ Delete a trade entry", expanded=False):
+                _del_id = st.number_input("Trade ID to delete", min_value=1, step=1, key="del_trade_id")
+                if st.button("Delete", type="secondary", key="del_trade_btn"):
+                    db.delete_trade(int(_del_id))
+                    st.success(f"Trade #{_del_id} deleted.")
+                    st.rerun()
+
+            # ── Training data export ──────────────────────────────────────
+            st.markdown("---")
+            st.subheader("📊 Strategy Insights")
+            _closed = _log_df[_log_df["status"].isin(["CLOSED","TARGET_HIT","STOPPED_OUT"])]
+            if len(_closed) >= 3:
+                _ins1, _ins2, _ins3 = st.columns(3)
+                # Win rate by setup
+                _wr_setup = (
+                    _closed.groupby("setup_type")
+                    .apply(lambda g: (g["pnl_amount"] > 0).mean() * 100, include_groups=False)
+                    .reset_index(name="Win %")
+                )
+                _ins1.markdown("**Win rate by setup**")
+                _ins1.dataframe(_wr_setup, hide_index=True, use_container_width=True)
+
+                # Avg P&L by signal type
+                _avg_pnl = (
+                    _closed.groupby("signal_type")["pnl_pct"]
+                    .mean()
+                    .reset_index(name="Avg P&L %")
+                    .sort_values("Avg P&L %", ascending=False)
+                )
+                _ins2.markdown("**Avg P&L % by signal**")
+                _ins2.dataframe(_avg_pnl.style.format({"Avg P&L %": "{:+.2f}%"}), hide_index=True, use_container_width=True)
+
+                # Slippage analysis
+                _slip = _closed["slippage_entry_pct"].dropna()
+                if not _slip.empty:
+                    _ins3.markdown("**Entry slippage**")
+                    _ins3.metric("Avg slippage", f"{_slip.mean():+.2f}%", help="How much you overpaid vs recommended entry on average")
+                    _ins3.metric("Max slippage", f"{_slip.max():+.2f}%")
+
+                # CSV export
+                st.download_button(
+                    "⬇️ Export full log as CSV",
+                    data=_log_df.to_csv(index=False).encode(),
+                    file_name=f"trade_log_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv",
+                    help="Download your full trade journal for offline analysis or model training."
+                )
+            else:
+                st.info("Log at least 3 closed trades to see strategy insights.", icon="📊")
