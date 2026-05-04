@@ -247,6 +247,25 @@ class KiteClient:
         """Return current net + day positions with unrealized P&L."""
         return self.kite.positions()
 
+    def get_holdings(self) -> list:
+        """
+        Return long-term equity holdings from DEMAT.
+        Each item has: tradingsymbol, quantity, average_price, last_price,
+        close_price, pnl, day_change, day_change_percentage.
+        """
+        return self.kite.holdings() or []
+
+    def get_margins(self, segment: str = "equity") -> dict:
+        """
+        Return fund/margin details for the given segment ('equity' or 'commodity').
+        Key fields under the segment key:
+          net                  — total account balance
+          available.live_balance — cash available to trade right now
+          available.cash       — cash component
+          used.debits          — total debit (used margin + MTM losses)
+        """
+        return self.kite.margins(segment) or {}
+
     def get_ltp_batch(self, instruments: list[str]) -> dict[str, float]:
         """
         Fastest possible price fetch — returns only the last traded price.

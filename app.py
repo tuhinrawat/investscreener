@@ -3091,6 +3091,84 @@ with tab_activity:
                 except Exception as _sync_err:
                     st.error(f"Sync failed: {_sync_err}")
 
+    # ── PORTFOLIO SNAPSHOT (live from Kite) ────────────────────────────────
+    if _act_kite_ok:
+        with st.container():
+            st.markdown(
+                '<div style="font-size:0.78rem;color:#64748b;font-weight:600;'
+                'letter-spacing:0.05em;text-transform:uppercase;margin-bottom:6px;">'
+                'Portfolio Snapshot — live from Kite</div>',
+                unsafe_allow_html=True,
+            )
+            try:
+                _margins   = _act_kc.get_margins("equity")
+                _eq        = _margins.get("equity", _margins)   # some SDK versions return flat dict
+                _avail     = _eq.get("available", {})
+                _used      = _eq.get("used", {})
+                _net_bal   = float(_eq.get("net", 0) or 0)
+                _live_bal  = float(_avail.get("live_balance", _avail.get("cash", 0)) or 0)
+                _used_deb  = float(_used.get("debits", 0) or 0)
+
+                _holdings  = _act_kc.get_holdings()
+                _h_value   = sum(float(h.get("last_price", 0)) * float(h.get("quantity", 0))
+                                 for h in _holdings if h.get("quantity", 0) > 0)
+                _h_pnl     = sum(float(h.get("pnl", 0)) for h in _holdings)
+                _h_day_pnl = sum(float(h.get("day_change", 0)) * float(h.get("quantity", 0))
+                                 for h in _holdings if h.get("quantity", 0) > 0)
+                _h_count   = sum(1 for h in _holdings if h.get("quantity", 0) > 0)
+
+                _positions = _act_kc.get_positions()
+                _net_pos   = _positions.get("net", []) if isinstance(_positions, dict) else []
+                _pos_open  = [p for p in _net_pos if p.get("quantity", 0) != 0]
+                _pos_value = sum(abs(float(p.get("value", 0))) for p in _pos_open)
+                _pos_pnl   = sum(float(p.get("unrealised", 0)) for p in _pos_open)
+                _pos_m2m   = sum(float(p.get("m2m", 0)) for p in _net_pos)
+
+                _p1, _p2, _p3, _p4, _p5, _p6, _p7 = st.columns(7)
+                _p1.metric(
+                    "Available Funds",
+                    f"₹{_live_bal:,.0f}",
+                    help="Cash available to place new orders right now",
+                )
+                _p2.metric(
+                    "Net Balance",
+                    f"₹{_net_bal:,.0f}",
+                    help="Total account value = cash + collateral − debits",
+                )
+                _p3.metric(
+                    "Margin Used",
+                    f"₹{_used_deb:,.0f}",
+                    help="Total debits / margin currently blocked",
+                )
+                _p4.metric(
+                    "Holdings Value",
+                    f"₹{_h_value:,.0f}",
+                    delta=f"₹{_h_day_pnl:+,.0f} today" if _h_count else None,
+                    help=f"Current market value of {_h_count} holding(s) in your DEMAT",
+                )
+                _p5.metric(
+                    "Holdings P&L",
+                    f"₹{_h_pnl:+,.0f}",
+                    delta=f"{(_h_pnl / (_h_value - _h_pnl) * 100) if (_h_value - _h_pnl) > 0 else 0:+.1f}% overall",
+                    help="Total unrealised gain/loss on long-term holdings (vs avg buy price)",
+                )
+                _p6.metric(
+                    "Open Positions",
+                    f"₹{_pos_value:,.0f}",
+                    delta=f"₹{_pos_pnl:+,.0f} unrealised" if _pos_open else None,
+                    help=f"{len(_pos_open)} open short-term position(s) — intraday/swing MIS",
+                )
+                _p7.metric(
+                    "Today's P&L",
+                    f"₹{_pos_m2m:+,.0f}",
+                    delta=f"₹{_h_day_pnl:+,.0f} holdings" if _h_count else None,
+                    help="Mark-to-market P&L on all positions today (realised + unrealised)",
+                )
+            except Exception as _pf_err:
+                st.caption(f"Portfolio data unavailable: {_pf_err}")
+
+        st.markdown("---")
+
     # ── Summary stats ──────────────────────────────────────────────────────
     _stats = db.get_trade_stats()
     if _stats.get("total", 0) == 0:
