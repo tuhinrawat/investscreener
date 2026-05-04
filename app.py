@@ -212,62 +212,177 @@ if not st.session_state["kite_authenticated"]:
     _login_client = KiteClient()
     _login_url = _login_client.get_login_url()
 
-    st.markdown(
-        """
-        <style>
-        .auth-card {
-            max-width: 480px;
-            margin: 80px auto 0 auto;
-            padding: 40px 48px;
-            border-radius: 16px;
-            border: 1px solid #e2e8f0;
-            background: #ffffff;
-            box-shadow: 0 4px 24px rgba(0,0,0,0.07);
-        }
-        .auth-logo { font-size: 2.4rem; margin-bottom: 8px; }
-        .auth-title { font-size: 1.5rem; font-weight: 700; color: #0f172a; margin-bottom: 4px; }
-        .auth-sub { color: #64748b; margin-bottom: 28px; font-size: 0.95rem; }
-        .auth-note { background: #f8fafc; border-radius: 8px; padding: 12px 16px;
-                     font-size: 0.85rem; color: #475569; margin-top: 20px; }
-        .auth-note code { background: #e2e8f0; padding: 2px 6px; border-radius: 4px;
-                          font-size: 0.82rem; color: #0f172a; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.markdown("""
+    <style>
+    /* Hide the default Streamlit header/footer/sidebar on this page */
+    [data-testid="stSidebar"] { display: none; }
+    [data-testid="stHeader"]  { background: transparent; }
+    .block-container { padding: 0 !important; max-width: 100% !important; }
 
-    _, col, _ = st.columns([1, 2, 1])
-    with col:
-        st.markdown(
-            """
-            <div class="auth-card">
-              <div class="auth-logo">📊</div>
-              <div class="auth-title">NSE Swing Screener</div>
-              <div class="auth-sub">Connect your Zerodha account to get started.</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    .login-page {
+        min-height: 100vh;
+        background: linear-gradient(135deg, #0a0f1e 0%, #0f172a 50%, #0a1628 100%);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 40px 20px;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }
+    .login-wrap {
+        width: 100%;
+        max-width: 440px;
+    }
 
+    /* Logo strip */
+    .login-logo {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 40px;
+        justify-content: center;
+    }
+    .login-logo-icon {
+        width: 44px; height: 44px;
+        background: linear-gradient(135deg, #3b82f6, #6366f1);
+        border-radius: 12px;
+        display: flex; align-items: center; justify-content: center;
+        font-size: 22px;
+    }
+    .login-logo-name {
+        font-size: 1.25rem; font-weight: 700;
+        color: #f1f5f9; letter-spacing: -0.3px;
+    }
+    .login-logo-tag {
+        font-size: 0.72rem; color: #3b82f6; font-weight: 600;
+        letter-spacing: 0.08em; text-transform: uppercase;
+    }
+
+    /* Hero text */
+    .login-hero { text-align: center; margin-bottom: 36px; }
+    .login-hero h1 {
+        font-size: 2rem; font-weight: 800; color: #f8fafc;
+        margin: 0 0 10px; letter-spacing: -0.5px; line-height: 1.2;
+    }
+    .login-hero p {
+        font-size: 0.95rem; color: #64748b; margin: 0; line-height: 1.6;
+    }
+
+    /* Feature pills */
+    .login-features {
+        display: flex; gap: 8px; justify-content: center;
+        flex-wrap: wrap; margin-bottom: 32px;
+    }
+    .login-pill {
+        background: rgba(59,130,246,0.08);
+        border: 1px solid rgba(59,130,246,0.2);
+        color: #93c5fd; font-size: 0.75rem; font-weight: 500;
+        padding: 4px 12px; border-radius: 20px;
+    }
+
+    /* Login card */
+    .login-card {
+        background: rgba(255,255,255,0.04);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 20px;
+        padding: 32px;
+        backdrop-filter: blur(10px);
+        margin-bottom: 16px;
+    }
+    .login-card-title {
+        font-size: 0.78rem; font-weight: 600; color: #475569;
+        letter-spacing: 0.08em; text-transform: uppercase;
+        margin-bottom: 12px;
+    }
+    .login-divider {
+        display: flex; align-items: center; gap: 12px; margin: 20px 0;
+    }
+    .login-divider-line { flex: 1; height: 1px; background: rgba(255,255,255,0.07); }
+    .login-divider-text { font-size: 0.75rem; color: #334155; }
+
+    /* Setup note */
+    .login-note {
+        background: rgba(251,191,36,0.05);
+        border: 1px solid rgba(251,191,36,0.15);
+        border-radius: 12px;
+        padding: 16px 20px;
+        font-size: 0.82rem;
+        color: #94a3b8;
+        line-height: 1.6;
+    }
+    .login-note strong { color: #fbbf24; }
+    .login-note a { color: #60a5fa; text-decoration: none; }
+    .login-note code {
+        background: rgba(255,255,255,0.07);
+        border: 1px solid rgba(255,255,255,0.1);
+        padding: 2px 8px; border-radius: 6px;
+        font-size: 0.79rem; color: #e2e8f0;
+        font-family: 'SF Mono', 'Fira Code', monospace;
+    }
+
+    /* Footer */
+    .login-footer {
+        text-align: center; margin-top: 24px;
+        font-size: 0.73rem; color: #334155;
+    }
+    </style>
+
+    <div class="login-page">
+      <div class="login-wrap">
+
+        <!-- Logo -->
+        <div class="login-logo">
+          <div class="login-logo-icon">📊</div>
+          <div>
+            <div class="login-logo-name">NSE Swing Screener</div>
+            <div class="login-logo-tag">Powered by Zerodha Kite</div>
+          </div>
+        </div>
+
+        <!-- Hero -->
+        <div class="login-hero">
+          <h1>Trade with an edge.</h1>
+          <p>AI-powered swing signals, live portfolio tracking,<br>and direct order execution — all in one place.</p>
+        </div>
+
+        <!-- Feature pills -->
+        <div class="login-features">
+          <span class="login-pill">📈 Swing &amp; Intraday Signals</span>
+          <span class="login-pill">🤖 AI Stock Analysis</span>
+          <span class="login-pill">⚡ Live Order Execution</span>
+          <span class="login-pill">📒 Trade Activity Log</span>
+        </div>
+
+        <!-- Login card (button injected below via Streamlit) -->
+        <div class="login-card">
+          <div class="login-card-title">Connect your Zerodha account</div>
+          <div id="login-btn-slot"></div>
+        </div>
+
+        <!-- Setup note -->
+        <div class="login-note">
+          <strong>One-time setup ·</strong>
+          In your <a href="https://developers.kite.trade" target="_blank">Kite Developer Console</a>,
+          set the app Redirect URL to <code>http://127.0.0.1:8501</code>
+          (or your Streamlit Cloud URL). The session token is cached until 6 AM IST next day.
+        </div>
+
+        <div class="login-footer">
+          Market data &amp; order execution via Zerodha Kite Connect API.
+          Your credentials are never stored on any server.
+        </div>
+
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # The actual button sits inside the card via Streamlit's DOM flow
+    _, _btn_col, _ = st.columns([1, 2, 1])
+    with _btn_col:
         st.link_button(
             "🔑  Login with Zerodha",
             _login_url,
             use_container_width=True,
             type="primary",
-        )
-
-        st.markdown(
-            """
-            <div class="auth-note">
-              <b>One-time setup:</b> In your
-              <a href="https://developers.kite.trade" target="_blank">Kite Developer Console</a>,
-              set the app's <b>Redirect URL</b> to:<br><br>
-              <code>http://127.0.0.1:8501</code><br><br>
-              After login, Zerodha will redirect back here automatically and
-              complete authentication. The token is cached until 6 AM IST the next day.
-            </div>
-            """,
-            unsafe_allow_html=True,
         )
 
     st.stop()
