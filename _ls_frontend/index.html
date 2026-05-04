@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8" /></head>
+<body style="margin:0;padding:0;background:transparent;">
+<script>
+"use strict";
+
+// ── Streamlit component protocol (vanilla JS, no build step needed) ───
+function _send(type, payload) {
+  window.parent.postMessage(
+    Object.assign({ isStreamlitMessage: true, type: type }, payload),
+    "*"
+  );
+}
+
+// Signal ready to Streamlit
+_send("streamlit:componentReady", { apiVersion: 1 });
+
+// Handle render calls from Streamlit
+window.addEventListener("message", function (event) {
+  if (!event.data || !event.data.isStreamlitMessage) return;
+  if (event.data.type !== "streamlit:render") return;
+
+  var args = event.data.args || {};
+  var result = null;
+
+  try {
+    if (args.action === "get") {
+      result = localStorage.getItem(args.key) || "";
+
+    } else if (args.action === "set") {
+      // Store with optional expiry epoch (ms)
+      if (args.expires_ms) {
+        localStorage.setItem(args.key, JSON.stringify({
+          v: args.value, exp: args.expires_ms
+        }));
+      } else {
+        localStorage.setItem(args.key, args.value);
+      }
+      result = "__ok__";
+
+    } else if (args.action === "delete") {
+      localStorage.removeItem(args.key);
+      result = "__ok__";
+
+    } else if (args.action === "get_all") {
+      // Return all keys that belong to this app (prefix: "kite_")
+      var out = {};
+      for (var i = 0; i < localStorage.length; i++) {
+        var k = localStorage.key(i);
+        if (k) out[k] = localStorage.getItem(k);
+      }
+      result = JSON.stringify(out);
+    }
+  } catch (e) {
+    result = "";
+  }
+
+  _send("streamlit:setComponentValue", { value: result });
+});
+</script>
+</body>
+</html>

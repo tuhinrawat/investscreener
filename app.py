@@ -112,13 +112,10 @@ st.set_page_config(
     layout="wide",
 )
 
-# ── Cookie manager (browser-side, per-user, per-domain) ──────────────
-# Must be instantiated immediately after set_page_config so the hidden
-# iframe component renders on EVERY page load — including the auth gate —
-# allowing us to read cookies before any st.stop() is hit.
-import extra_streamlit_components as _stx
-
-_cm = _stx.CookieManager(key="screener_cm")
+# ── Browser localStorage (per-user, per-domain) ──────────────────────
+# ls_get / ls_set / ls_delete persist values in the user's own browser.
+# No external package needed — just a tiny vanilla-JS Streamlit component.
+from ls_store import ls_get as _ls_get, ls_set as _ls_set, ls_delete as _ls_del
 
 
 # ============================================================
@@ -150,10 +147,15 @@ def _init_session_kite_state():
     #
     # On local dev: seed from the local .env file for single-user convenience.
     if _ON_CLOUD:
-        _k     = _cm.get("kite_api_key")      or ""
-        _s     = _cm.get("kite_api_secret")   or ""
-        _token = _cm.get("kite_access_token") or ""
-        _tdate = _cm.get("kite_access_date")  or ""
+        # Restore from browser localStorage (per-user, per-domain).
+        # ls_get returns None on the very first render cycle (before the
+        # component JS fires).  We treat None as "" — the user will see
+        # the key-entry form, and on the second render the real values
+        # populate and trigger a rerun that auto-restores auth.
+        _k     = _ls_get("kite_api_key")      or ""
+        _s     = _ls_get("kite_api_secret")   or ""
+        _token = _ls_get("kite_access_token") or ""
+        _tdate = _ls_get("kite_access_date")  or ""
     else:
         _k     = _os.getenv("KITE_API_KEY", "")
         _s     = _os.getenv("KITE_API_SECRET", "")
@@ -202,11 +204,8 @@ if not (_ss_api_key and _ss_api_secret):
             st.session_state["kite_api_key"]    = _setup_k.strip()
             st.session_state["kite_api_secret"] = _setup_s.strip()
             if _ON_CLOUD:
-                # Persist in the user's own browser (per-domain cookie)
-                from datetime import datetime as _dt, timedelta as _td
-                _exp = _dt.now() + _td(days=365)
-                _cm.set("kite_api_key",    _setup_k.strip(), expires_at=_exp, key="ck_setup_k")
-                _cm.set("kite_api_secret", _setup_s.strip(), expires_at=_exp, key="ck_setup_s")
+                _ls_set("kite_api_key",    _setup_k.strip(), expires_days=365)
+                _ls_set("kite_api_secret", _setup_s.strip(), expires_days=365)
             else:
                 _ai.save_kite_keys(_setup_k.strip(), _setup_s.strip())
             st.rerun()
@@ -264,10 +263,8 @@ if "request_token" in st.query_params:
             st.session_state["kite_client"]       = _client
             # Persist token in browser cookie (expires at next 6 AM IST ≈ 30h)
             if _ON_CLOUD:
-                from datetime import datetime as _dt, timedelta as _td
-                _tkn_exp = _dt.now() + _td(hours=30)
-                _cm.set("kite_access_token", _acc_token,   expires_at=_tkn_exp, key="ck_token")
-                _cm.set("kite_access_date",  _today_str,   expires_at=_tkn_exp, key="ck_tdate")
+                _ls_set("kite_access_token", _acc_token,  expires_days=1)
+                _ls_set("kite_access_date",  _today_str,  expires_days=1)
             st.query_params.clear()
             st.rerun()
         except Exception as _auth_err:
@@ -705,10 +702,8 @@ with st.sidebar.expander("🔄 Update API Keys", expanded=False):
             st.session_state["kite_api_key"]    = _upd_k.strip()
             st.session_state["kite_api_secret"] = _upd_s.strip()
             if _ON_CLOUD:
-                from datetime import datetime as _dt, timedelta as _td
-                _exp = _dt.now() + _td(days=365)
-                _cm.set("kite_api_key",    _upd_k.strip(), expires_at=_exp, key="ck_upd_k")
-                _cm.set("kite_api_secret", _upd_s.strip(), expires_at=_exp, key="ck_upd_s")
+                _ls_set("kite_api_key",    _upd_k.strip(), expires_days=365)
+                _ls_set("kite_api_secret", _upd_s.strip(), expires_days=365)
             else:
                 _ai.save_kite_keys(_upd_k.strip(), _upd_s.strip())
             # Clear auth so new keys take effect on next Zerodha login
@@ -724,11 +719,8 @@ with st.sidebar.expander("🔄 Update API Keys", expanded=False):
 if _ON_CLOUD and st.sidebar.button("🚪 Sign out & forget keys",
                                    use_container_width=True,
                                    help="Clears your API keys and token from this browser"):
-    for _ck in ("kite_api_key", "kite_api_secret", "kite_access_token", "kite_access_date"):
-        try:
-            _cm.delete(_ck, key=f"del_{_ck}")
-        except Exception:
-            pass
+    for _lk in ("kite_api_key", "kite_api_secret", "kite_access_token", "kite_access_date"):
+        _ls_del(_lk)
     for _sk in ("kite_authenticated", "kite_client", "kite_access_token",
                 "kite_access_date", "kite_api_key", "kite_api_secret",
                 "kite_user_id", "kite_user_name", "kite_ss_initialized"):
