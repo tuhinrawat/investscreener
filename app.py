@@ -129,10 +129,23 @@ st.set_page_config(
 def _init_session_kite_state():
     if "kite_ss_initialized" in st.session_state:
         return
-    # Seed from env / screener_keys.json (local dev convenience).
-    # On Streamlit Cloud with no env vars these will be empty strings.
-    _k = config._get_secret("KITE_API_KEY")
-    _s = config._get_secret("KITE_API_SECRET")
+
+    # On Streamlit Cloud (HOME=/home/appuser) st.secrets are SHARED across
+    # ALL users of the deployment, so we must never auto-populate credentials
+    # into session_state from any shared source.  Each user enters their own
+    # keys via the sidebar, which stores them only in their browser session.
+    #
+    # On local dev (HOME != /home/appuser) we seed from the local .env file
+    # as a convenience so the developer doesn't re-enter keys on every restart.
+    import os as _os
+    _on_cloud = _os.environ.get("HOME", "").rstrip("/").endswith("appuser")
+    if _on_cloud:
+        _k, _s = "", ""   # cloud: always start empty — user must enter own keys
+    else:
+        # Local dev only: read from actual process env vars (.env file)
+        _k = _os.getenv("KITE_API_KEY", "")
+        _s = _os.getenv("KITE_API_SECRET", "")
+
     st.session_state.setdefault("kite_api_key",       _k)
     st.session_state.setdefault("kite_api_secret",    _s)
     st.session_state.setdefault("kite_access_token",  "")
