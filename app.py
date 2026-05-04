@@ -3127,41 +3127,41 @@ with tab_activity:
                 _p1, _p2, _p3, _p4, _p5, _p6, _p7 = st.columns(7)
                 _p1.metric(
                     "Available Funds",
-                    f"₹{_live_bal:,.0f}",
+                    f"₹{_live_bal:,.2f}",
                     help="Cash available to place new orders right now",
                 )
                 _p2.metric(
                     "Net Balance",
-                    f"₹{_net_bal:,.0f}",
+                    f"₹{_net_bal:,.2f}",
                     help="Total account value = cash + collateral − debits",
                 )
                 _p3.metric(
                     "Margin Used",
-                    f"₹{_used_deb:,.0f}",
+                    f"₹{_used_deb:,.2f}",
                     help="Total debits / margin currently blocked",
                 )
                 _p4.metric(
                     "Holdings Value",
-                    f"₹{_h_value:,.0f}",
-                    delta=f"₹{_h_day_pnl:+,.0f} today" if _h_count else None,
+                    f"₹{_h_value:,.2f}",
+                    delta=f"₹{_h_day_pnl:+,.2f} today" if _h_count else None,
                     help=f"Current market value of {_h_count} holding(s) in your DEMAT",
                 )
                 _p5.metric(
                     "Holdings P&L",
-                    f"₹{_h_pnl:+,.0f}",
+                    f"₹{_h_pnl:+,.2f}",
                     delta=f"{(_h_pnl / (_h_value - _h_pnl) * 100) if (_h_value - _h_pnl) > 0 else 0:+.1f}% overall",
                     help="Total unrealised gain/loss on long-term holdings (vs avg buy price)",
                 )
                 _p6.metric(
                     "Open Positions",
-                    f"₹{_pos_value:,.0f}",
-                    delta=f"₹{_pos_pnl:+,.0f} unrealised" if _pos_open else None,
+                    f"₹{_pos_value:,.2f}",
+                    delta=f"₹{_pos_pnl:+,.2f} unrealised" if _pos_open else None,
                     help=f"{len(_pos_open)} open short-term position(s) — intraday/swing MIS",
                 )
                 _p7.metric(
                     "Today's P&L",
-                    f"₹{_pos_m2m:+,.0f}",
-                    delta=f"₹{_h_day_pnl:+,.0f} holdings" if _h_count else None,
+                    f"₹{_pos_m2m:+,.2f}",
+                    delta=f"₹{_h_day_pnl:+,.2f} holdings" if _h_count else None,
                     help="Mark-to-market P&L on all positions today (realised + unrealised)",
                 )
             except Exception as _pf_err:
@@ -3185,10 +3185,10 @@ with tab_activity:
                    f"{_stats['win_rate']:.1f}%" if _stats["closed"] > 0 else "—",
                    help="% of closed trades with positive P&L")
         _s4.metric("Total P&L",
-                   f"₹{_stats['total_pnl']:+,.0f}",
+                   f"₹{_stats['total_pnl']:+,.2f}",
                    delta=f"{'▲' if _stats['total_pnl'] >= 0 else '▼'} overall")
         _s5.metric("Best trade",
-                   f"₹{_stats['best_trade']:+,.0f}" if _stats["best_trade"] else "—")
+                   f"₹{_stats['best_trade']:+,.2f}" if _stats["best_trade"] else "—")
         _s6.metric("Avg R/R realised",
                    f"{_stats['avg_rr']:.2f}×" if _stats["avg_rr"] else "—",
                    help="Actual gain/risk ratio achieved across closed trades")
