@@ -142,34 +142,69 @@ if "request_token" in st.query_params:
 if "kite_authenticated" not in st.session_state:
     st.session_state["kite_authenticated"] = _check_cached_auth()
 
-# Step 2b — show "configure secrets" page if API keys are not set at all
+# Step 2b — if API keys are missing, show sidebar entry form + instructions
 _tmp_kc = KiteClient()
 if _tmp_kc.missing_keys:
-    st.error("⚙️ **Kite API credentials not configured.**")
-    st.markdown(
-        """
-        This app requires a Zerodha Kite Connect API key to function.
-
-        **If running locally:**
-        Create a `.env` file in the project root with:
-        ```
-        KITE_API_KEY=your_api_key
-        KITE_API_SECRET=your_api_secret
-        ```
-
-        **If deployed on Streamlit Cloud:**
-        Go to your app → ⋮ menu → **Settings → Secrets** and add:
-        ```toml
-        KITE_API_KEY = "your_api_key"
-        KITE_API_SECRET = "your_api_secret"
-        ```
-        Then click **Save** and **Reboot app**.
-
-        You can create a Kite Connect app at [developers.kite.trade](https://developers.kite.trade).
-        Set the **Redirect URL** to your app's URL (e.g. `https://yourapp.streamlit.app`).
-        """,
-        unsafe_allow_html=False,
+    # ── Sidebar: key entry (renders before st.stop) ──────────────────────
+    st.sidebar.title("⚙️ Setup")
+    st.sidebar.subheader("🔑 Zerodha Kite Connect")
+    st.sidebar.caption(
+        "Enter your Kite Connect API credentials below to get started. "
+        "Keys are saved locally in `screener_keys.json` and never leave this machine."
     )
+    _setup_saved = _ai.load_keys()
+    _setup_k = st.sidebar.text_input(
+        "API Key",
+        value=_setup_saved.get("kite_api_key", ""),
+        type="password",
+        key="setup_kite_key",
+        help="Found in your Kite Developer Console → My Apps → API Key",
+    )
+    _setup_s = st.sidebar.text_input(
+        "API Secret",
+        value=_setup_saved.get("kite_api_secret", ""),
+        type="password",
+        key="setup_kite_secret",
+        help="Found in your Kite Developer Console → My Apps → API Secret",
+    )
+    if st.sidebar.button("💾 Save & Connect", type="primary", use_container_width=True,
+                         key="setup_kite_save"):
+        if _setup_k.strip() and _setup_s.strip():
+            _ai.save_kite_keys(_setup_k.strip(), _setup_s.strip())
+            st.sidebar.success("Keys saved! Reloading…")
+            st.rerun()
+        else:
+            st.sidebar.error("Both API Key and Secret are required.")
+
+    # ── Main area: onboarding instructions ───────────────────────────────
+    _, _oc, _ = st.columns([1, 3, 1])
+    with _oc:
+        st.markdown(
+            """
+            <div style="text-align:center;margin-top:60px;">
+              <div style="font-size:3rem;margin-bottom:8px;">📊</div>
+              <h2 style="color:#f1f5f9;margin-bottom:4px;">NSE Swing Screener</h2>
+              <p style="color:#64748b;margin-bottom:32px;">
+                Enter your Zerodha Kite Connect API credentials in the sidebar to get started.
+              </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        with st.expander("📋 How to get your API Key & Secret", expanded=True):
+            st.markdown(
+                """
+                1. Go to [developers.kite.trade](https://developers.kite.trade) and log in with your Zerodha account
+                2. Click **Create new app** → fill in a name (e.g. "Screener")
+                3. Set **Redirect URL** to:
+                   - Local: `http://127.0.0.1:8501`
+                   - Streamlit Cloud: your app URL (e.g. `https://yourapp.streamlit.app`)
+                4. Copy the **API Key** and **API Secret** from the app detail page
+                5. Paste them in the **sidebar on the left** and click **Save & Connect**
+
+                Your keys are stored only in `screener_keys.json` on this machine and are never transmitted anywhere except Zerodha's own API.
+                """
+            )
     st.stop()
 
 # Step 3 — show login page if not authenticated
@@ -392,12 +427,13 @@ if st.sidebar.button("🔄 Full Rescan (~3-5 min)", use_container_width=True,
 
 st.sidebar.markdown("---")
 
-# ─── Kite connection status + re-auth ───────────────────────
+# ─── Kite connection status + key management ────────────────
+st.sidebar.subheader("🔑 Zerodha Kite Connect")
 _kc_live = st.session_state.get("kite_client")
 if _kc_live and _kc_live.authenticated:
     st.sidebar.markdown(
         '<div style="font-size:12px;color:#22c55e;padding:2px 0 6px 0;">'
-        '🟢 <b>Kite connected</b> — intraday candles & live prices active'
+        '🟢 <b>Kite connected</b> — intraday candles &amp; live prices active'
         '</div>',
         unsafe_allow_html=True,
     )
@@ -409,11 +445,41 @@ else:
         unsafe_allow_html=True,
     )
     _reauth_client = KiteClient()
-    st.sidebar.link_button(
-        "🔑 Authenticate Kite",
-        _reauth_client.get_login_url(),
-        use_container_width=True,
+    _reauth_url = _reauth_client.get_login_url()
+    if _reauth_url:
+        st.sidebar.link_button(
+            "🔑 Authenticate Kite",
+            _reauth_url,
+            use_container_width=True,
+        )
+
+# ── Update / rotate API keys ────────────────────────────────
+with st.sidebar.expander("🔄 Update API Keys", expanded=False):
+    _cur_keys = _ai.load_keys()
+    _upd_k = st.text_input(
+        "API Key",
+        value=_cur_keys.get("kite_api_key", ""),
+        type="password",
+        key="upd_kite_key",
+        help="Kite Developer Console → My Apps → API Key",
     )
+    _upd_s = st.text_input(
+        "API Secret",
+        value=_cur_keys.get("kite_api_secret", ""),
+        type="password",
+        key="upd_kite_secret",
+        help="Kite Developer Console → My Apps → API Secret",
+    )
+    if st.button("💾 Save Keys", key="upd_kite_save", use_container_width=True):
+        if _upd_k.strip() and _upd_s.strip():
+            _ai.save_kite_keys(_upd_k.strip(), _upd_s.strip())
+            # Clear cached auth so the new keys take effect on next rerun
+            st.session_state.pop("kite_authenticated", None)
+            st.session_state.pop("kite_client", None)
+            st.success("Keys updated — please re-authenticate Kite above.")
+            st.rerun()
+        else:
+            st.error("Both fields required.")
 
 st.sidebar.markdown("---")
 

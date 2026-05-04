@@ -14,8 +14,9 @@ load_dotenv()
 def _get_secret(key: str) -> str:
     """
     Read a secret from (in priority order):
-      1. OS environment variable / .env file (local dev)
-      2. Streamlit Cloud Secrets (st.secrets — TOML configured in dashboard)
+      1. OS environment variable / .env file  (local dev)
+      2. Streamlit Cloud Secrets (st.secrets) (cloud deployment via dashboard)
+      3. screener_keys.json                   (entered by user in sidebar UI)
     Returns an empty string if not found anywhere.
     """
     val = os.getenv(key, "")
@@ -23,6 +24,17 @@ def _get_secret(key: str) -> str:
         try:
             import streamlit as st          # noqa: PLC0415 — lazy import OK here
             val = str(st.secrets.get(key, "") or "")
+        except Exception:
+            pass
+    if not val:
+        try:
+            import json as _json
+            _kf = Path(__file__).parent / "screener_keys.json"
+            if _kf.exists():
+                _stored = _json.loads(_kf.read_text())
+                # screener_keys.json uses lowercase keys (kite_api_key / kite_api_secret)
+                _map = {"KITE_API_KEY": "kite_api_key", "KITE_API_SECRET": "kite_api_secret"}
+                val = str(_stored.get(_map.get(key, key), "") or "")
         except Exception:
             pass
     return val or ""

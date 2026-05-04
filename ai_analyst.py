@@ -145,17 +145,38 @@ HORIZON: [Short 1–4 wks / Medium 1–3 months / Long 3–12 months]
 # ── Key persistence ──────────────────────────────────────────────────────────
 
 def load_keys() -> dict:
+    """Load all persisted keys (AI + Kite). Returns dict with all known keys."""
+    defaults = {
+        "openai_key":       "",
+        "openrouter_key":   "",
+        "kite_api_key":     "",
+        "kite_api_secret":  "",
+    }
     if os.path.exists(_KEYS_FILE):
         try:
-            return json.load(open(_KEYS_FILE))
+            stored = json.load(open(_KEYS_FILE))
+            defaults.update(stored)
         except Exception:
             pass
-    return {"openai_key": "", "openrouter_key": ""}
+    return defaults
 
 
 def save_keys(openai_key: str, openrouter_key: str) -> None:
+    """Save AI keys, preserving any existing Kite keys in the file."""
+    existing = load_keys()
+    existing["openai_key"]     = openai_key
+    existing["openrouter_key"] = openrouter_key
     with open(_KEYS_FILE, "w") as f:
-        json.dump({"openai_key": openai_key, "openrouter_key": openrouter_key}, f)
+        json.dump(existing, f)
+
+
+def save_kite_keys(api_key: str, api_secret: str) -> None:
+    """Persist Kite API key + secret, preserving AI keys in the same file."""
+    existing = load_keys()
+    existing["kite_api_key"]    = api_key.strip()
+    existing["kite_api_secret"] = api_secret.strip()
+    with open(_KEYS_FILE, "w") as f:
+        json.dump(existing, f)
 
 
 # ── Client factory ───────────────────────────────────────────────────────────
