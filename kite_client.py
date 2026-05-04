@@ -15,12 +15,18 @@ Auth flow (frontend-driven):
   4. Subsequent runs load the cached token until it expires (~6 AM IST).
 """
 import json
+import os as _kc_os
 import time
 from datetime import datetime, date
 from pathlib import Path
 
 from kiteconnect import KiteConnect
 import config
+
+# On Streamlit Cloud the container filesystem is SHARED between all users.
+# data/access_token.json must never be read or written there — each user's
+# token must come exclusively from their own browser session (session_state).
+_KC_ON_CLOUD: bool = _kc_os.environ.get("HOME", "").rstrip("/").endswith("appuser")
 
 
 class RateLimiter:
@@ -92,8 +98,12 @@ class KiteClient:
             # Caller supplied a session token — use it directly, skip disk cache
             self.kite.set_access_token(access_token)
             self.authenticated = True
+        elif _KC_ON_CLOUD:
+            # On Cloud the disk cache is shared across all users — never read it.
+            # Authentication must come from the per-user browser session only.
+            self.authenticated = False
         else:
-            # Local dev fallback: try today's token from disk
+            # Local dev: try today's token from disk (single-user convenience)
             self.authenticated = self._try_load_cached_token()
 
     # ----------------------------------------------------------
@@ -162,16 +172,17 @@ class KiteClient:
         self.kite.set_access_token(access_token)
         self.authenticated = True
 
-        # Keep disk cache for local dev
-        try:
-            token_path = Path(config.TOKEN_CACHE)
-            token_path.parent.mkdir(parents=True, exist_ok=True)
-            token_path.write_text(json.dumps({
-                "access_token": access_token,
-                "date": date.today().isoformat(),
-            }))
-        except Exception:
-            pass
+        # Write disk cache only on local dev — never on Cloud (shared file)
+        if not _KC_ON_CLOUD:
+            try:
+                token_path = Path(config.TOKEN_CACHE)
+                token_path.parent.mkdir(parents=True, exist_ok=True)
+                token_path.write_text(json.dumps({
+                    "access_token": access_token,
+                    "date": date.today().isoformat(),
+                }))
+            except Exception:
+                pass
         return access_token
 
     def get_profile(self) -> dict:

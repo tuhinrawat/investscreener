@@ -291,12 +291,11 @@ if not st.session_state.get("kite_authenticated"):
                 st.session_state["kite_client"]    = _rc
         except Exception:
             pass
-    else:
-        # Try disk cache (local-dev single-user convenience)
+    elif not _ON_CLOUD:
+        # Local dev only: try disk cache (single-user, no sharing risk)
         try:
             _rc = KiteClient(api_key=_ss_api_key, api_secret=_ss_api_secret)
             if _rc.authenticated:
-                # Hydrate session_state from the disk token
                 _profile = _rc.get_profile()
                 st.session_state["kite_user_id"]   = _profile.get("user_id",  "")
                 st.session_state["kite_user_name"] = _profile.get("user_name","")
