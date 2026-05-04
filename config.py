@@ -10,11 +10,29 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _get_secret(key: str) -> str:
+    """
+    Read a secret from (in priority order):
+      1. OS environment variable / .env file (local dev)
+      2. Streamlit Cloud Secrets (st.secrets — TOML configured in dashboard)
+    Returns an empty string if not found anywhere.
+    """
+    val = os.getenv(key, "")
+    if not val:
+        try:
+            import streamlit as st          # noqa: PLC0415 — lazy import OK here
+            val = str(st.secrets.get(key, "") or "")
+        except Exception:
+            pass
+    return val or ""
+
+
 # ============================================================
-# AUTH — credentials from .env (never commit this file)
+# AUTH — credentials from .env (local) or Streamlit Cloud Secrets
 # ============================================================
-KITE_API_KEY = os.getenv("KITE_API_KEY", "")
-KITE_API_SECRET = os.getenv("KITE_API_SECRET", "")
+KITE_API_KEY    = _get_secret("KITE_API_KEY")
+KITE_API_SECRET = _get_secret("KITE_API_SECRET")
 
 # ============================================================
 # PATHS

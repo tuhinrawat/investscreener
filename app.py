@@ -117,8 +117,11 @@ st.set_page_config(
 
 def _check_cached_auth() -> bool:
     """Return True if today's access token is already cached on disk."""
-    client = KiteClient()
-    return client.authenticated
+    try:
+        client = KiteClient()
+        return client.authenticated
+    except Exception:
+        return False
 
 
 # Step 1 — handle Kite OAuth redirect (?request_token=xxx in URL)
@@ -138,6 +141,36 @@ if "request_token" in st.query_params:
 # Step 2 — check session state / cached token
 if "kite_authenticated" not in st.session_state:
     st.session_state["kite_authenticated"] = _check_cached_auth()
+
+# Step 2b — show "configure secrets" page if API keys are not set at all
+_tmp_kc = KiteClient()
+if _tmp_kc.missing_keys:
+    st.error("⚙️ **Kite API credentials not configured.**")
+    st.markdown(
+        """
+        This app requires a Zerodha Kite Connect API key to function.
+
+        **If running locally:**
+        Create a `.env` file in the project root with:
+        ```
+        KITE_API_KEY=your_api_key
+        KITE_API_SECRET=your_api_secret
+        ```
+
+        **If deployed on Streamlit Cloud:**
+        Go to your app → ⋮ menu → **Settings → Secrets** and add:
+        ```toml
+        KITE_API_KEY = "your_api_key"
+        KITE_API_SECRET = "your_api_secret"
+        ```
+        Then click **Save** and **Reboot app**.
+
+        You can create a Kite Connect app at [developers.kite.trade](https://developers.kite.trade).
+        Set the **Redirect URL** to your app's URL (e.g. `https://yourapp.streamlit.app`).
+        """,
+        unsafe_allow_html=False,
+    )
+    st.stop()
 
 # Step 3 — show login page if not authenticated
 if not st.session_state["kite_authenticated"]:

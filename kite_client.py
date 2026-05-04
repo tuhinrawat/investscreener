@@ -50,11 +50,15 @@ class KiteClient:
     complete_auth(). No blocking CLI prompts.
     """
     def __init__(self):
-        if not config.KITE_API_KEY:
-            raise RuntimeError(
-                "KITE_API_KEY missing. Create a .env file with "
-                "KITE_API_KEY=xxx and KITE_API_SECRET=xxx"
-            )
+        self.missing_keys = not (config.KITE_API_KEY and config.KITE_API_SECRET)
+        if self.missing_keys:
+            # No API credentials — mark as unauthenticated and skip SDK init.
+            # The app will show a "configure secrets" prompt instead of crashing.
+            self.authenticated = False
+            self.kite = None
+            self.hist_limiter  = RateLimiter(config.HIST_REQUESTS_PER_SEC)
+            self.quote_limiter = RateLimiter(config.QUOTE_REQUESTS_PER_SEC)
+            return
         self.kite = KiteConnect(api_key=config.KITE_API_KEY)
         self._patch_session()
         self.hist_limiter = RateLimiter(config.HIST_REQUESTS_PER_SEC)
@@ -108,6 +112,8 @@ class KiteClient:
 
     def get_login_url(self) -> str:
         """Return the Zerodha OAuth login URL to open in the browser."""
+        if self.kite is None:
+            return ""
         return self.kite.login_url()
 
     def complete_auth(self, request_token: str) -> str:
