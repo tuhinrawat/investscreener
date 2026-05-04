@@ -39,16 +39,21 @@ def ls_get(key: str) -> str | None:
     Returns:
         str  — the stored value (may be "")
         None — on the first render cycle before the component has responded
+
+    Each call passes `key=f"_ls_get_{key}"` as the Streamlit widget identity
+    so instances have stable keys across reruns and never collide with
+    st.session_state keys (which use plain names like "kite_api_key").
+    The localStorage key name is passed as `ls_key` to avoid Streamlit's
+    reserved `key` parameter.
     """
-    raw = _ls(action="get", key=key, default=None)
+    raw = _ls(action="get", ls_key=key, default=None, key=f"_ls_get_{key}")
     if raw is None:
         return None
-    # Check expiry if the value was stored as JSON with exp field
     try:
         obj = json.loads(raw)
         if isinstance(obj, dict) and "v" in obj and "exp" in obj:
             if datetime.now().timestamp() * 1000 > obj["exp"]:
-                ls_delete(key)   # expired — clean up
+                ls_delete(key)
                 return ""
             return obj["v"]
     except (json.JSONDecodeError, TypeError):
@@ -67,9 +72,10 @@ def ls_set(key: str, value: str, expires_days: int = 0) -> None:
         expires_ms = int(
             (datetime.now() + timedelta(days=expires_days)).timestamp() * 1000
         )
-    _ls(action="set", key=key, value=value, expires_ms=expires_ms, default=None)
+    _ls(action="set", ls_key=key, value=value, expires_ms=expires_ms,
+        default=None, key=f"_ls_set_{key}")
 
 
 def ls_delete(key: str) -> None:
     """Remove a key from localStorage."""
-    _ls(action="delete", key=key, default=None)
+    _ls(action="delete", ls_key=key, default=None, key=f"_ls_del_{key}")

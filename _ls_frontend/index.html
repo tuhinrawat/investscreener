@@ -25,22 +25,25 @@ window.addEventListener("message", function (event) {
   var result = null;
 
   try {
+    // Use ls_key (not "key") to avoid Streamlit's reserved widget-key parameter
+    var lsKey = args.ls_key;
+
     if (args.action === "get") {
-      result = localStorage.getItem(args.key) || "";
+      result = localStorage.getItem(lsKey) || "";
 
     } else if (args.action === "set") {
       // Store with optional expiry epoch (ms)
       if (args.expires_ms) {
-        localStorage.setItem(args.key, JSON.stringify({
+        localStorage.setItem(lsKey, JSON.stringify({
           v: args.value, exp: args.expires_ms
         }));
       } else {
-        localStorage.setItem(args.key, args.value);
+        localStorage.setItem(lsKey, args.value);
       }
       result = "__ok__";
 
     } else if (args.action === "delete") {
-      localStorage.removeItem(args.key);
+      localStorage.removeItem(lsKey);
       result = "__ok__";
 
     } else if (args.action === "get_all") {
