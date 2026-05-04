@@ -136,7 +136,16 @@ from ls_store import ls_get as _ls_get, ls_set as _ls_set, ls_delete as _ls_del
 # enters their own credentials — giving true per-user isolation.
 # ============================================================
 
-# ── Step 0: seed session-state keys once per session ──────────────────
+# ── Step 0a: capture incoming request_token BEFORE anything else ──────
+# session_state survives st.rerun() but NOT cross-page navigation.
+# When Zerodha redirects back, it's a fresh page load with empty session.
+# We save the token here so it survives the 1-2 reruns needed for the
+# localStorage component to fire and return the API key/secret.
+if "request_token" in st.query_params:
+    st.session_state["_pending_rt"] = st.query_params["request_token"]
+    st.query_params.clear()          # clean the URL immediately
+
+# ── Step 0b: seed session-state keys once per session ─────────────────
 def _init_session_kite_state():
     if "kite_ss_initialized" in st.session_state:
         return
@@ -175,14 +184,50 @@ _init_session_kite_state()
 
 _ss_api_key    = st.session_state.get("kite_api_key",    "")
 _ss_api_secret = st.session_state.get("kite_api_secret", "")
+_pending_rt    = st.session_state.get("_pending_rt",     "")
 
-# ── Step 2b — no keys in session yet: show onboarding ─────────────────
+# ── Step 1 — exchange pending request_token (if we have keys) ─────────
+# Keys may arrive 1 render cycle after the OAuth redirect because the
+# localStorage component needs one render to fire.
+if _pending_rt and _ss_api_key and _ss_api_secret:
+    with st.spinner("Completing Zerodha authentication…"):
+        try:
+            _client    = KiteClient(api_key=_ss_api_key, api_secret=_ss_api_secret)
+            _acc_token = _client.complete_auth(_pending_rt)
+            _profile   = _client.get_profile()
+            _today_str = date_type.today().isoformat()
+            st.session_state["kite_access_token"]  = _acc_token
+            st.session_state["kite_access_date"]   = _today_str
+            st.session_state["kite_user_id"]       = _profile.get("user_id",   "")
+            st.session_state["kite_user_name"]     = _profile.get("user_name", "")
+            st.session_state["kite_authenticated"] = True
+            st.session_state["kite_client"]        = _client
+            st.session_state.pop("_pending_rt", None)
+            if _ON_CLOUD:
+                _ls_set("kite_access_token", _acc_token,  expires_days=1)
+                _ls_set("kite_access_date",  _today_str,  expires_days=1)
+            st.rerun()
+        except Exception as _auth_err:
+            st.session_state.pop("_pending_rt", None)
+            st.error(f"Authentication failed: {_auth_err}. Please try logging in again.")
+            st.stop()
+
+# ── Step 1b — request_token received but localStorage not yet ready ────
+# Show a brief spinner; the localStorage component will fire and trigger
+# a rerun that provides the keys, at which point Step 1 exchanges them.
+elif _pending_rt and not (_ss_api_key and _ss_api_secret):
+    with st.spinner("⏳ Loading your credentials, please wait…"):
+        import time as _time
+        _time.sleep(0.5)   # give the localStorage component time to respond
+    st.rerun()
+
+# ── Step 2b — no keys at all: show onboarding ─────────────────────────
 if not (_ss_api_key and _ss_api_secret):
     st.sidebar.title("⚙️ Setup")
     st.sidebar.subheader("🔑 Zerodha Kite Connect")
     st.sidebar.caption(
         "Enter your Kite Connect API credentials below to get started.  \n"
-        "Keys are stored **only in your browser session** and never shared."
+        "Keys are stored **only in your browser** and never shared."
     )
     _setup_k = st.sidebar.text_input(
         "API Key",
@@ -237,39 +282,10 @@ if not (_ss_api_key and _ss_api_secret):
                 4. Copy **API Key** and **API Secret** from the app detail page
                 5. Paste them in the **sidebar on the left** and click **Save & Connect**
 
-                Keys stay only in your browser session and are never shared with other users.
+                Keys stay only in your browser and are never shared with other users.
                 """
             )
     st.stop()
-
-
-# ── Step 1 — handle Kite OAuth redirect (?request_token=xxx in URL) ───
-if "request_token" in st.query_params:
-    _req_token = st.query_params["request_token"]
-    with st.spinner("Completing Zerodha authentication…"):
-        try:
-            _client = KiteClient(
-                api_key=_ss_api_key, api_secret=_ss_api_secret
-            )
-            _acc_token = _client.complete_auth(_req_token)
-            # Fetch profile for user_id / display name
-            _profile = _client.get_profile()
-            _today_str = date_type.today().isoformat()
-            st.session_state["kite_access_token"] = _acc_token
-            st.session_state["kite_access_date"]  = _today_str
-            st.session_state["kite_user_id"]      = _profile.get("user_id", "")
-            st.session_state["kite_user_name"]    = _profile.get("user_name", "")
-            st.session_state["kite_authenticated"] = True
-            st.session_state["kite_client"]       = _client
-            # Persist token in browser cookie (expires at next 6 AM IST ≈ 30h)
-            if _ON_CLOUD:
-                _ls_set("kite_access_token", _acc_token,  expires_days=1)
-                _ls_set("kite_access_date",  _today_str,  expires_days=1)
-            st.query_params.clear()
-            st.rerun()
-        except Exception as _auth_err:
-            st.error(f"Authentication failed: {_auth_err}")
-            st.stop()
 
 # ── Step 2 — restore session token if we have one for today ───────────
 if not st.session_state.get("kite_authenticated"):
