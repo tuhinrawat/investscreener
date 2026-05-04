@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Secrets & credentials — NEVER commit these
+.env
+.env.*
+screener_keys.json
+data/access_token.json
+
+# Database & data files — large binaries, user-specific
+data/screener.db
+data/screener.db.wal
+data/instruments.csv
+data/nse_index_symbols.json
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test artefacts
+.pytest_cache/
+htmlcov/
+.coverage

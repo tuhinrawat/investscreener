@@ -1,0 +1,2774 @@
+"""
+app.py — Streamlit dashboard.
+
+Three sections:
+  1. Sidebar — refresh buttons + filters
+  2. Main table — sortable, filterable, with composite score ranking
+  3. Detail panel — when you click a row, shows candlestick + indicators
+
+Run with:  streamlit run app.py
+"""
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import charts as _charts
+from datetime import datetime, timezone, timedelta, date as date_type
+
+import config
+import db
+import data_pipeline
+import ai_analyst as _ai
+from kite_client import KiteClient
+
+
+# ============================================================
+# LIVE QUOTE FRAGMENT — auto-refreshes every 10 s independently
+# of the rest of the page (Streamlit 1.37+ fragment feature).
+# Only invoked when the user enables the Live toggle.
+# ============================================================
+@st.fragment(run_every="10s")
+def _live_quote_fragment(symbol: str):
+    """Fetches and displays a real-time OHLC quote for one symbol."""
+    # Don't poll the API outside market hours
+    from datetime import datetime, timezone, timedelta
+    _ist = timezone(timedelta(hours=5, minutes=30))
+    _now = datetime.now(_ist)
+    _mkt_open = (
+        _now.weekday() < 5
+        and _now.replace(hour=9,  minute=15, second=0, microsecond=0) <= _now
+        <= _now.replace(hour=15, minute=30, second=0, microsecond=0)
+    )
+    if not _mkt_open:
+        st.caption("⏸ Market closed — live quote paused.")
+        return
+
+    try:
+        client = KiteClient()
+        quotes  = client.get_ohlc_batch([f"NSE:{symbol}"])
+        q       = quotes.get(f"NSE:{symbol}")
+    except Exception as err:
+        st.warning(f"Live data unavailable: {err}")
+        return
+
+    if not q:
+        st.caption("No live quote returned.")
+        return
+
+    ltp        = q.get("last_price", 0)
+    ohlc_today = q.get("ohlc", {})
+    prev_close = ohlc_today.get("close", 0)
+    day_chg    = ((ltp - prev_close) / prev_close * 100) if prev_close else 0
+    day_abs    = ltp - prev_close
+    badge_col  = "#22c55e" if day_chg >= 0 else "#ef4444"
+    arrow      = "▲" if day_chg >= 0 else "▼"
+
+    st.markdown(
+        f"""
+        <div style="background:#0f172a;border:1px solid #1e293b;border-radius:10px;
+                    padding:14px 22px;margin-bottom:8px;display:flex;
+                    align-items:center;gap:24px;flex-wrap:wrap">
+          <span style="font-size:1.7rem;font-weight:700;color:#f1f5f9;
+                       letter-spacing:-0.5px">{symbol}</span>
+          <span style="font-size:1.5rem;font-weight:700;color:#f8fafc">
+            ₹{ltp:,.2f}</span>
+          <span style="font-size:1.05rem;font-weight:600;color:{badge_col}">
+            {arrow} {day_chg:+.2f}%&nbsp;&nbsp;({day_abs:+.2f})</span>
+          <span style="font-size:0.88rem;color:#64748b">
+            O&nbsp;<b style="color:#94a3b8">₹{ohlc_today.get('open',0):,.2f}</b>
+            &nbsp;&nbsp;H&nbsp;<b style="color:#94a3b8">₹{ohlc_today.get('high',0):,.2f}</b>
+            &nbsp;&nbsp;L&nbsp;<b style="color:#94a3b8">₹{ohlc_today.get('low',0):,.2f}</b>
+            &nbsp;&nbsp;Prev&nbsp;<b style="color:#94a3b8">₹{prev_close:,.2f}</b>
+          </span>
+          <span style="margin-left:auto;font-size:0.78rem;color:#475569">
+            ⏱ {datetime.now().strftime('%H:%M:%S')}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Store latest LTP in session so the chart can use it without re-fetching
+    st.session_state[f"live_ltp_{symbol}"]       = ltp
+    st.session_state[f"live_ohlc_{symbol}"]      = ohlc_today
+    st.session_state[f"live_prev_close_{symbol}"] = prev_close
+
+
+# ============================================================
+# PAGE CONFIG
+# ============================================================
+st.set_page_config(
+    page_title="NSE Swing Screener",
+    page_icon="📊",
+    layout="wide",
+)
+
+
+# ============================================================
+# KITE AUTH GATE
+# Runs on every page load before any other UI is rendered.
+#
+# Flow:
+#   a) Kite redirects back here with ?request_token=xxx after login.
+#      We exchange it for an access_token, cache it, then strip the
+#      query param and rerun so the URL is clean.
+#   b) If a valid cached token exists for today, proceed normally.
+#   c) Otherwise render a login page and st.stop() so nothing else runs.
+# ============================================================
+
+def _check_cached_auth() -> bool:
+    """Return True if today's access token is already cached on disk."""
+    client = KiteClient()
+    return client.authenticated
+
+
+# Step 1 — handle Kite OAuth redirect (?request_token=xxx in URL)
+if "request_token" in st.query_params:
+    _req_token = st.query_params["request_token"]
+    with st.spinner("Completing Zerodha authentication…"):
+        try:
+            _client = KiteClient()
+            _client.complete_auth(_req_token)
+            st.session_state["kite_authenticated"] = True
+            st.query_params.clear()
+            st.rerun()
+        except Exception as _auth_err:
+            st.error(f"Authentication failed: {_auth_err}")
+            st.stop()
+
+# Step 2 — check session state / cached token
+if "kite_authenticated" not in st.session_state:
+    st.session_state["kite_authenticated"] = _check_cached_auth()
+
+# Step 3 — show login page if not authenticated
+if not st.session_state["kite_authenticated"]:
+    _login_client = KiteClient()
+    _login_url = _login_client.get_login_url()
+
+    st.markdown(
+        """
+        <style>
+        .auth-card {
+            max-width: 480px;
+            margin: 80px auto 0 auto;
+            padding: 40px 48px;
+            border-radius: 16px;
+            border: 1px solid #e2e8f0;
+            background: #ffffff;
+            box-shadow: 0 4px 24px rgba(0,0,0,0.07);
+        }
+        .auth-logo { font-size: 2.4rem; margin-bottom: 8px; }
+        .auth-title { font-size: 1.5rem; font-weight: 700; color: #0f172a; margin-bottom: 4px; }
+        .auth-sub { color: #64748b; margin-bottom: 28px; font-size: 0.95rem; }
+        .auth-note { background: #f8fafc; border-radius: 8px; padding: 12px 16px;
+                     font-size: 0.85rem; color: #475569; margin-top: 20px; }
+        .auth-note code { background: #e2e8f0; padding: 2px 6px; border-radius: 4px;
+                          font-size: 0.82rem; color: #0f172a; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    _, col, _ = st.columns([1, 2, 1])
+    with col:
+        st.markdown(
+            """
+            <div class="auth-card">
+              <div class="auth-logo">📊</div>
+              <div class="auth-title">NSE Swing Screener</div>
+              <div class="auth-sub">Connect your Zerodha account to get started.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.link_button(
+            "🔑  Login with Zerodha",
+            _login_url,
+            use_container_width=True,
+            type="primary",
+        )
+
+        st.markdown(
+            """
+            <div class="auth-note">
+              <b>One-time setup:</b> In your
+              <a href="https://developers.kite.trade" target="_blank">Kite Developer Console</a>,
+              set the app's <b>Redirect URL</b> to:<br><br>
+              <code>http://127.0.0.1:8501</code><br><br>
+              After login, Zerodha will redirect back here automatically and
+              complete authentication. The token is cached until 6 AM IST the next day.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.stop()
+
+
+# ============================================================
+# AUTHENTICATED — initialize DB and continue
+# ============================================================
+db.init_schema()
+
+# Always ensure kite_client is set in session_state so intraday
+# fetches and any other Kite API calls can use it.
+if "kite_client" not in st.session_state:
+    _kc = KiteClient()
+    if _kc.authenticated:
+        st.session_state["kite_client"] = _kc
+
+
+# ============================================================
+# SIDEBAR — Controls
+# ============================================================
+st.sidebar.title("⚙️ Controls")
+
+# --- Refresh status
+last_update = db.get_last_metrics_update()
+st.sidebar.caption(f"**Last metrics update:** {last_update}")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Refresh")
+st.sidebar.caption(
+    "**Quick Scan** → updates live prices + refreshes all trade signals against today's LTP.  \n"
+    "**Full Rescan** → rebuilds everything from 400-day history (run after 3:30 PM)."
+)
+
+# --- Quick refresh button
+if st.sidebar.button("⚡ Quick Scan (~15s)", use_container_width=True,
+                     help="Pulls live LTP + recomputes trade signals. If AI key is set, "
+                          "auto-analyses signal stocks not reviewed in 7 days (max 20)."):
+    with st.spinner("Pulling fresh quotes + recomputing signals..."):
+        try:
+            result = data_pipeline.quick_refresh()
+            if "error" in result:
+                st.sidebar.error(result["error"])
+            else:
+                sigs = result.get("signals_recomputed", 0)
+                st.sidebar.success(
+                    f"✓ {result['stocks_updated']} prices updated, "
+                    f"{sigs} signals refreshed in {result['elapsed_sec']}s"
+                )
+        except Exception as e:
+            st.sidebar.error(f"Failed: {e}")
+
+    # ── Auto-AI: analyse signal stocks that haven't been reviewed in 7 days ──
+    _qscan_ai_client   = st.session_state.get("ai_client")
+    _qscan_ai_provider = st.session_state.get("ai_provider")
+    if _qscan_ai_client:
+        _all_metrics = db.load_metrics()
+        # Only stocks with an active trade signal
+        _signal_mask = (
+            _all_metrics["swing_signal"].isin(["BUY", "SELL"]) |
+            _all_metrics["intraday_signal"].isin(["BUY_ABOVE", "SELL_BELOW"]) |
+            (_all_metrics.get("scale_signal", pd.Series(dtype=str)) == "INITIAL_ENTRY")
+        ) if "swing_signal" in _all_metrics.columns else pd.Series(False, index=_all_metrics.index)
+        _signal_stocks = _all_metrics[_signal_mask].copy()
+
+        if not _signal_stocks.empty:
+            # Prioritise by composite score; cap at 20 stocks per run
+            _signal_stocks = _signal_stocks.sort_values(
+                "composite_score", ascending=False
+            ).head(20)
+            _n_signal = len(_signal_stocks)
+
+            _ai_sidebar_prog = st.sidebar.progress(0, text=f"🤖 AI: analysing {_n_signal} signal stocks…")
+            _ai_qs_state = {"done": 0, "skipped": 0}
+
+            def _ai_qs_cb(i, total, sym, skipped=False):
+                _ai_qs_state["done"] += 1
+                if skipped:
+                    _ai_qs_state["skipped"] += 1
+                pct = min(1.0, _ai_qs_state["done"] / max(total, 1))
+                lbl = "⏭" if skipped else "🔍"
+                _ai_sidebar_prog.progress(pct, text=f"{lbl} AI: {sym} ({_ai_qs_state['done']}/{total})")
+
+            _qs_results = _ai.batch_analyze(
+                _signal_stocks.to_dict("records"),
+                _qscan_ai_client, _qscan_ai_provider,
+                stale_hours=168,        # 7 days — fundamentals don't change daily
+                progress_callback=_ai_qs_cb,
+            )
+            _qs_new = 0
+            for _res in _qs_results:
+                if _res.get("skipped") or _res.get("error"):
+                    continue
+                _sym = _res.get("tradingsymbol")
+                _tok_rows = _all_metrics[_all_metrics["tradingsymbol"] == _sym]
+                if not _tok_rows.empty:
+                    db.save_ai_result(int(_tok_rows.iloc[0]["instrument_token"]), _res)
+                    _qs_new += 1
+
+            _qs_skip = _ai_qs_state["skipped"]
+            _ai_sidebar_prog.progress(
+                1.0,
+                text=f"✅ AI done — {_qs_new} new, {_qs_skip} cached (7d) of {_n_signal} signal stocks"
+            )
+
+# --- Refresh Signals button (no API calls — reads existing DB OHLCV)
+if st.sidebar.button("📡 Refresh Signals (~30s)", use_container_width=True,
+                     help="Recomputes all swing / intraday / scaling signals from existing "
+                          "historical data in the DB. No API calls — run this if signal "
+                          "columns are empty after a schema change or failed Full Rescan."):
+    _sig_bar = st.sidebar.progress(0)
+    _sig_status = st.sidebar.empty()
+
+    def _sig_progress(idx, total, sym):
+        _sig_bar.progress((idx + 1) / total)
+        _sig_status.caption(f"{idx+1}/{total}: {sym}")
+
+    try:
+        _sig_result = data_pipeline.refresh_signals_only(progress_callback=_sig_progress)
+        _sig_bar.progress(1.0)
+        _sig_status.caption("Done")
+        if "error" in _sig_result:
+            st.sidebar.error(_sig_result["error"])
+        else:
+            st.sidebar.success(
+                f"✓ {_sig_result['signals_updated']} signals refreshed "
+                f"({_sig_result['errors']} errors) in {_sig_result['elapsed_sec']}s"
+            )
+            st.rerun()
+    except Exception as _e:
+        st.sidebar.error(f"Failed: {_e}")
+
+# --- Full rescan button
+if st.sidebar.button("🔄 Full Rescan (~3-5 min)", use_container_width=True,
+                     help="Re-pulls 400 days of history for all NSE EQ stocks. "
+                          "Run once daily post-market."):
+    progress_bar = st.sidebar.progress(0)
+    status = st.sidebar.empty()
+
+    def update_progress(idx, total, symbol):
+        progress_bar.progress((idx + 1) / total)
+        status.caption(f"{idx+1}/{total}: {symbol}")
+
+    try:
+        result = data_pipeline.full_rescan(progress_callback=update_progress)
+        progress_bar.progress(1.0)
+        status.caption("Done")
+        st.sidebar.success(
+            f"✓ {result['metrics_computed']} stocks scored "
+            f"in {result['elapsed_sec']}s"
+        )
+        st.sidebar.json(result)
+    except Exception as e:
+        st.sidebar.error(f"Failed: {e}")
+        import traceback
+        st.sidebar.code(traceback.format_exc())
+
+st.sidebar.markdown("---")
+
+# ─── Kite connection status + re-auth ───────────────────────
+_kc_live = st.session_state.get("kite_client")
+if _kc_live and _kc_live.authenticated:
+    st.sidebar.markdown(
+        '<div style="font-size:12px;color:#22c55e;padding:2px 0 6px 0;">'
+        '🟢 <b>Kite connected</b> — intraday candles & live prices active'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+else:
+    st.sidebar.markdown(
+        '<div style="font-size:12px;color:#f59e0b;padding:2px 0 4px 0;">'
+        '🟡 <b>Kite not connected</b> — intraday candles unavailable'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    _reauth_client = KiteClient()
+    st.sidebar.link_button(
+        "🔑 Authenticate Kite",
+        _reauth_client.get_login_url(),
+        use_container_width=True,
+    )
+
+st.sidebar.markdown("---")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AI ANALYSIS SETTINGS
+# ═══════════════════════════════════════════════════════════════════════════
+st.sidebar.subheader("🤖 AI Analysis (STOCKLENS)")
+st.sidebar.caption(
+    "Connect an AI API to enrich screener results with fundamental, "
+    "sentiment, and macro analysis. OpenRouter (Perplexity) uses live web search."
+)
+
+# Load persisted keys
+_ai_keys = _ai.load_keys()
+
+_or_key = st.sidebar.text_input(
+    "OpenRouter API Key",
+    value=_ai_keys.get("openrouter_key", ""),
+    type="password",
+    help="Preferred. Get a free key at openrouter.ai · Uses Perplexity/sonar-pro with live web search.",
+    key="sidebar_or_key",
+)
+_oa_key = st.sidebar.text_input(
+    "OpenAI API Key",
+    value=_ai_keys.get("openai_key", ""),
+    type="password",
+    help="Fallback when OpenRouter key is not set. Uses gpt-4o.",
+    key="sidebar_oa_key",
+)
+
+# Save keys whenever they change
+if _or_key != _ai_keys.get("openrouter_key", "") or _oa_key != _ai_keys.get("openai_key", ""):
+    _ai.save_keys(_oa_key, _or_key)
+
+# Show connection status
+_ai_client, _ai_provider = _ai.get_client(_oa_key, _or_key)
+if _ai_client:
+    _provider_label = "OpenRouter (Perplexity/sonar-pro)" if _ai_provider == "openrouter" else "OpenAI (gpt-4o)"
+    st.sidebar.markdown(
+        f'<div style="font-size:12px;color:#22c55e;padding:2px 0 6px 0;">'
+        f'🟢 AI connected · {_provider_label}</div>',
+        unsafe_allow_html=True,
+    )
+    # Store client in session state so the rest of the app can use it
+    st.session_state["ai_client"]   = _ai_client
+    st.session_state["ai_provider"] = _ai_provider
+else:
+    st.sidebar.markdown(
+        '<div style="font-size:12px;color:#64748b;padding:2px 0 6px 0;">'
+        '⚪ AI not connected — add a key above to enable STOCKLENS scoring</div>',
+        unsafe_allow_html=True,
+    )
+    st.session_state.pop("ai_client",   None)
+    st.session_state.pop("ai_provider", None)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Filters")
+
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+df = db.load_metrics()
+# Keep df in session_state so the live-signal fragment always sees the latest
+# base data (entry/stop/pivot levels) even across fragment-only reruns.
+st.session_state["_signals_base_df"] = df
+
+if df.empty:
+    st.warning("⚠ No data yet. Click 'Full Rescan' in the sidebar to bootstrap.")
+    st.stop()
+
+
+# ============================================================
+# SIDEBAR FILTERS (continued, now that we have data)
+# ============================================================
+min_score, max_score = float(df["composite_score"].min() or 0), float(df["composite_score"].max() or 100)
+score_threshold = st.sidebar.slider(
+    "Min composite score", min_score, max_score, min_score,
+    help="Higher = stronger momentum + RS + volume"
+)
+
+rsi_min, rsi_max = st.sidebar.slider(
+    "RSI(14) range", 0, 100, (40, 75),
+    help="Sweet spot for short swing: 50-70 (trending up, not overbought)"
+)
+
+max_dist_52w_high = st.sidebar.slider(
+    "Max % below 52W high", 0, 100, 25,
+    help="Lower = closer to 52W high = stronger stock"
+)
+
+min_5d_return = st.sidebar.slider(
+    "Min 5D return %", -20, 20, -5,
+    help="Negative values allowed for pullback setups"
+)
+
+min_turnover = st.sidebar.number_input(
+    "Min avg turnover (₹ Cr)", value=config.MIN_AVG_TURNOVER_CR,
+    min_value=1.0, step=1.0,
+    help="Stocks below this daily turnover are excluded. ₹5 Cr is the slippage threshold for retail traders."
+)
+
+min_avg_volume = st.sidebar.number_input(
+    "Min avg daily volume (shares)", value=int(config.MIN_AVG_VOLUME),
+    min_value=10_000, step=10_000,
+    help="Low-volume stocks have wide bid-ask spreads and are hard to exit quickly."
+)
+
+vol_expansion_min = st.sidebar.slider(
+    "Min volume expansion (5D/20D)", 0.0, 3.0, 0.0, step=0.1,
+    help=(
+        "Ratio of 5-day avg volume ÷ 20-day avg volume. "
+        "> 1.2 = volume building (institutional buying). "
+        "1.0 = neutral. < 0.8 = volume drying up (avoid)."
+    )
+)
+
+# Trend alignment toggle
+require_all_positive = st.sidebar.checkbox(
+    "Require ALL timeframes positive", value=False,
+    help="1Y, 6M, 3M, 1M, 5D all > 0%"
+)
+
+
+# ============================================================
+# APPLY FILTERS
+# ============================================================
+filtered = df.copy()
+filtered = filtered[filtered["composite_score"].fillna(-999) >= score_threshold]
+filtered = filtered[filtered["rsi_14"].between(rsi_min, rsi_max, inclusive="both") |
+                    filtered["rsi_14"].isna()]
+filtered = filtered[filtered["dist_from_52w_high_pct"].fillna(999) <= max_dist_52w_high]
+filtered = filtered[filtered["ret_5d"].fillna(-999) >= min_5d_return]
+filtered = filtered[filtered["avg_turnover_cr"].fillna(0) >= min_turnover]
+filtered = filtered[filtered["avg_volume"].fillna(0) >= min_avg_volume]
+if vol_expansion_min > 0:
+    filtered = filtered[filtered["vol_expansion_ratio"].fillna(0) >= vol_expansion_min]
+
+if require_all_positive:
+    for col in ["ret_1y", "ret_6m", "ret_3m", "ret_1m", "ret_5d"]:
+        filtered = filtered[filtered[col].fillna(-999) > 0]
+
+
+# ============================================================
+# HEADER
+# ============================================================
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Universe", len(df))
+col2.metric("Filtered", len(filtered))
+col3.metric("Pct retained", f"{len(filtered)/max(len(df),1)*100:.1f}%")
+col4.metric("Last update", last_update.split()[1] if last_update != "never" else "-")
+
+
+# ============================================================
+# TAB LAYOUT — Screener | Trade Signals
+# ============================================================
+tab_screener, tab_signals = st.tabs(["📋 Screener", "🎯 Trade Signals"])
+
+# ─── helper used by both tabs ───────────────────────────────
+def _stars(q) -> str:
+    """Convert integer 1-5 to filled/empty star string."""
+    if q is None or (isinstance(q, float) and pd.isna(q)):
+        return "—"
+    q = int(q)
+    return "★" * q + "☆" * (5 - q)
+
+
+def _fmt(v, fmt="₹{:,.2f}", fallback="—"):
+    """Format a number safely, return fallback on None/NaN."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return fallback
+    try:
+        return fmt.format(float(v))
+    except Exception:
+        return fallback
+
+
+# ─── SCREENER TAB ───────────────────────────────────────────
+with tab_screener:
+    st.subheader(f"Screener Results — {len(filtered)} candidates")
+
+    # ── AI status line (no bulk-run button — analysis is per-stock or auto on signals) ──
+    _ai_ready = "ai_client" in st.session_state
+    _ai_analyzed_in_view = (
+        filtered["ai_score"].notna().sum()
+        if "ai_score" in filtered.columns else 0
+    )
+    _ai_analyzed_total = (
+        df["ai_score"].notna().sum()
+        if "ai_score" in df.columns else 0
+    )
+    if _ai_ready:
+        st.markdown(
+            f'<div style="font-size:12px;color:#22c55e;margin-bottom:4px;">'
+            f'🤖 AI connected · {_ai_analyzed_in_view} of {len(filtered)} stocks in this view have STOCKLENS scores'
+            f' ({_ai_analyzed_total} total in DB) · '
+            f'Click any stock below to analyse it, or run Quick Scan to auto-analyse signal stocks.'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    elif _ai_analyzed_total > 0:
+        st.markdown(
+            f'<div style="font-size:12px;color:#94a3b8;margin-bottom:4px;">'
+            f'🤖 {_ai_analyzed_in_view} of {len(filtered)} filtered stocks have cached AI scores '
+            f'({_ai_analyzed_total} total in DB) · Add an API key in sidebar to run more.'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # Activity filter info badge
+    _high_vol = (filtered["vol_expansion_ratio"].fillna(0) >= 1.2).sum() if "vol_expansion_ratio" in filtered.columns else 0
+    _liquid   = (filtered["avg_turnover_cr"].fillna(0) >= 10).sum() if "avg_turnover_cr" in filtered.columns else 0
+    st.markdown(
+        f'<div style="margin:0 0 8px 0; font-size:12px; color:#94a3b8;">'
+        f'🔍 Activity filters active: '
+        f'<b>Min turnover ₹{min_turnover:.0f} Cr</b> · '
+        f'<b>Min volume {min_avg_volume:,} shares/day</b>'
+        + (f' · <b>Vol expansion ≥ {vol_expansion_min:.1f}×</b>' if vol_expansion_min > 0 else '') +
+        f' &nbsp;|&nbsp; '
+        f'<span style="color:#22c55e;">{_high_vol} stocks with volume surging (≥1.2×)</span> · '
+        f'<span style="color:#3b82f6;">{_liquid} stocks with ≥₹10 Cr daily turnover</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Blended score = 70% composite + 30% AI — only for stocks with real AI scores ──
+    # Check against the FULL dataset, not just filtered — filters must not hide AI columns
+    _has_ai_globally = (
+        "ai_score" in df.columns
+        and df["ai_score"].notna().any()
+    )
+    _has_ai = (
+        "ai_score" in filtered.columns
+        and filtered["ai_score"].notna().any()
+    )
+    if _has_ai:
+        _cs_min   = filtered["composite_score"].min()
+        _cs_max   = filtered["composite_score"].max()
+        _cs_range = max(_cs_max - _cs_min, 1e-6)
+        _norm_cs  = (filtered["composite_score"] - _cs_min) / _cs_range * 10
+        # Blended score is NaN ("—") for stocks without an AI score
+        _blended  = (0.70 * _norm_cs + 0.30 * filtered["ai_score"]).round(1)
+        filtered  = filtered.assign(blended_score=_blended)
+    else:
+        filtered  = filtered.assign(blended_score=float("nan"))
+
+    # Show AI columns whenever ANY stock in the full DB has been analysed —
+    # filters must not make columns disappear just because filtered stocks lack AI scores.
+    _ai_display_cols = (
+        ["blended_score", "ai_score", "ai_verdict"]
+        if _has_ai_globally else []
+    )
+
+    display_cols = (
+        ["tradingsymbol", "company_name", "ltp"]
+        + _ai_display_cols
+        + [
+            "composite_score", "trend_score", "rs_vs_nifty_3m",
+            "ret_1y", "ret_6m", "ret_3m", "ret_1m", "ret_5d",
+            "rsi_14", "vol_expansion_ratio",
+            "dist_from_52w_high_pct", "dist_from_50ema_pct",
+            "avg_turnover_cr",
+            "support_20d", "resistance_20d",
+        ]
+    )
+    display_cols = [c for c in display_cols if c in filtered.columns]
+
+    # Pretty number formatting
+    formatters = {
+        "ltp": "₹{:,.2f}",
+        "blended_score":   "{:.1f}",
+        "composite_score": "{:.1f}",
+        "ai_score":        "{:.1f}",
+        "trend_score": "{:.1f}",
+        "rs_vs_nifty_3m": "{:+.2f}%",
+        "ret_5d": "{:+.2f}%",
+        "ret_1m": "{:+.2f}%",
+        "ret_3m": "{:+.2f}%",
+        "ret_6m": "{:+.2f}%",
+        "ret_1y": "{:+.2f}%",
+        "rsi_14": "{:.1f}",
+        "vol_expansion_ratio": "{:.2f}x",
+        "dist_from_52w_high_pct": "{:.1f}%",
+        "dist_from_50ema_pct": "{:+.1f}%",
+        "avg_turnover_cr": "₹{:.1f} Cr",
+        "support_20d": "₹{:,.2f}",
+        "resistance_20d": "₹{:,.2f}",
+    }
+
+    # Render with conditional coloring on returns
+    def color_returns(val):
+        if pd.isna(val):
+            return ""
+        color = "#22c55e" if val > 0 else "#ef4444" if val < 0 else ""
+        return f"color: {color}; font-weight: 600"
+
+    def _color_verdict(val):
+        return f"color: {_ai.VERDICT_COLOR.get(str(val).upper(), '#94a3b8')}; font-weight: 700"
+
+    def _color_ai_score(val):
+        try:
+            v = float(val)
+            if v >= 8:   return "color: #22c55e; font-weight: 700"
+            if v >= 6.5: return "color: #86efac; font-weight: 600"
+            if v >= 5:   return "color: #f59e0b; font-weight: 600"
+            return "color: #ef4444; font-weight: 600"
+        except Exception:
+            return ""
+
+    _style_cols  = ["ret_1y", "ret_6m", "ret_3m", "ret_1m", "ret_5d", "rs_vs_nifty_3m"]
+    _verdict_col = [c for c in ["ai_verdict"] if c in display_cols]
+    _ai_score_col = [c for c in ["ai_score", "blended_score"] if c in display_cols]
+
+    styled = (
+        filtered[display_cols]
+        .style
+        .format(formatters, na_rep="—")
+        .map(color_returns, subset=_style_cols)
+    )
+    if _verdict_col:
+        styled = styled.map(_color_verdict, subset=_verdict_col)
+    if _ai_score_col:
+        styled = styled.map(_color_ai_score, subset=_ai_score_col)
+
+    _W = config.TREND_WEIGHTS
+    _cc = st.column_config
+    st.dataframe(
+    styled,
+    use_container_width=True,
+    height=500,
+    hide_index=True,
+    column_config={
+        "tradingsymbol": _cc.TextColumn(
+            "Symbol",
+            help="NSE ticker symbol. Click the stock name in the detail panel below to see its full chart.",
+        ),
+        "company_name": _cc.TextColumn(
+            "Company",
+            help="Full registered company name.",
+        ),
+        "ltp": _cc.TextColumn(
+            "LTP (₹)",
+            help=(
+                "Last Traded Price — the closing price from the most recent trading session stored in the DB. "
+                "Enable 📡 Live mode in the detail panel for the real-time quote."
+            ),
+        ),
+        "composite_score": _cc.TextColumn(
+            "Score",
+            help=(
+                f"Composite Score = {int(config.W_TREND*100)}% Trend + {int(config.W_RELATIVE_STRENGTH*100)}% RS vs Nifty + {int(config.W_VOLUME_EXPANSION*100)}% Volume expansion.\n\n"
+                "Higher is better. Ranks all stocks in the filtered universe so the strongest momentum setups float to the top.\n\n"
+                "Use it to prioritise which charts to review first — not as a buy signal on its own."
+            ),
+        ),
+        "trend_score": _cc.TextColumn(
+            "Trend",
+            help=(
+                f"Weighted average of 5 timeframe returns:\n"
+                f"  5D × {_W['5D']}%  |  1M × {_W['1M']}%  |  3M × {_W['3M']}%  |  6M × {_W['6M']}%  |  1Y × {_W['1Y']}%\n\n"
+                "Each return is capped at ±50% before weighting to prevent one outlier dominating.\n\n"
+                "Positive = trending up across multiple timeframes (alignment). Negative = downtrend. "
+                "Front-loaded to 5D + 1M because short-swing edge is in recent momentum."
+            ),
+        ),
+        "rs_vs_nifty_3m": _cc.TextColumn(
+            "RS vs Nifty",
+            help=(
+                "Relative Strength vs Nifty 50 over 3 months.\n\n"
+                "Formula: stock 3M return − Nifty 3M return.\n\n"
+                "Positive = stock is outperforming the index (generating alpha). "
+                "Negative = underperforming. "
+                "Key criterion: you want to be in stocks that are rising faster than the market, "
+                "especially on pullbacks. A stock with strong RS tends to recover faster and go higher."
+            ),
+        ),
+        "ret_1y": _cc.TextColumn(
+            "1Y Return",
+            help=(
+                "1-year % return: (today's close / close 252 trading days ago − 1) × 100.\n\n"
+                "Big-picture trend health. A stock with a strong 1Y return is in a long-term uptrend — "
+                "the best environment for short swing trades is to trade with the larger trend, not against it."
+            ),
+        ),
+        "ret_6m": _cc.TextColumn(
+            "6M Return",
+            help=(
+                "6-month % return: (today's close / close 126 trading days ago − 1) × 100.\n\n"
+                "Medium-term trend. Confirms whether the stock is in a sustained move or just a short spike. "
+                "Strong 6M + strong 1M = trend continuity."
+            ),
+        ),
+        "ret_3m": _cc.TextColumn(
+            "3M Return",
+            help=(
+                "3-month % return: (today's close / close 63 trading days ago − 1) × 100.\n\n"
+                "Also used as the base for the RS vs Nifty calculation. "
+                "Positive 3M in a negative-market environment is a strong alpha signal."
+            ),
+        ),
+        "ret_1m": _cc.TextColumn(
+            "1M Return",
+            help=(
+                "1-month % return: (today's close / close 21 trading days ago − 1) × 100.\n\n"
+                "Recent momentum. A 1M pullback into a rising 3M/6M trend is a classic swing entry setup. "
+                "Strong 1M alone without 3M/6M support is often just noise."
+            ),
+        ),
+        "ret_5d": _cc.TextColumn(
+            "5D Return",
+            help=(
+                "5-day % return: (today's close / close 5 trading days ago − 1) × 100.\n\n"
+                "Most recent short-term momentum. Useful for timing entries on stocks already on the watchlist. "
+                "A small negative 5D (mild pullback) inside a strong 1M/3M trend is an ideal entry zone."
+            ),
+        ),
+        "rsi_14": _cc.TextColumn(
+            "RSI(14)",
+            help=(
+                "Relative Strength Index over 14 periods using Wilder's smoothing.\n\n"
+                "Scale: 0–100.\n"
+                "  < 30  = oversold (possible reversal, but can stay low in downtrends)\n"
+                "  30–50 = recovering / weak\n"
+                "  50–70 = bullish momentum ← sweet spot for swing entries\n"
+                "  > 70  = overbought (avoid chasing; wait for pullback to 50–60)\n\n"
+                "RSI alone is not a signal — use it with trend and volume confirmation."
+            ),
+        ),
+        "vol_expansion_ratio": _cc.TextColumn(
+            "Vol Expansion",
+            help=(
+                "5-day average volume ÷ 20-day average volume.\n\n"
+                "  > 1.5x = strong volume surge — institutional participation, high conviction move\n"
+                "  1.2–1.5x = moderate expansion — worth noting\n"
+                "  0.8–1.2x = neutral — no volume signal\n"
+                "  < 0.8x = volume drying up — avoid breakouts on low volume\n\n"
+                "Rule of thumb: a price breakout on 2x+ volume is far more reliable than the same move on 0.5x volume."
+            ),
+        ),
+        "dist_from_52w_high_pct": _cc.TextColumn(
+            "From 52W High",
+            help=(
+                "% below the 52-week high: (52W_high − LTP) / LTP × 100.\n\n"
+                "  0–5%  = at or near 52W high — strong stock, potential breakout zone\n"
+                "  5–15% = in the zone of strength — good for swing entries\n"
+                "  > 30% = far from highs — avoid unless there's a strong reversal thesis\n\n"
+                "Stocks near their 52W high tend to continue higher (momentum effect). "
+                "Stocks far below their highs need a strong reason to reverse."
+            ),
+        ),
+        "dist_from_50ema_pct": _cc.TextColumn(
+            "vs 50 EMA",
+            help=(
+                "% distance of LTP from the 50-day Exponential Moving Average.\n\n"
+                "  Positive = price is above 50 EMA (bullish structure)\n"
+                "  Negative = price is below 50 EMA (bearish / in pullback)\n\n"
+                "  −5% to +5% = healthy pullback entry zone — price testing 50 EMA\n"
+                "  > +15%    = extended, risk of mean reversion — wait for pullback\n"
+                "  < −10%    = broken down — avoid\n\n"
+                "The 50 EMA is widely watched by institutional traders, making it a self-fulfilling support level."
+            ),
+        ),
+        "blended_score": _cc.TextColumn(
+            "⚡ Blended",
+            help=(
+                "Blended score (0–10) = 70% mathematical composite + 30% AI (STOCKLENS) score.\n"
+                "Only shown for stocks that have an AI analysis — '—' means not yet analysed.\n\n"
+                "Click any stock to run STOCKLENS individually, or hit Quick Scan to "
+                "auto-analyse signal stocks. Sort by this column for the highest-confidence ideas."
+            ),
+        ),
+        "ai_score": _cc.TextColumn(
+            "🤖 AI Score",
+            help=(
+                "STOCKLENS AI score out of 10 — combines fundamental health, technical structure, "
+                "news sentiment, FII/DII flows, and macro context.\n\n"
+                "  8–10  = STRONG BUY  · High conviction\n"
+                "  6.5–8 = BUY         · Good risk/reward\n"
+                "  5–6.5 = WATCHLIST   · Wait for trigger\n"
+                "  3–5   = AVOID       · Risk > reward\n"
+                "  0–3   = EXIT        · Structural deterioration\n\n"
+                "Click a stock below to run STOCKLENS on it, or use Quick Scan to "
+                "auto-analyse all signal stocks. Results cached for 7 days."
+            ),
+        ),
+        "ai_verdict": _cc.TextColumn(
+            "🤖 Verdict",
+            help="STOCKLENS verdict: STRONG BUY / BUY / WATCHLIST / AVOID / EXIT. "
+                 "Click a stock row and expand 'STOCKLENS Brief' below for the full analysis. "
+                 "Shown only for stocks that have been analysed.",
+        ),
+        "avg_turnover_cr": _cc.TextColumn(
+            "Avg Turnover",
+            help=(
+                "Average daily turnover in ₹ Crores over the last 20 trading days.\n"
+                "Formula: mean(daily_volume × close_price) / 1,00,00,000.\n\n"
+                "  ≥ ₹50 Cr  = highly liquid — institutional-grade, tight spreads\n"
+                "  ₹10–50 Cr = liquid enough for most retail swing traders\n"
+                "  ₹5–10 Cr  = borderline — slippage risk on large orders\n"
+                "  < ₹5 Cr   = excluded by the screener's liquidity gate\n\n"
+                "Low liquidity = wide bid-ask spread + slippage + hard to exit in a hurry."
+            ),
+        ),
+        "support_20d": _cc.TextColumn(
+            "Support (20D)",
+            help=(
+                "Lowest price (intraday low) over the last 20 trading days.\n\n"
+                "Used as a rough near-term support proxy for stop-loss placement. "
+                "A close below this level often signals a short-term trend break.\n\n"
+                "⚠ Note: this is a screening proxy, not a hand-drawn S/R level. "
+                "Always confirm on the chart before using as an actual stop."
+            ),
+        ),
+        "resistance_20d": _cc.TextColumn(
+            "Resistance (20D)",
+            help=(
+                "Highest price (intraday high) over the last 20 trading days.\n\n"
+                "Used as a rough near-term resistance proxy for target setting. "
+                "A close above this level can signal a breakout.\n\n"
+                "⚠ Note: same caveat as Support — confirm on the chart."
+            ),
+        ),
+    },
+)
+
+    # Export button
+    csv = filtered[display_cols].to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "📥 Export shortlist to CSV", csv,
+        file_name=f"screener_{datetime.now():%Y%m%d_%H%M}.csv",
+        mime="text/csv",
+    )
+
+    # ============================================================
+    # DETAIL PANEL — click-to-inspect any stock
+    # ============================================================
+    st.markdown("---")
+    st.subheader("🔍 Stock Detail")
+
+    sel_col, live_col = st.columns([4, 1])
+    with sel_col:
+        selected = st.selectbox(
+            "Select a stock to inspect",
+            filtered["tradingsymbol"].tolist(),
+            index=0 if not filtered.empty else None,
+            label_visibility="collapsed",
+        )
+    with live_col:
+        live_mode = st.toggle("📡 Live", value=False,
+                              help="Fetch today's real-time quote from Kite")
+
+    if selected:
+        stock_row = filtered[filtered["tradingsymbol"] == selected].iloc[0]
+        token = int(stock_row["instrument_token"])
+        ohlcv = db.load_ohlcv(token)
+
+        # ============================================================
+        # LIVE QUOTE — fragment auto-refreshes every 10 s independently
+        # ============================================================
+        if live_mode:
+            _live_quote_fragment(selected)
+
+        # ============================================================
+        # METRIC TILES
+        # ============================================================
+        if ohlcv.empty:
+            st.warning("No historical data cached for this stock.")
+        else:
+            # Use live LTP from session state if available, else fall back to cached
+            display_ltp = st.session_state.get(f"live_ltp_{selected}") or stock_row["ltp"]
+
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("LTP", f"₹{display_ltp:,.2f}")
+            m2.metric("Composite",
+                      f"{stock_row['composite_score']:.1f}" if pd.notna(stock_row["composite_score"]) else "—")
+            m3.metric("RSI(14)",
+                      f"{stock_row['rsi_14']:.1f}" if pd.notna(stock_row["rsi_14"]) else "—")
+            m4.metric("From 52W High",
+                      f"-{stock_row['dist_from_52w_high_pct']:.1f}%"
+                      if pd.notna(stock_row["dist_from_52w_high_pct"]) else "—")
+            m5.metric("Avg Turnover",
+                      f"₹{stock_row['avg_turnover_cr']:.1f} Cr"
+                      if pd.notna(stock_row["avg_turnover_cr"]) else "—")
+
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("5D",  f"{stock_row['ret_5d']:+.2f}%"  if pd.notna(stock_row["ret_5d"])  else "—")
+            m2.metric("1M",  f"{stock_row['ret_1m']:+.2f}%"  if pd.notna(stock_row["ret_1m"])  else "—")
+            m3.metric("3M",  f"{stock_row['ret_3m']:+.2f}%"  if pd.notna(stock_row["ret_3m"])  else "—")
+            m4.metric("6M",  f"{stock_row['ret_6m']:+.2f}%"  if pd.notna(stock_row["ret_6m"])  else "—")
+            m5.metric("1Y",  f"{stock_row['ret_1y']:+.2f}%"  if pd.notna(stock_row["ret_1y"])  else "—")
+
+            # ============================================================
+            # CHART DATA — inject live candle when in live mode
+            # ============================================================
+            chart_df = ohlcv.sort_values("date").tail(400).copy()
+
+            if live_mode and f"live_ltp_{selected}" in st.session_state:
+                IST = timezone(timedelta(hours=5, minutes=30))
+                now_ist = datetime.now(IST)
+                is_market_hours = (
+                    now_ist.weekday() < 5
+                    and now_ist.replace(hour=9,  minute=15, second=0, microsecond=0)
+                    <= now_ist
+                    <= now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+                )
+                today = date_type.today()
+                latest_cached = chart_df["date"].max()
+                if hasattr(latest_cached, "date"):
+                    latest_cached = latest_cached.date()
+
+                if latest_cached < today or is_market_hours:
+                    ltp_live   = st.session_state[f"live_ltp_{selected}"]
+                    ohlc_today = st.session_state.get(f"live_ohlc_{selected}", {})
+                    today_row  = pd.DataFrame([{
+                        "date": today, "open": ohlc_today.get("open", ltp_live),
+                        "high": ohlc_today.get("high", ltp_live),
+                        "low":  ohlc_today.get("low",  ltp_live),
+                        "close": ltp_live, "volume": 0,
+                    }])
+                    chart_df = pd.concat(
+                        [chart_df[chart_df["date"] != today], today_row],
+                        ignore_index=True,
+                    )
+
+            # ============================================================
+            # ANALYSIS CONTEXT BAR — stage + signal pills
+            # ============================================================
+            context_pills = _charts.build_context_bar(chart_df, stock_row)  # always daily
+            if context_pills:
+                pill_html_parts = []
+                for p in context_pills:
+                    pill_html_parts.append(
+                        f'<span style="'
+                        f'display:inline-block;'
+                        f'padding:3px 10px;'
+                        f'margin:2px 4px;'
+                        f'border-radius:12px;'
+                        f'border:1px solid {p["color"]};'
+                        f'color:{p["color"]};'
+                        f'font-size:12px;'
+                        f'background:rgba(15,23,42,0.7);'
+                        f'">'
+                        f'<span style="opacity:0.6;font-size:10px;">{p["label"]}&nbsp;&nbsp;</span>'
+                        f'<b>{p["value"]}</b>'
+                        f'</span>'
+                    )
+                st.markdown(
+                    '<div style="margin:6px 0 10px 0;">' +
+                    "".join(pill_html_parts) +
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+
+            # ============================================================
+            # AI SYNTHESIS CARD — combines AI brief + all mathematical signals
+            # ============================================================
+            _syn_ai_brief   = stock_row.get("ai_brief")
+            _syn_ai_score   = stock_row.get("ai_score")
+            _syn_ai_verdict = str(stock_row.get("ai_verdict") or "")
+            _syn_ai_conf    = str(stock_row.get("ai_confidence") or "")
+            _syn_ai_ts      = stock_row.get("ai_analyzed_at")
+
+            # Build mathematical signal summary from stored metrics
+            _syn_sw_sig   = str(stock_row.get("swing_signal") or "")
+            _syn_sw_entry = stock_row.get("swing_entry")
+            _syn_sw_stop  = stock_row.get("swing_stop")
+            _syn_sw_t1    = stock_row.get("swing_t1")
+            _syn_sw_t2    = stock_row.get("swing_t2")
+            _syn_sw_rr    = stock_row.get("swing_rr")
+            _syn_id_sig   = str(stock_row.get("intraday_signal") or "")
+            _syn_id_entry = stock_row.get("intraday_entry")
+            _syn_id_stop  = stock_row.get("intraday_stop")
+            _syn_id_t1    = stock_row.get("intraday_t1")
+            _syn_sc_sig   = str(stock_row.get("scale_signal") or "")
+            _syn_rsi      = stock_row.get("rsi_14")
+            _syn_ltp      = stock_row.get("ltp") or float(chart_df["close"].iloc[-1])
+            _syn_ret_1m   = stock_row.get("ret_1m")
+            _syn_ret_3m   = stock_row.get("ret_3m")
+            _syn_comp     = stock_row.get("composite_score")
+            _syn_rs       = stock_row.get("rs_vs_nifty_3m")
+            _syn_vol_exp  = stock_row.get("vol_expansion_ratio")
+            _syn_dist52   = stock_row.get("dist_from_52w_high_pct")
+
+            # Only show when AI brief is available (otherwise no synthesis possible)
+            if _syn_ai_brief and str(_syn_ai_brief).strip():
+                # Compute quick Weinstein stage from OHLCV for synthesis
+                _syn_c    = chart_df["close"]
+                _syn_e50  = _syn_c.ewm(span=50,  adjust=False).mean()
+                _syn_e200 = _syn_c.ewm(span=200, adjust=False).mean()
+                _syn_ltp_f = float(_syn_c.iloc[-1])
+                if len(_syn_c) >= 50:
+                    _above_200 = _syn_ltp_f > _syn_e200.iloc[-1]
+                    _e50_above = _syn_e50.iloc[-1] > _syn_e200.iloc[-1]
+                    _lb = min(30, len(_syn_c) - 1)
+                    _slope = (_syn_e200.iloc[-1] - _syn_e200.iloc[-_lb]) / _syn_e200.iloc[-_lb] * 100
+                    if _above_200 and _e50_above and _slope > 0.3:
+                        _syn_stage = "Stage 2 Advancing"
+                    elif not _above_200 and not _e50_above and _slope < -0.3:
+                        _syn_stage = "Stage 4 Declining"
+                    elif not _above_200 and not _e50_above and abs(_slope) <= 0.3:
+                        _syn_stage = "Stage 1 Basing"
+                    else:
+                        _syn_stage = "Stage 3 Distribution"
+                else:
+                    _syn_stage = "—"
+
+                # MACD state
+                if len(_syn_c) >= 26:
+                    _em12 = _syn_c.ewm(span=12, adjust=False).mean()
+                    _em26 = _syn_c.ewm(span=26, adjust=False).mean()
+                    _mcd  = _em12 - _em26
+                    _mcs  = _mcd.ewm(span=9, adjust=False).mean()
+                    _hist = _mcd - _mcs
+                    _syn_macd = ("positive accelerating" if _hist.iloc[-1] > 0 and _hist.iloc[-1] > _hist.iloc[-2]
+                                 else "positive slowing"   if _hist.iloc[-1] > 0
+                                 else "negative improving" if _hist.iloc[-1] > _hist.iloc[-2]
+                                 else "negative falling")
+                else:
+                    _syn_macd = "—"
+
+                # Pivot bias
+                if len(chart_df) >= 2:
+                    _yc = chart_df.iloc[-2]
+                    _P  = (float(_yc["high"]) + float(_yc["low"]) + float(_yc["close"])) / 3
+                    _syn_piv_bias = "above pivot (bullish)" if _syn_ltp_f > _P else "below pivot (bearish)"
+                else:
+                    _syn_piv_bias = "—"
+
+                # Assemble math context string for synthesis
+                _math_ctx_parts = [
+                    f"Weinstein: {_syn_stage}",
+                    f"RSI-14: {_syn_rsi:.1f}" if _syn_rsi and not pd.isna(_syn_rsi) else "RSI: —",
+                    f"MACD histogram: {_syn_macd}",
+                    f"Pivot: {_syn_piv_bias}",
+                    f"Composite score: {_syn_comp:.1f}" if _syn_comp and not pd.isna(_syn_comp) else "",
+                    f"RS vs Nifty (3M): {_syn_rs:+.1f}%" if _syn_rs and not pd.isna(_syn_rs) else "",
+                    f"Vol expansion: {_syn_vol_exp:.2f}×" if _syn_vol_exp and not pd.isna(_syn_vol_exp) else "",
+                    f"Dist from 52W High: {_syn_dist52:+.1f}%" if _syn_dist52 and not pd.isna(_syn_dist52) else "",
+                    f"1M return: {_syn_ret_1m:+.1f}%" if _syn_ret_1m and not pd.isna(_syn_ret_1m) else "",
+                    f"3M return: {_syn_ret_3m:+.1f}%" if _syn_ret_3m and not pd.isna(_syn_ret_3m) else "",
+                ]
+                if _syn_sw_sig == "BUY":
+                    _math_ctx_parts.append(
+                        f"Swing BUY: entry ₹{_syn_sw_entry:.2f} / stop ₹{_syn_sw_stop:.2f} / T1 ₹{_syn_sw_t1:.2f}"
+                        + (f" / T2 ₹{_syn_sw_t2:.2f}" if _syn_sw_t2 and not pd.isna(_syn_sw_t2) else "")
+                        + (f" R/R {_syn_sw_rr:.1f}×" if _syn_sw_rr and not pd.isna(_syn_sw_rr) else "")
+                    )
+                elif _syn_sw_sig == "SELL":
+                    _math_ctx_parts.append(f"Swing SELL signal active: entry ₹{_syn_sw_entry:.2f}")
+                if _syn_id_sig == "BUY_ABOVE":
+                    _math_ctx_parts.append(f"Intraday BUY ABOVE ₹{_syn_id_entry:.2f} / stop ₹{_syn_id_stop:.2f} / T1 ₹{_syn_id_t1:.2f}")
+                elif _syn_id_sig == "SELL_BELOW":
+                    _math_ctx_parts.append(f"Intraday SELL BELOW ₹{_syn_id_entry:.2f} / stop ₹{_syn_id_stop:.2f} / T1 ₹{_syn_id_t1:.2f}")
+                if _syn_sc_sig == "INITIAL_ENTRY":
+                    _math_ctx_parts.append("Scaling signal: INITIAL_ENTRY — start building position")
+
+                _math_ctx = " | ".join(p for p in _math_ctx_parts if p)
+
+                # AI brief snippet (first 600 chars for the synthesis prompt)
+                _ai_brief_snip = str(_syn_ai_brief)[:600]
+
+                # Call AI to synthesize — only if client available
+                _syn_client   = st.session_state.get("ai_client")
+                _syn_provider = st.session_state.get("ai_provider")
+
+                _syn_cache_key = f"synthesis_{selected}_{_syn_ai_ts}"
+                if _syn_cache_key not in st.session_state:
+                    if _syn_client:
+                        try:
+                            import ai_analyst as _ai_mod
+                            _syn_model = _ai_mod._model_for(_syn_provider)
+                            _syn_resp  = _syn_client.chat.completions.create(
+                                model=_syn_model,
+                                messages=[
+                                    {
+                                        "role": "system",
+                                        "content": (
+                                            "You are a senior equity analyst. Given quantitative technical signals "
+                                            "AND a fundamental/sentiment AI research brief for the same stock, "
+                                            "synthesize a single, concise (max 5 bullet points) actionable recommendation. "
+                                            "Format: start with a one-line VERDICT in ALL CAPS (STRONG BUY / BUY / HOLD / REDUCE / SELL), "
+                                            "then 3-5 bullets each ≤15 words covering: trend alignment, momentum, key levels, risk, and timing. "
+                                            "Be direct. No disclaimers. No padding."
+                                        ),
+                                    },
+                                    {
+                                        "role": "user",
+                                        "content": (
+                                            f"Stock: {selected}\n"
+                                            f"Quantitative signals: {_math_ctx}\n"
+                                            f"AI research brief: {_ai_brief_snip}"
+                                        ),
+                                    },
+                                ],
+                                max_tokens=250,
+                                temperature=0.3,
+                            )
+                            st.session_state[_syn_cache_key] = _syn_resp.choices[0].message.content.strip()
+                        except Exception as _syn_e:
+                            st.session_state[_syn_cache_key] = None
+                    else:
+                        # No client — build a rule-based synthesis from math signals alone
+                        st.session_state[_syn_cache_key] = "__math_only__"
+
+                _syn_text = st.session_state.get(_syn_cache_key)
+
+                # Render synthesis card
+                _vd_col_map = {
+                    "STRONG BUY": "#22c55e", "BUY": "#86efac", "HOLD": "#f59e0b",
+                    "REDUCE": "#f97316", "SELL": "#ef4444", "AVOID": "#ef4444",
+                    "WATCHLIST": "#f59e0b",
+                }
+                _syn_hdr_col = _vd_col_map.get(_syn_ai_verdict.upper(), "#3b82f6")
+
+                if _syn_text and _syn_text != "__math_only__":
+                    # Render AI-synthesised card
+                    _syn_lines = [l.strip() for l in _syn_text.strip().split("\n") if l.strip()]
+                    _verdict_line = _syn_lines[0] if _syn_lines else ""
+                    _bullet_lines = _syn_lines[1:]
+                    # Choose border colour based on first word of verdict
+                    _first_word = _verdict_line.split()[0].rstrip(":").upper() if _verdict_line else ""
+                    _card_col = _vd_col_map.get(_first_word, "#3b82f6")
+                    _bullets_html = "".join(
+                        f'<li style="margin:4px 0;color:#e2e8f0;font-size:13px;">{bl.lstrip("-•▸● ").lstrip("*")}</li>'
+                        for bl in _bullet_lines
+                    )
+                    _ts_str = ""
+                    if _syn_ai_ts:
+                        try:
+                            _ts_str = pd.to_datetime(_syn_ai_ts).strftime("AI analysed %b %d, %H:%M")
+                        except Exception:
+                            pass
+                    _conf_badge = (
+                        f'<span style="background:rgba(34,197,94,0.15);border:1px solid #22c55e;'
+                        f'color:#22c55e;font-size:10px;padding:1px 6px;border-radius:8px;margin-left:8px;">'
+                        f'{_syn_ai_conf}</span>'
+                        if _syn_ai_conf else ""
+                    )
+                    st.markdown(
+                        f'<div style="background:rgba(15,23,42,0.95);border:1px solid {_card_col};'
+                        f'border-radius:10px;padding:14px 18px;margin:8px 0 12px 0;">'
+                        f'<div style="font-size:12px;color:#64748b;margin-bottom:6px;">'
+                        f'🤖 STOCKLENS × QUANT SYNTHESIS {_conf_badge}'
+                        f'<span style="float:right;font-size:10px;color:#475569;">{_ts_str}</span>'
+                        f'</div>'
+                        f'<div style="font-size:15px;font-weight:700;color:{_card_col};margin-bottom:8px;">'
+                        f'{_verdict_line}'
+                        f'</div>'
+                        f'<ul style="margin:0;padding-left:18px;">{_bullets_html}</ul>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                elif _syn_text == "__math_only__" or (_syn_ai_brief and not _syn_client):
+                    # Math-only synthesis — derive verdict from available signals
+                    _mo_signals = []
+                    if _syn_sw_sig == "BUY":
+                        _mo_signals.append(f"🟢 Swing BUY @ ₹{_syn_sw_entry:.2f} · R/R {_syn_sw_rr:.1f}×")
+                    elif _syn_sw_sig == "SELL":
+                        _mo_signals.append(f"🔴 Swing SELL signal active")
+                    if _syn_id_sig == "BUY_ABOVE":
+                        _mo_signals.append(f"🟢 Intraday: BUY ABOVE ₹{_syn_id_entry:.2f}")
+                    elif _syn_id_sig == "SELL_BELOW":
+                        _mo_signals.append(f"🔴 Intraday: SELL BELOW ₹{_syn_id_entry:.2f}")
+                    if _syn_sc_sig == "INITIAL_ENTRY":
+                        _mo_signals.append("🏗️ Scaling: start building position")
+
+                    _mo_trend = "🟢 Bullish" if "Advancing" in _syn_stage else "🔴 Bearish" if "Declining" in _syn_stage else "⚪ Transitioning"
+                    _mo_rsi_txt = (
+                        f"RSI {_syn_rsi:.0f} — overbought, trail stop" if _syn_rsi and _syn_rsi > 70
+                        else f"RSI {_syn_rsi:.0f} — momentum zone" if _syn_rsi and 50 < _syn_rsi <= 70
+                        else f"RSI {_syn_rsi:.0f} — below 50, caution" if _syn_rsi
+                        else "RSI —"
+                    )
+                    _mo_ai_line = (
+                        f"🤖 AI score: {_syn_ai_score:.1f}/10 · Verdict: {_syn_ai_verdict}"
+                        if _syn_ai_score and not pd.isna(_syn_ai_score) else ""
+                    )
+                    _mo_bullets = [b for b in [
+                        f"{_mo_trend} · {_syn_stage}",
+                        _mo_rsi_txt,
+                        _mo_ai_line,
+                    ] + _mo_signals if b]
+                    _mo_col = "#22c55e" if "BUY" in " ".join([_syn_sw_sig, _syn_id_sig]) else "#f59e0b" if "Advancing" in _syn_stage else "#ef4444"
+                    _mo_bullets_html = "".join(
+                        f'<li style="margin:4px 0;color:#e2e8f0;font-size:13px;">{b}</li>'
+                        for b in _mo_bullets
+                    )
+                    st.markdown(
+                        f'<div style="background:rgba(15,23,42,0.95);border:1px solid {_mo_col};'
+                        f'border-radius:10px;padding:14px 18px;margin:8px 0 12px 0;">'
+                        f'<div style="font-size:12px;color:#64748b;margin-bottom:6px;">📊 QUANT SYNTHESIS · '
+                        f'<span style="color:#475569;font-size:10px;">AI brief available — add API key for full synthesis</span>'
+                        f'</div>'
+                        f'<ul style="margin:0;padding-left:18px;">{_mo_bullets_html}</ul>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+            # ============================================================
+            # TIMEFRAME + CANDLE INTERVAL SELECTORS
+            # ============================================================
+            # Kite Connect interval codes and their max history limits
+            _KITE_INTERVAL_MAP = {
+                "1m":  ("minute",    60),
+                "3m":  ("3minute",  100),
+                "5m":  ("5minute",  100),
+                "10m": ("10minute", 100),
+                "15m": ("15minute", 200),
+                "30m": ("30minute", 200),
+                "1H":  ("60minute", 400),
+                "1D":  (None,       None),   # use stored daily data
+                "1W":  (None,       None),   # resample weekly from daily
+                "1M":  (None,       None),   # resample monthly from daily
+            }
+            # Suggested default TF per interval (avoids loading 100k bars)
+            _CI_DEFAULT_TF = {
+                "1m": "5D", "3m": "5D", "5m": "1M", "10m": "1M",
+                "15m": "3M", "30m": "3M", "1H": "6M",
+                "1D": "1Y", "1W": "Max", "1M": "Max",
+            }
+            _TF_DAYS = {
+                "5D": 5, "1M": 22, "3M": 63, "6M": 126, "1Y": 252, "Max": len(chart_df),
+            }
+
+            _tf_col, _ci_col = st.columns([4, 6])
+            with _tf_col:
+                selected_tf = st.radio(
+                    "Timeframe", list(_TF_DAYS.keys()),
+                    index=4,
+                    horizontal=True,
+                    label_visibility="collapsed",
+                    key=f"tf_{selected}",
+                )
+            with _ci_col:
+                candle_interval = st.radio(
+                    "Candle",
+                    list(_KITE_INTERVAL_MAP.keys()),
+                    index=7,   # default: 1D
+                    horizontal=True,
+                    label_visibility="collapsed",
+                    key=f"ci_{selected}",
+                )
+
+            # ── Build the DataFrame to plot ───────────────────────────────
+            def _resample_daily_to(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+                """Resample daily OHLCV data to weekly or monthly candles."""
+                df2 = df[["date", "open", "high", "low", "close", "volume"]].copy()
+                df2 = df2.assign(date=pd.to_datetime(df2["date"]))
+                df2 = df2.set_index("date").sort_index()
+                resampled = df2.resample(rule).agg(
+                    open=("open", "first"), high=("high", "max"),
+                    low=("low", "min"),   close=("close", "last"),
+                    volume=("volume", "sum"),
+                ).dropna(subset=["open"])
+                return resampled.reset_index()
+
+            kite_interval, max_hist_days = _KITE_INTERVAL_MAP[candle_interval]
+            _is_intraday = kite_interval is not None
+
+            if _is_intraday:
+                # Intraday — fetch from Kite API, cache in session state
+                _ci_tf = _TF_DAYS.get(selected_tf, 22)
+                fetch_days = min(_ci_tf, max_hist_days)
+                _cache_key = f"intraday_{selected}_{candle_interval}_{fetch_days}"
+                if _cache_key not in st.session_state:
+                    kc = st.session_state.get("kite_client")
+                    if kc is None:
+                        st.info(
+                            f"ℹ️ Intraday {candle_interval} candles require Kite authentication. "
+                            "Please connect Kite in the sidebar first."
+                        )
+                        plot_df = chart_df
+                        _is_intraday = False
+                    else:
+                        with st.spinner(f"Fetching {candle_interval} candles ({fetch_days}d)…"):
+                            try:
+                                from_dt = datetime.now() - timedelta(days=fetch_days)
+                                raw = kc.get_historical(
+                                    int(stock_row["instrument_token"]),
+                                    from_dt, datetime.now(), kite_interval,
+                                )
+                                if raw:
+                                    _ic_df = pd.DataFrame(raw)
+                                    # Strip timezone info — Kite returns IST-aware timestamps;
+                                    # keeping tz-aware causes Plotly to convert to UTC which
+                                    # shifts x-axis times by +5:30.
+                                    _ic_df["date"] = (
+                                        pd.to_datetime(_ic_df["date"])
+                                        .dt.tz_localize(None)  # already IST, just drop tz
+                                    )
+                                    st.session_state[_cache_key] = _ic_df
+                                    plot_df = _ic_df
+                                else:
+                                    st.warning(f"No {candle_interval} data returned.")
+                                    plot_df = chart_df
+                            except Exception as _e:
+                                st.warning(f"Could not fetch {candle_interval} data: {_e}")
+                                plot_df = chart_df
+                else:
+                    plot_df = st.session_state[_cache_key]
+                    # Show freshness + refresh button
+                    _ci_info_col, _ci_btn_col = st.columns([6, 2])
+                    with _ci_btn_col:
+                        if st.button("↻ Refresh candles", key=f"ci_refresh_{selected}_{candle_interval}"):
+                            del st.session_state[_cache_key]
+                            st.rerun()
+            elif candle_interval == "1W":
+                plot_df = _resample_daily_to(chart_df, "W-FRI")
+            elif candle_interval == "1M":
+                plot_df = _resample_daily_to(chart_df, "ME")
+            else:
+                plot_df = chart_df  # 1D
+
+            # Validate we have enough bars
+            if len(plot_df) < 5:
+                st.warning("Not enough candles for the selected interval and timeframe.")
+                plot_df = chart_df
+
+            # ── X-axis range (visible window) ────────────────────────────
+            # Calendar days per TF label (used for date-arithmetic on intraday)
+            _TF_CAL_DAYS = {
+                "5D": 7,   # 5 trading days ≈ 7 calendar days
+                "1M": 31,
+                "3M": 93,
+                "6M": 186,
+                "1Y": 366,
+                "Max": 9999,
+            }
+            _sorted = plot_df.sort_values("date").reset_index(drop=True)
+            _x_end  = _sorted["date"].iloc[-1]
+
+            if _is_intraday:
+                # For intraday bars use date arithmetic — NOT candle count.
+                # iloc[-5] on a 5m DataFrame = last 25 minutes, not 5 days.
+                _cal_days = _TF_CAL_DAYS.get(selected_tf, 7)
+                _x_start  = pd.Timestamp(_x_end) - pd.Timedelta(days=_cal_days)
+                tf_days   = _cal_days   # used only for display_days param below
+            else:
+                # Daily/Weekly/Monthly: count candles (works correctly)
+                tf_days  = min(_TF_DAYS[selected_tf], len(_sorted))
+                _x_start = _sorted["date"].iloc[-tf_days] if tf_days < len(_sorted) else _sorted["date"].iloc[0]
+
+            _x_range = (_x_start, _x_end)
+
+            # Show a note when timeframe might be beyond the API limit
+            if _is_intraday and _TF_CAL_DAYS.get(selected_tf, 0) > (max_hist_days or 0):
+                st.caption(
+                    f"⚠️ {candle_interval} candles are limited to {max_hist_days} days of history by Kite. "
+                    f"Showing all available data. Try a shorter timeframe for full coverage."
+                )
+
+            # Plotly chart config — scroll to zoom, drag to pan
+            _pchart_cfg = {"scrollZoom": True, "displayModeBar": True, "displaylogo": False}
+
+            # ──────────────────────────────────────────────────────────────────
+            # PRE-COMPUTE indicators for summary cards (no chart rendering yet)
+            # ──────────────────────────────────────────────────────────────────
+            def _safe(v, fmt="₹{:,.2f}"):
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    return "—"
+                try:
+                    return fmt.format(float(v))
+                except Exception:
+                    return str(v)
+
+            _summary_df = plot_df.copy()
+            _sc = _summary_df["close"]
+            _ltp_s  = float(_sc.iloc[-1]) if len(_sc) else float("nan")
+            _52w_hi = float(_summary_df["high"].tail(252).max()) if len(_summary_df) >= 20 else float("nan")
+            _52w_lo = float(_summary_df["low"].tail(252).min())  if len(_summary_df) >= 20 else float("nan")
+
+            # EMA
+            _ema50  = _sc.ewm(span=50,  adjust=False).mean().iloc[-1]  if len(_sc) >= 10 else float("nan")
+            _ema200 = _sc.ewm(span=200, adjust=False).mean().iloc[-1]  if len(_sc) >= 20 else float("nan")
+            _above200 = _ltp_s > _ema200 if not (pd.isna(_ema200) or pd.isna(_ltp_s)) else None
+
+            # Golden / Death cross within last 30 bars
+            def _cross_status(close):
+                if len(close) < 30:
+                    return "—"
+                e50  = close.ewm(span=50,  adjust=False).mean()
+                e200 = close.ewm(span=200, adjust=False).mean()
+                diff = e50 - e200
+                recent = diff.tail(30)
+                for i in range(len(recent) - 1, 0, -1):
+                    if recent.iloc[i - 1] < 0 and recent.iloc[i] >= 0:
+                        return "🟡 Golden Cross (recent)"
+                    if recent.iloc[i - 1] > 0 and recent.iloc[i] <= 0:
+                        return "💀 Death Cross (recent)"
+                return "No cross in past 30 bars"
+
+            _cross = _cross_status(_sc)
+
+            # Weinstein stage
+            def _w_stage(close, length):
+                if length < 50:
+                    return "?", "Insufficient data"
+                e50  = close.ewm(span=50, adjust=False).mean()
+                e200 = close.ewm(span=200, adjust=False).mean()
+                ltp  = close.iloc[-1]
+                above_200 = ltp > e200.iloc[-1]
+                e50_above = e50.iloc[-1] > e200.iloc[-1]
+                lookback  = min(30, length - 1)
+                slope_pct = (e200.iloc[-1] - e200.iloc[-lookback]) / e200.iloc[-lookback] * 100
+                if above_200 and e50_above and slope_pct > 0.3:
+                    return "2", "STAGE 2 — ADVANCING 🟢"
+                elif not above_200 and not e50_above and slope_pct < -0.3:
+                    return "4", "STAGE 4 — DECLINING 🔴"
+                elif not above_200 and not e50_above and abs(slope_pct) <= 0.3:
+                    return "1", "STAGE 1 — BASING ⚪"
+                else:
+                    return "3", "STAGE 3 — DISTRIBUTION 🟡"
+
+            _stage_num, _stage_label = _w_stage(_sc, len(_sc))
+
+            # RSI
+            _rsi_val = float(stock_row.get("rsi_14", float("nan")))
+            if pd.isna(_rsi_val) and len(_sc) >= 15:
+                delta = _sc.diff()
+                gain  = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+                loss  = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+                _rs   = gain / loss.replace(0, float("nan"))
+                _rsi_val = float(100 - (100 / (1 + _rs.iloc[-1])))
+
+            def _rsi_label(v):
+                if pd.isna(v):
+                    return "—", "⚪"
+                if v >= 70:
+                    return f"{v:.1f} — OVERBOUGHT", "🔴"
+                if v >= 55:
+                    return f"{v:.1f} — Bullish zone", "🟢"
+                if v >= 45:
+                    return f"{v:.1f} — Neutral", "⚪"
+                if v >= 30:
+                    return f"{v:.1f} — Bearish zone", "🟡"
+                return f"{v:.1f} — OVERSOLD", "🟢"  # oversold = potential bounce
+
+            _rsi_txt, _rsi_ico = _rsi_label(_rsi_val)
+
+            # Bollinger Bands position
+            def _bb_position(close):
+                if len(close) < 20:
+                    return "—"
+                mid  = close.rolling(20).mean()
+                std  = close.rolling(20).std()
+                upper = (mid + 2 * std).iloc[-1]
+                lower = (mid - 2 * std).iloc[-1]
+                ltp   = close.iloc[-1]
+                pct   = (ltp - lower) / (upper - lower) if (upper - lower) > 0 else 0.5
+                if pct >= 0.95:
+                    return f"At upper band ({pct*100:.0f}%) — stretched / overbought"
+                if pct >= 0.7:
+                    return f"Upper half ({pct*100:.0f}%) — bullish range"
+                if pct >= 0.3:
+                    return f"Mid-band ({pct*100:.0f}%) — consolidating"
+                if pct >= 0.05:
+                    return f"Lower half ({pct*100:.0f}%) — bearish range"
+                return f"At lower band ({pct*100:.0f}%) — oversold / potential bounce"
+
+            _bb_pos = _bb_position(_sc)
+
+            # MACD histogram state
+            def _macd_state(close):
+                if len(close) < 26:
+                    return "—"
+                ema12 = close.ewm(span=12, adjust=False).mean()
+                ema26 = close.ewm(span=26, adjust=False).mean()
+                macd  = ema12 - ema26
+                sig   = macd.ewm(span=9, adjust=False).mean()
+                hist  = macd - sig
+                cur   = hist.iloc[-1]
+                prev  = hist.iloc[-2] if len(hist) >= 2 else cur
+                if cur > 0 and cur > prev:
+                    return "🟢 Positive & accelerating — best long entry zone"
+                if cur > 0 and cur <= prev:
+                    return "🟡 Positive but slowing — hold, don't add"
+                if cur < 0 and cur > prev:
+                    return "🟡 Negative but improving — potential reversal building"
+                return "🔴 Negative & accelerating down — avoid longs"
+
+            _macd_state_txt = _macd_state(_sc)
+
+            # Pivot levels (from last daily candle)
+            _piv_df   = chart_df.sort_values("date")
+            if len(_piv_df) >= 2:
+                _yest = _piv_df.iloc[-2]
+                _H, _L, _C = float(_yest["high"]), float(_yest["low"]), float(_yest["close"])
+                _P  = (_H + _L + _C) / 3
+                _R1 = 2 * _P - _L
+                _R2 = _P + (_H - _L)
+                _S1 = 2 * _P - _H
+                _S2 = _P - (_H - _L)
+                _atr14 = float(
+                    _piv_df["close"].diff().abs().tail(14).mean()
+                )  # simplified ATR
+                _piv_bias = "🟢 BULLISH (price above pivot)" if _ltp_s > _P else "🔴 BEARISH (price below pivot)"
+                _closest_r = "R1" if abs(_ltp_s - _R1) < abs(_ltp_s - _R2) else "R2"
+                _closest_s = "S1" if abs(_ltp_s - _S1) < abs(_ltp_s - _S2) else "S2"
+            else:
+                _P = _R1 = _R2 = _S1 = _S2 = float("nan")
+                _piv_bias = "—"
+                _closest_r = _closest_s = "—"
+                _atr14 = float("nan")
+
+            # S/R zones near LTP
+            def _nearest_zones(df, ltp):
+                if len(df) < 10 or pd.isna(ltp):
+                    return [], []
+                data = df.tail(120).reset_index(drop=True)
+                raw = []
+                for i in range(2, len(data) - 2):
+                    h = float(data["high"].iloc[i])
+                    if h >= data["high"].iloc[max(0,i-2):i].max() and h >= data["high"].iloc[i+1:i+3].max():
+                        raw.append(h)
+                    l = float(data["low"].iloc[i])
+                    if l <= data["low"].iloc[max(0,i-2):i].min() and l <= data["low"].iloc[i+1:i+3].min():
+                        raw.append(l)
+                if not raw:
+                    return [], []
+                supports    = sorted([p for p in raw if p < ltp], reverse=True)[:3]
+                resistances = sorted([p for p in raw if p > ltp])[:3]
+                return supports, resistances
+
+            _sup_levels, _res_levels = _nearest_zones(plot_df, _ltp_s)
+
+            # Volume profile POC (simplified: price bin with highest cumulative volume)
+            def _vol_poc(df):
+                if len(df) < 20 or df["volume"].sum() == 0:
+                    return float("nan")
+                data = df.tail(120)
+                prices = (data["high"] + data["low"]) / 2
+                lo, hi = prices.min(), prices.max()
+                if hi <= lo:
+                    return float("nan")
+                bins = pd.cut(prices, bins=30)
+                vol_by_bin = data.groupby(bins, observed=True)["volume"].sum()
+                if vol_by_bin.empty:
+                    return float("nan")
+                poc_interval = vol_by_bin.idxmax()
+                return (poc_interval.left + poc_interval.right) / 2
+
+            _poc = _vol_poc(plot_df)
+            _poc_txt = (
+                f"₹{_poc:,.2f} ({'above LTP — acts as resistance' if _poc > _ltp_s else 'below LTP — acts as support'})"
+                if not pd.isna(_poc) else "—"
+            )
+
+            # ============================================================
+            # STOCK ANALYSIS CONSOLE — 4 purpose-built chart tabs
+            # ============================================================
+            tab_trend, tab_mom, tab_setup, tab_struct = st.tabs([
+                "📈 Trend Canvas",
+                "⚡ Momentum Lab",
+                "🎯 Trade Setup",
+                "🏗️ Market Structure",
+            ])
+
+            with tab_trend:
+                # ── Summary card ─────────────────────────────────────────
+                _trend_verdict_map = {
+                    "2": ("🟢", "#22c55e", "Bullish — best time to buy swings"),
+                    "4": ("🔴", "#ef4444", "Bearish — avoid longs, short setups viable"),
+                    "1": ("⚪", "#94a3b8", "Basing — wait for Stage 2 breakout"),
+                    "3": ("🟡", "#f59e0b", "Topping — reduce exposure, tighten stops"),
+                    "?": ("⚪", "#94a3b8", "Insufficient data"),
+                }
+                _tv_ico, _tv_col, _tv_action = _trend_verdict_map.get(_stage_num, ("⚪", "#94a3b8", "—"))
+                _dist_hi_pct = (((_ltp_s - _52w_hi) / _52w_hi) * 100) if not pd.isna(_52w_hi) and _52w_hi else float("nan")
+                _dist_lo_pct = (((_ltp_s - _52w_lo) / _52w_lo) * 100) if not pd.isna(_52w_lo) and _52w_lo else float("nan")
+
+                st.markdown(
+                    f'<div style="background:rgba(30,41,59,0.9);border:1px solid {_tv_col};'
+                    f'border-radius:10px;padding:14px 18px;margin-bottom:10px;">'
+                    f'<div style="font-size:16px;font-weight:700;color:{_tv_col};margin-bottom:10px;">'
+                    f'{_tv_ico} {_stage_label} &nbsp;·&nbsp; <span style="font-size:13px;font-weight:400;color:#e2e8f0;">{_tv_action}</span>'
+                    f'</div>'
+                    f'<table style="width:100%;border-collapse:collapse;font-size:13px;color:#e2e8f0;">'
+                    f'<tr><td style="padding:3px 12px 3px 0;color:#94a3b8;width:40%;">LTP</td>'
+                    f'<td><b>{_safe(_ltp_s)}</b></td></tr>'
+                    f'<tr><td style="padding:3px 12px 3px 0;color:#94a3b8;">EMA 50</td>'
+                    f'<td><b>{_safe(_ema50)}</b> &nbsp;{"🟢 Price above" if not pd.isna(_ema50) and _ltp_s > _ema50 else "🔴 Price below"}</td></tr>'
+                    f'<tr><td style="padding:3px 12px 3px 0;color:#94a3b8;">EMA 200</td>'
+                    f'<td><b>{_safe(_ema200)}</b> &nbsp;{"🟢 Price above — long bias" if _above200 else "🔴 Price below — caution"}</td></tr>'
+                    f'<tr><td style="padding:3px 12px 3px 0;color:#94a3b8;">Cross signal</td>'
+                    f'<td>{_cross}</td></tr>'
+                    f'<tr><td style="padding:3px 12px 3px 0;color:#94a3b8;">52W High</td>'
+                    f'<td>{_safe(_52w_hi)} &nbsp;({_dist_hi_pct:+.1f}% from LTP)</td></tr>'
+                    f'<tr><td style="padding:3px 12px 3px 0;color:#94a3b8;">52W Low</td>'
+                    f'<td>{_safe(_52w_lo)} &nbsp;({_dist_lo_pct:+.1f}% from LTP)</td></tr>'
+                    f'</table>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+                with st.expander("📊 Open Trend Canvas chart", expanded=False):
+                    fig1 = _charts.chart_trend_canvas(plot_df, stock_row, x_range=_x_range, candle_label=candle_interval)
+                    st.plotly_chart(fig1, use_container_width=True, config=_pchart_cfg)
+
+                with st.expander("📖 How to interpret — Trend Canvas"):
+                    st.markdown(f"""
+**What this chart answers:** *"Which market phase is this stock in — bull, bear, or transitioning?"*
+
+**Current reading for {selected}:**
+- Weinstein stage: **{_stage_label}** → _{_tv_action}_
+- EMA 50 is `{_safe(_ema50)}` — LTP is **{'above' if not pd.isna(_ema50) and _ltp_s > _ema50 else 'below'}**
+- EMA 200 is `{_safe(_ema200)}` — LTP is **{'above → long-only stance' if _above200 else 'below → avoid fresh longs'}**
+- Cross signal: **{_cross}**
+
+| Element | What it means | How to act |
+|---|---|---|
+| **Stage 2 — Advancing** 🟢 | Price > EMA 200, EMA 50 rising. The profitable zone | Best time to buy swings |
+| **Stage 4 — Declining** 🔴 | Price < EMA 200, EMA 50 falling | Avoid longs. Short setups viable |
+| **Stage 1 — Basing** ⚪ | EMA 200 flat, price oscillating | Wait — accumulation happening |
+| **Stage 3 — Distribution** 🟡 | Near highs, EMA 50 rolling over | Reduce exposure, tighten stops |
+| **🟡 Golden Cross** | EMA 50 crossed above EMA 200 | Biggest gains happen after a Golden Cross |
+| **💀 Death Cross** | EMA 50 crossed below EMA 200 | Exit longs immediately |
+| **52W High** (dotted) | Annual ceiling — psychological resistance | Breaking above on high volume = very bullish |
+""")
+
+            with tab_mom:
+                # ── Summary card ─────────────────────────────────────────
+                _mom_overall = (
+                    "🟢 Strong momentum — enter or hold longs" if not pd.isna(_rsi_val) and 45 <= _rsi_val <= 65 and "accelerating" in _macd_state_txt
+                    else "🔴 Overextended — book partial profits" if not pd.isna(_rsi_val) and _rsi_val > 70
+                    else "🟡 Momentum mixed — watch for confirmation" if not pd.isna(_rsi_val) and _rsi_val >= 40
+                    else "🔴 Weak momentum — avoid longs"
+                )
+                st.markdown(
+                    f'<div style="background:rgba(30,41,59,0.9);border:1px solid #3b82f6;'
+                    f'border-radius:10px;padding:14px 18px;margin-bottom:10px;">'
+                    f'<div style="font-size:15px;font-weight:700;color:#3b82f6;margin-bottom:10px;">'
+                    f'⚡ Momentum Overview &nbsp;·&nbsp; <span style="font-size:13px;font-weight:400;color:#e2e8f0;">{_mom_overall}</span>'
+                    f'</div>'
+                    f'<table style="width:100%;border-collapse:collapse;font-size:13px;color:#e2e8f0;">'
+                    f'<tr><td style="padding:3px 12px 3px 0;color:#94a3b8;width:40%;">RSI-14</td>'
+                    f'<td>{_rsi_ico} <b>{_rsi_txt}</b></td></tr>'
+                    f'<tr><td style="padding:3px 12px 3px 0;color:#94a3b8;">Bollinger position</td>'
+                    f'<td>{_bb_pos}</td></tr>'
+                    f'<tr><td style="padding:3px 12px 3px 0;color:#94a3b8;">MACD histogram</td>'
+                    f'<td>{_macd_state_txt}</td></tr>'
+                    f'<tr><td style="padding:3px 12px 3px 0;color:#94a3b8;">5D return</td>'
+                    f'<td>{_safe(stock_row.get("ret_5d"), "{:+.2f}%")}</td></tr>'
+                    f'<tr><td style="padding:3px 12px 3px 0;color:#94a3b8;">1M return</td>'
+                    f'<td>{_safe(stock_row.get("ret_1m"), "{:+.2f}%")}</td></tr>'
+                    f'</table>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+                with st.expander("📊 Open Momentum Lab chart", expanded=False):
+                    fig2 = _charts.chart_momentum_lab(plot_df, stock_row, x_range=_x_range, candle_label=candle_interval)
+                    st.plotly_chart(fig2, use_container_width=True, config=_pchart_cfg)
+
+                with st.expander("📖 How to interpret — Momentum Lab"):
+                    st.markdown(f"""
+**What this chart answers:** *"Is momentum accelerating into the trade, or exhausting?"*
+
+**Current reading for {selected}:**
+- RSI-14: **{_rsi_txt}** — {"book partial profits" if not pd.isna(_rsi_val) and _rsi_val > 70 else "add on pullbacks" if not pd.isna(_rsi_val) and 50 < _rsi_val < 70 else "wait for recovery" if not pd.isna(_rsi_val) and _rsi_val < 50 else "—"}
+- Bollinger: **{_bb_pos}**
+- MACD: **{_macd_state_txt}**
+
+| RSI reading | Meaning | Action |
+|---|---|---|
+| > 70 | Overbought | Book 50% profits, trail stop on rest |
+| 55–70 | Bullish momentum | Hold longs or add on pullbacks |
+| 45–55 | Neutral | Wait for direction |
+| 30–45 | Bearish momentum | Avoid new longs |
+| < 30 | Oversold | Watch for reversal with divergence |
+
+**Rule of thumb:** Best entries when RSI 45–65 + MACD histogram bright green.
+""")
+
+            with tab_setup:
+                # Trade Setup always uses DAILY candles
+                _setup_days = 40
+                _daily_setup = chart_df.sort_values("date").tail(_setup_days).copy()
+                _su_end   = pd.to_datetime(_daily_setup["date"].iloc[-1])
+                _su_start = pd.to_datetime(_daily_setup["date"].iloc[0])
+                _setup_x_range = (_su_start, _su_end)
+
+                # Intraday signal values
+                _id_sig   = stock_row.get("intraday_signal", "")
+                _id_entry = stock_row.get("intraday_entry")
+                _id_stop  = stock_row.get("intraday_stop")
+                _id_t1    = stock_row.get("intraday_t1")
+                _sw_sig   = stock_row.get("swing_signal", "")
+                _sw_entry = stock_row.get("swing_entry")
+                _sw_stop  = stock_row.get("swing_stop")
+                _sw_t1    = stock_row.get("swing_t1")
+                _sw_t2    = stock_row.get("swing_t2")
+
+                _id_signal_line = (
+                    f'🟢 <b>BUY ABOVE {_safe(_id_entry)}</b> · Stop {_safe(_id_stop)} · Target {_safe(_id_t1)}'
+                    if _id_sig == "BUY_ABOVE"
+                    else f'🔴 <b>SELL BELOW {_safe(_id_entry)}</b> · Stop {_safe(_id_stop)} · Target {_safe(_id_t1)}'
+                    if _id_sig == "SELL_BELOW"
+                    else "No intraday signal active"
+                )
+                _sw_signal_line = (
+                    f'🟢 <b>Swing BUY @ {_safe(_sw_entry)}</b> · Stop {_safe(_sw_stop)} · T1 {_safe(_sw_t1)} · T2 {_safe(_sw_t2)}'
+                    if _sw_sig == "BUY"
+                    else f'🔴 <b>Swing SELL @ {_safe(_sw_entry)}</b> · Stop {_safe(_sw_stop)} · T1 {_safe(_sw_t1)}'
+                    if _sw_sig == "SELL"
+                    else "No swing signal active"
+                )
+
+                st.markdown(
+                    f'<div style="background:rgba(30,41,59,0.9);border:1px solid #f59e0b;'
+                    f'border-radius:10px;padding:14px 18px;margin-bottom:10px;">'
+                    f'<div style="font-size:15px;font-weight:700;color:#f59e0b;margin-bottom:10px;">'
+                    f'🎯 Today\'s Trade Levels &nbsp;·&nbsp; <span style="font-size:13px;font-weight:400;color:#e2e8f0;">{_piv_bias}</span>'
+                    f'</div>'
+                    f'<table style="width:100%;border-collapse:collapse;font-size:13px;color:#e2e8f0;">'
+                    f'<tr><td style="padding:3px 12px 3px 0;color:#94a3b8;width:40%;">Intraday signal</td>'
+                    f'<td>{_id_signal_line}</td></tr>'
+                    f'<tr><td style="padding:3px 12px 3px 0;color:#94a3b8;">Swing signal</td>'
+                    f'<td>{_sw_signal_line}</td></tr>'
+                    f'<tr><td style="padding:4px 12px 4px 0;color:#94a3b8;">Pivot (P)</td>'
+                    f'<td>{_safe(_P)}</td></tr>'
+                    f'<tr><td style="padding:3px 12px 3px 0;color:#22c55e;">R1 / R2</td>'
+                    f'<td>{_safe(_R1)} &nbsp;/&nbsp; {_safe(_R2)}</td></tr>'
+                    f'<tr><td style="padding:3px 12px 3px 0;color:#ef4444;">S1 / S2</td>'
+                    f'<td>{_safe(_S1)} &nbsp;/&nbsp; {_safe(_S2)}</td></tr>'
+                    f'<tr><td style="padding:3px 12px 3px 0;color:#94a3b8;">Nearest resistance</td>'
+                    f'<td>{_closest_r}</td></tr>'
+                    f'<tr><td style="padding:3px 12px 3px 0;color:#94a3b8;">Nearest support</td>'
+                    f'<td>{_closest_s}</td></tr>'
+                    f'</table>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+                if candle_interval not in ("1D", "1W", "1M"):
+                    st.caption("ℹ️ Trade Setup always uses daily candles — pivot levels are based on yesterday's High/Low/Close.")
+
+                with st.expander("📊 Open Trade Setup chart", expanded=False):
+                    fig3 = _charts.chart_trade_setup(
+                        _daily_setup, stock_row,
+                        x_range=_setup_x_range,
+                        display_days=_setup_days,
+                        candle_label="1D",
+                    )
+                    st.plotly_chart(fig3, use_container_width=True, config=_pchart_cfg)
+
+                with st.expander("📖 How to interpret — Trade Setup"):
+                    st.markdown(f"""
+**What this chart answers:** *"Where exactly do I place my order, stop-loss, and target today?"*
+
+**Current levels for {selected}:**
+- Pivot bias: **{_piv_bias}**
+- Intraday: {_id_signal_line}
+- Swing: {_sw_signal_line}
+- Pivot P = {_safe(_P)} · R1 = {_safe(_R1)} · R2 = {_safe(_R2)} · S1 = {_safe(_S1)} · S2 = {_safe(_S2)}
+
+| Level | Use |
+|---|---|
+| **R2** | Take 50% profits at R2 for intraday |
+| **R1** | BUY ABOVE R1 = momentum entry; becomes support after breakout |
+| **Pivot P** | Above P = bullish bias. Below = bearish bias |
+| **S1** | SELL BELOW S1 = breakdown; bounce zone for longs |
+| **S2** | Short target; strong buy-the-dip for longer-term holders |
+
+**Key rule: HARD EXIT all intraday positions by 3:10 PM.**
+""")
+
+            with tab_struct:
+                # ── Summary card ─────────────────────────────────────────
+                _sup_txt = ", ".join(f"₹{p:,.2f}" for p in _sup_levels) if _sup_levels else "none detected"
+                _res_txt = ", ".join(f"₹{p:,.2f}" for p in _res_levels) if _res_levels else "none detected"
+                _struct_verdict = (
+                    "🟢 Price near support — potential bounce zone"
+                    if _sup_levels and abs(_ltp_s - _sup_levels[0]) / _ltp_s < 0.02
+                    else "🔴 Price near resistance — potential rejection zone"
+                    if _res_levels and abs(_ltp_s - _res_levels[0]) / _ltp_s < 0.02
+                    else "⚪ Price in open range between zones"
+                )
+
+                st.markdown(
+                    f'<div style="background:rgba(30,41,59,0.9);border:1px solid #8b5cf6;'
+                    f'border-radius:10px;padding:14px 18px;margin-bottom:10px;">'
+                    f'<div style="font-size:15px;font-weight:700;color:#8b5cf6;margin-bottom:10px;">'
+                    f'🏗️ Market Structure &nbsp;·&nbsp; <span style="font-size:13px;font-weight:400;color:#e2e8f0;">{_struct_verdict}</span>'
+                    f'</div>'
+                    f'<table style="width:100%;border-collapse:collapse;font-size:13px;color:#e2e8f0;">'
+                    f'<tr><td style="padding:3px 12px 3px 0;color:#94a3b8;width:40%;">LTP</td>'
+                    f'<td><b>{_safe(_ltp_s)}</b></td></tr>'
+                    f'<tr><td style="padding:3px 12px 3px 0;color:#22c55e;">Support zones (below)</td>'
+                    f'<td>{_sup_txt}</td></tr>'
+                    f'<tr><td style="padding:3px 12px 3px 0;color:#ef4444;">Resistance zones (above)</td>'
+                    f'<td>{_res_txt}</td></tr>'
+                    f'<tr><td style="padding:3px 12px 3px 0;color:#f59e0b;">Volume POC (6M)</td>'
+                    f'<td>{_poc_txt}</td></tr>'
+                    f'</table>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+                with st.expander("📊 Open Market Structure chart", expanded=False):
+                    fig4 = _charts.chart_market_structure(plot_df, stock_row, x_range=_x_range, candle_label=candle_interval)
+                    st.plotly_chart(fig4, use_container_width=True, config=_pchart_cfg)
+
+                with st.expander("📖 How to interpret — Market Structure"):
+                    st.markdown(f"""
+**What this chart answers:** *"Where are the real walls of supply and demand?"*
+
+**Current reading for {selected}:**
+- Support zones (below LTP): **{_sup_txt}**
+- Resistance zones (above LTP): **{_res_txt}**
+- Volume POC: **{_poc_txt}**
+- Verdict: **{_struct_verdict}**
+
+| Element | Meaning | Action |
+|---|---|---|
+| **Green bands** | Price bounced here multiple times | Buy zone on dip into green band |
+| **Red bands** | Price rejected here multiple times | Take profits when price enters red band |
+| **POC** (amber line) | Price where most volume was traded | Strongest magnet — price returns here often |
+| **Thick zone** | More touches = stronger level | 4+ touch zones are highly reliable |
+
+**Best setup:** Support zone + high volume POC at the same price = very strong buy zone.
+""")
+
+    # ── STOCKLENS AI Brief for selected stock ───────────────────────────────
+    _ai_brief_val  = stock_row.get("ai_brief")
+    _ai_score_val  = stock_row.get("ai_score")
+    _ai_verdict_val = stock_row.get("ai_verdict", "")
+    _ai_conf_val   = stock_row.get("ai_confidence", "")
+    _ai_ts_val     = stock_row.get("ai_analyzed_at")
+    _has_brief     = bool(_ai_brief_val) and str(_ai_brief_val) not in ("", "nan", "None")
+
+    with st.expander(
+        ("🤖 STOCKLENS Brief"
+         + (f" · {_ai.VERDICT_EMOJI.get(str(_ai_verdict_val).upper(),'—')} {_ai_verdict_val} "
+            f"({_ai_score_val:.1f}/10)" if _has_brief and _ai_score_val else "")
+        ),
+        expanded=False,
+    ):
+        if _has_brief:
+            # Freshness badge
+            if _ai_ts_val:
+                try:
+                    _age_h = (datetime.now() - datetime.fromisoformat(str(_ai_ts_val))).total_seconds() / 3600
+                    _fresh = f"Analysed {_age_h:.0f}h ago"
+                except Exception:
+                    _fresh = ""
+            else:
+                _fresh = ""
+
+            _vc = _ai.VERDICT_COLOR.get(str(_ai_verdict_val).upper(), "#64748b")
+            st.markdown(
+                f'<div style="display:flex;gap:12px;margin-bottom:10px;align-items:center;">'
+                f'<span style="background:rgba(15,23,42,0.8);border:1px solid {_vc};'
+                f'color:{_vc};font-weight:700;padding:4px 14px;border-radius:20px;font-size:13px;">'
+                f'{_ai.VERDICT_EMOJI.get(str(_ai_verdict_val).upper(),"—")} {_ai_verdict_val}</span>'
+                f'<span style="color:#94a3b8;font-size:12px;">AI Score: {_ai_score_val:.1f}/10 · '
+                f'Confidence: {_ai_conf_val} · {_fresh}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f'<div style="background:#0f172a;border:1px solid #1e293b;border-radius:8px;'
+                f'padding:16px;font-family:monospace;font-size:12px;color:#e2e8f0;'
+                f'white-space:pre-wrap;line-height:1.6;">{_ai_brief_val}</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            _detail_ai_c = st.session_state.get("ai_client")
+            if _detail_ai_c:
+                st.markdown(
+                    '<div style="background:rgba(59,130,246,0.08);border:1px solid #3b82f6;'
+                    'border-radius:8px;padding:12px 16px;margin-bottom:4px;">'
+                    '🤖 <b>No STOCKLENS brief yet</b> for this stock. '
+                    'Click below to run a full analysis (~1 API call).'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+                if st.button(
+                    f"🤖 Analyse {selected} with STOCKLENS",
+                    key=f"ai_single_{selected}",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    with st.spinner(f"Running STOCKLENS on {selected} (fundamental + sentiment + macro)…"):
+                        _res = _ai.run_stocklens(
+                            selected, stock_row.to_dict(),
+                            _detail_ai_c,
+                            st.session_state["ai_provider"],
+                        )
+                        if _res.get("error"):
+                            st.error(f"AI error: {_res['error']}")
+                        else:
+                            _token = int(stock_row["instrument_token"])
+                            db.save_ai_result(_token, _res)
+                            st.rerun()
+            else:
+                st.info(
+                    "No AI analysis yet. Add an OpenAI or OpenRouter API key in the sidebar "
+                    "to enable STOCKLENS fundamentals + sentiment research for this stock."
+                )
+
+    with st.expander("ℹ️ How the composite score works"):
+        st.markdown(f"""
+        **Composite Score** = `{config.W_TREND}` × Trend + `{config.W_RELATIVE_STRENGTH}` × RS + `{config.W_VOLUME_EXPANSION}` × Vol
+
+        **Trend Score** weights (calibrated for 1-3 day swing):
+        - 5D: {config.TREND_WEIGHTS['5D']}  |  1M: {config.TREND_WEIGHTS['1M']}  |  3M: {config.TREND_WEIGHTS['3M']}  |  6M: {config.TREND_WEIGHTS['6M']}  |  1Y: {config.TREND_WEIGHTS['1Y']}
+
+        **Liquidity gate:** ≥ ₹{config.MIN_AVG_TURNOVER_CR} Cr daily turnover, ≥ {config.MIN_AVG_VOLUME:,} avg volume, price ≥ ₹{config.MIN_PRICE}
+        """)
+
+
+# ─── SIGNALS TAB ────────────────────────────────────────────
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _is_market_open() -> bool:
+    """True only during NSE cash market hours (9:15–15:30 IST, Mon–Fri)."""
+    now = datetime.now(_IST)
+    if now.weekday() >= 5:           # Saturday / Sunday
+        return False
+    market_open  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
+    market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    return market_open <= now <= market_close
+
+
+# ── Shared styling helpers (used by signal tabs and intraday fragments) ───────
+def _long_status_color(val):
+    return {
+        "TRIGGERED":   "color: #22c55e; font-weight: 700",
+        "APPROACHING": "color: #f59e0b; font-weight: 600",
+        "BROKEN":      "color: #ef4444; font-weight: 600",
+    }.get(val, "color: #94a3b8")
+
+
+def _short_status_color(val):
+    return {
+        "TRIGGERED":   "color: #ef4444; font-weight: 700",
+        "APPROACHING": "color: #f59e0b; font-weight: 600",
+        "REVERSED":    "color: #22c55e; font-weight: 600",
+    }.get(val, "color: #94a3b8")
+
+
+def _delta_color(val):
+    """Green for ▲ price rise, red for ▼ price fall."""
+    v = str(val)
+    if v.startswith("▲"):
+        return "color: #22c55e; font-weight: 600"
+    if v.startswith("▼"):
+        return "color: #ef4444; font-weight: 600"
+    return "color: #64748b"
+
+
+def _gain_color(val):
+    """Positive gain shown in green."""
+    v = str(val)
+    if v.startswith("+"):
+        return "color: #22c55e"
+    return "color: #94a3b8"
+
+
+def _risk_color(val):
+    """Risk always shown in amber so it stands out."""
+    v = str(val)
+    if v != "—":
+        return "color: #f59e0b"
+    return "color: #94a3b8"
+
+
+def _gain_pct(entry, target) -> str:
+    """Return '+X.X%' upside from entry → target, or '—'. Returns '—' if target ≤ entry."""
+    try:
+        e, t = float(entry or 0), float(target or 0)
+        if e > 0 and t > e:
+            return f"+{(t - e) / e * 100:.1f}%"
+    except Exception:
+        pass
+    return "—"
+
+
+def _risk_pct(entry, stop) -> str:
+    """Return '-X.X%' downside from entry → stop, or '—'."""
+    try:
+        e, s = float(entry or 0), float(stop or 0)
+        if e > 0 and s > 0:
+            return f"-{abs(e - s) / e * 100:.1f}%"
+    except Exception:
+        pass
+    return "—"
+
+
+def _delta_str(sym: str) -> str:
+    """LTP change since last fragment tick, formatted as ▲/▼ X.XX%."""
+    cur  = st.session_state.get("_live_ltp",  {}).get(sym, 0)
+    prev = st.session_state.get("_prev_ltp",  {}).get(sym, cur)
+    if not cur or not prev or prev == cur:
+        return "—"
+    chg = (cur - prev) / prev * 100
+    return f"▲{chg:.2f}%" if chg > 0 else f"▼{abs(chg):.2f}%"
+
+
+# ── FRAGMENT 1: live header (badge + LTP fetch + metric pills) ────────────────
+# Runs every 2 s. Does NOT contain any st.tabs() — tabs must live outside
+# fragments to keep their selection state stable across re-renders.
+@st.fragment(run_every=2)
+def _live_signals_header():
+    base_df = st.session_state.get("_signals_base_df", pd.DataFrame())
+    if base_df.empty or "swing_signal" not in base_df.columns:
+        return
+
+    _market_open = _is_market_open()
+    # Market closed — render static header once, skip LTP fetch entirely
+    if not _market_open:
+        _hc1, _hc2 = st.columns([5, 2])
+        _hc1.subheader("🎯 Trade Signals")
+        _hc2.markdown(
+            "<div style='text-align:right;padding-top:8px'>"
+            "<span style='color:#64748b'>⏸ Market Closed</span></div>",
+            unsafe_allow_html=True,
+        )
+        _sig_age = ""
+        if "last_updated" in base_df.columns:
+            try:
+                _lu = pd.to_datetime(base_df["last_updated"]).max()
+                if pd.notna(_lu):
+                    _lu_ist = _lu.tz_localize("Asia/Kolkata") if _lu.tzinfo is None else _lu.astimezone(_IST)
+                    _sig_age = f" · Signals: {_lu_ist.strftime('%d %b %H:%M')}"
+            except Exception:
+                pass
+        st.caption(
+            f"Auto-refresh paused outside market hours (9:15–15:30 IST, Mon–Fri).{_sig_age} "
+            "Run Quick Scan to recompute signals."
+        )
+        df_c = base_df.copy()
+        _n_sb = int((df_c["swing_signal"]    == "BUY").sum())
+        _n_ss = int((df_c["swing_signal"]    == "SELL").sum())
+        _n_il = int((df_c["intraday_signal"] == "BUY_ABOVE").sum())
+        _n_is = int((df_c["intraday_signal"] == "SELL_BELOW").sum())
+        _n_sc = int((df_c["scale_signal"]    == "INITIAL_ENTRY").sum())
+        st.session_state["_n_intra_long"]  = _n_il
+        st.session_state["_n_intra_short"] = _n_is
+        _pc1, _pc2, _pc3, _pc4, _pc5 = st.columns(5)
+        _pc1.metric("Swing Buy",       _n_sb)
+        _pc2.metric("Exit signals",    _n_ss)
+        _pc3.metric("Intraday Long",   _n_il)
+        _pc4.metric("Intraday Short",  _n_is)
+        _pc5.metric("Scaling entries", _n_sc)
+        return   # ← stop here; no live fetch, no further work
+    _has_signal_mask = (
+        base_df["swing_signal"].isin(["BUY", "SELL"]) |
+        base_df["intraday_signal"].isin(["BUY_ABOVE", "SELL_BELOW"]) |
+        (base_df["scale_signal"] == "INITIAL_ENTRY")
+    )
+    _signal_syms = base_df.loc[_has_signal_mask, "tradingsymbol"].dropna().unique().tolist()
+
+    _ltp_err = None
+    if _market_open and _signal_syms:
+        try:
+            _fc = KiteClient()
+            if _fc.authenticated:
+                fresh = _fc.get_ltp_batch([f"NSE:{s}" for s in _signal_syms])
+                # Snapshot current → previous BEFORE overwriting with new prices
+                if "_live_ltp" in st.session_state:
+                    st.session_state["_prev_ltp"] = dict(st.session_state["_live_ltp"])
+                st.session_state["_live_ltp"] = {
+                    k.split(":", 1)[-1]: v for k, v in fresh.items()
+                }
+                st.session_state["_live_ltp_ts"] = datetime.now(_IST)
+        except Exception as exc:
+            _ltp_err = str(exc)[:80]
+
+    _hc1, _hc2 = st.columns([5, 2])
+    _hc1.subheader("🎯 Trade Signals")
+    _ts = st.session_state.get("_live_ltp_ts")
+    if _market_open:
+        if _ts:
+            _hc2.markdown(
+                f"<div style='text-align:right;padding-top:8px'>"
+                f"<span style='color:#22c55e;font-weight:700'>● LIVE</span>"
+                f"&nbsp;&nbsp;<small style='color:#94a3b8'>{_ts.strftime('%H:%M:%S')} IST</small></div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            _hc2.markdown(
+                "<div style='text-align:right;padding-top:8px'>"
+                "<span style='color:#f59e0b'>● Market Open — awaiting auth</span></div>",
+                unsafe_allow_html=True,
+            )
+    else:
+        _hc2.markdown(
+            "<div style='text-align:right;padding-top:8px'>"
+            "<span style='color:#64748b'>⏸ Market Closed — last data shown</span></div>",
+            unsafe_allow_html=True,
+        )
+    if _ltp_err:
+        st.caption(f"⚠ LTP fetch error: {_ltp_err}")
+
+    # Show when signals were last computed (from DB timestamp)
+    _sig_age = ""
+    if "last_updated" in base_df.columns:
+        try:
+            _lu = pd.to_datetime(base_df["last_updated"]).max()
+            if pd.notna(_lu):
+                _lu_ist = _lu.tz_localize("Asia/Kolkata") if _lu.tzinfo is None else _lu.astimezone(_IST)
+                _sig_age = f" · Signals computed: {_lu_ist.strftime('%d %b %H:%M')}"
+        except Exception:
+            pass
+    st.caption(
+        f"Levels (entry/stop/targets) loaded from DB — persist across restarts.{_sig_age} "
+        "LTP refreshes every ~2 s during market hours. Run Quick Scan to recompute signals."
+    )
+
+    # Apply live LTP for metric pill counts
+    df_c = base_df.copy()
+    for _sym, _price in st.session_state.get("_live_ltp", {}).items():
+        df_c.loc[df_c["tradingsymbol"] == _sym, "ltp"] = _price
+
+    _n_sb  = int((df_c["swing_signal"]    == "BUY").sum())
+    _n_ss  = int((df_c["swing_signal"]    == "SELL").sum())
+    _n_il  = int((df_c["intraday_signal"] == "BUY_ABOVE").sum())
+    _n_is  = int((df_c["intraday_signal"] == "SELL_BELOW").sum())
+    _n_sc  = int((df_c["scale_signal"]    == "INITIAL_ENTRY").sum())
+    # Persist counts so outer tabs can display them in sub-tab labels
+    st.session_state["_n_intra_long"]  = _n_il
+    st.session_state["_n_intra_short"] = _n_is
+
+    _pc1, _pc2, _pc3, _pc4, _pc5 = st.columns(5)
+    _pc1.metric("Swing Buy",       _n_sb,  help="Stocks with a BUY signal (PULLBACK / BREAKOUT / NR7)")
+    _pc2.metric("Exit signals",    _n_ss,  help="Existing longs where trend has broken — consider exiting")
+    _pc3.metric("Intraday Long",   _n_il,  help="BUY_ABOVE R1 setups for today's session")
+    _pc4.metric("Intraday Short",  _n_is,  help="SELL_BELOW S1 setups — short sell opportunities")
+    _pc5.metric("Scaling entries", _n_sc,  help="Stocks in full EMA stack at EMA50 pullback — position build")
+
+
+# ── FRAGMENT 2a: intraday LONG table (live status column) ────────────────────
+# Runs every 2 s inside the Long sub-tab. No st.tabs() here — the sub-tabs
+# that contain this fragment are created OUTSIDE in _signals_main().
+@st.fragment(run_every=2)
+def _intraday_long_live():
+    # Skip all work outside market hours — fragment still runs but is instant
+    if not _is_market_open():
+        return
+    base_df = st.session_state.get("_signals_base_df", pd.DataFrame())
+    if base_df.empty:
+        return
+    df_l = base_df.copy()
+    for _sym, _price in st.session_state.get("_live_ltp", {}).items():
+        df_l.loc[df_l["tradingsymbol"] == _sym, "ltp"] = _price
+
+    _si = (
+        df_l[df_l["intraday_signal"] == "BUY_ABOVE"]
+        .sort_values("composite_score", ascending=False)
+        .reset_index(drop=True)
+    )
+    if _si.empty:
+        st.info("No intraday long setups for today's session.")
+        return
+
+    st.caption("Watch for price to trade **above R1**. Enter with stop just below Pivot.")
+    _si_rows = []
+    for _, r in _si.iterrows():
+        sym       = r.get("tradingsymbol", "")
+        ltp_now   = r.get("ltp") or 0
+        r1_val    = r.get("intraday_r1") or 0
+        entry_val = r.get("intraday_entry") or 0
+        s1_val    = float(r.get("intraday_s1") or 0)
+        if r1_val and ltp_now:
+            if ltp_now >= entry_val:
+                live_status = "TRIGGERED"
+            elif ltp_now >= r1_val * 0.995:
+                live_status = "APPROACHING"
+            elif s1_val and ltp_now < s1_val:
+                live_status = "BROKEN"
+            else:
+                live_status = "WATCHING"
+        else:
+            live_status = "—"
+        # Compute R/R for display
+        try:
+            _e = float(r.get("intraday_entry") or 0)
+            _s = float(r.get("intraday_stop")  or 0)
+            _t = float(r.get("intraday_t1")    or 0)
+            _rr_val = round((_t - _e) / (_e - _s), 1) if (_e > _s > 0 and _t > _e) else None
+            _rr_str = f"{_rr_val:.1f}×" if _rr_val else "—"
+        except Exception:
+            _rr_str = "—"
+
+        _si_rows.append([
+            live_status,
+            sym,
+            r.get("company_name", ""),
+            _fmt(ltp_now,                  "₹{:,.2f}"),
+            _delta_str(sym),
+            _gain_pct(r.get("intraday_entry"), r.get("intraday_t1")),
+            _risk_pct(r.get("intraday_entry"), r.get("intraday_stop")),
+            _rr_str,
+            _fmt(r.get("intraday_entry"),  "₹{:,.2f}"),
+            _fmt(r.get("intraday_stop"),   "₹{:,.2f}"),
+            _fmt(r.get("intraday_t1"),     "₹{:,.2f}"),
+            _fmt(r.get("intraday_pivot"),  "₹{:,.2f}"),
+            _fmt(r.get("intraday_r1"),     "₹{:,.2f}"),
+            _fmt(r.get("intraday_r2"),     "₹{:,.2f}"),
+            _fmt(r.get("intraday_s1"),     "₹{:,.2f}"),
+        ])
+
+    _si_df = pd.DataFrame(_si_rows, columns=[
+        "Status", "Symbol", "Company", "LTP", "Δ",
+        "Gain %", "Risk %", "R/R",
+        "Buy Above", "Stop", "T1 (R2)", "Pivot", "R1", "R2", "S1",
+    ])
+    st.dataframe(
+        _si_df.style
+            .map(_long_status_color, subset=["Status"])
+            .map(_delta_color,       subset=["Δ"])
+            .map(_gain_color,        subset=["Gain %"])
+            .map(_risk_color,        subset=["Risk %"])
+            .map(_gain_color,        subset=["R/R"]),
+        use_container_width=True,
+        height=min(450, 50 + len(_si_rows) * 38),
+        hide_index=True,
+        column_config={
+            "Status":    st.column_config.TextColumn("Status",
+                help=(
+                    "Live signal state (refreshes every 2 s):\n\n"
+                    "🟢 TRIGGERED — LTP is already above the buy-stop entry. "
+                    "The breakout has fired. Enter if momentum is still strong; "
+                    "do NOT chase if it has run >1% past entry.\n\n"
+                    "🟡 APPROACHING — LTP is within 0.5% of R1. "
+                    "Breakout could happen any moment. "
+                    "Set your buy-stop order NOW.\n\n"
+                    "🔴 BROKEN — LTP fell below S1. "
+                    "Bullish structure has failed for today. Do not enter long.\n\n"
+                    "⚪ WATCHING — LTP is between S1 and R1. "
+                    "No action yet. Monitor for approach to R1."
+                )),
+            "Δ":         st.column_config.TextColumn("Δ",
+                help="LTP change since last 2-second refresh tick. "
+                     "▲ green = price rising, ▼ red = price falling."),
+            "Gain %":    st.column_config.TextColumn("Gain %",
+                help="Potential upside from Buy-Above entry to T1 (R2) target. "
+                     "Typical range: 0.8%–3%."),
+            "Risk %":    st.column_config.TextColumn("Risk %",
+                help="Distance from entry to stop-loss (0.3% below R1). "
+                     "Tight stop — if price falls back below R1 the breakout failed."),
+            "R/R":       st.column_config.TextColumn("R/R",
+                help="Risk/Reward ratio = Gain ÷ Risk. "
+                     "Only signals with R/R ≥ 1.5× are shown. "
+                     "Aim for 2×+ for best setups."),
+            "Buy Above": st.column_config.TextColumn("Buy Above",
+                help="Your entry trigger. Place a buy-stop order 0.1% above R1. "
+                     "Execute only when price actually trades above this level."),
+            "Stop":      st.column_config.TextColumn("Stop",
+                help="Hard intraday stop-loss, set just below Pivot. "
+                     "If price closes below Pivot after you enter, exit immediately."),
+            "T1 (R2)":  st.column_config.TextColumn("T1 (R2)",
+                help="First (and only) intraday target = R2 pivot level. "
+                     "Exit your full position here."),
+            "Pivot":     st.column_config.TextColumn("Pivot",
+                help="(Prev H + L + C) / 3. Above Pivot = bullish bias."),
+            "R1":        st.column_config.TextColumn("R1",
+                help="Resistance 1. Break above = intraday long trigger."),
+            "R2":        st.column_config.TextColumn("R2",
+                help="Resistance 2. Intraday profit target."),
+            "S1":        st.column_config.TextColumn("S1",
+                help="Support 1. Break below invalidates the long setup."),
+        },
+    )
+    st.markdown(
+        """
+<div style="background:#0f172a;border:1px solid #1e293b;border-radius:10px;padding:16px 20px;margin-top:8px">
+<div style="font-size:0.78rem;font-weight:700;color:#94a3b8;letter-spacing:0.08em;margin-bottom:10px">STATUS GUIDE — INTRADAY LONG</div>
+<table style="width:100%;border-collapse:collapse;font-size:0.82rem">
+<tr>
+  <td style="padding:5px 12px 5px 0;color:#22c55e;font-weight:700;white-space:nowrap">🟢 TRIGGERED</td>
+  <td style="padding:5px 0;color:#cbd5e1">LTP already <b>above Buy-Above entry</b>. Trade is live. Enter only if still within 1% of entry — otherwise wait for next pullback.</td>
+</tr>
+<tr>
+  <td style="padding:5px 12px 5px 0;color:#f59e0b;font-weight:700;white-space:nowrap">🟡 APPROACHING</td>
+  <td style="padding:5px 0;color:#cbd5e1">LTP is <b>within 0.5% of R1</b>. Breakout is imminent. <b>Place your buy-stop order now</b> at the "Buy Above" price.</td>
+</tr>
+<tr>
+  <td style="padding:5px 12px 5px 0;color:#ef4444;font-weight:700;white-space:nowrap">🔴 BROKEN</td>
+  <td style="padding:5px 0;color:#cbd5e1">LTP fell <b>below S1</b>. Intraday bullish structure has collapsed. <b>Do not enter long today.</b></td>
+</tr>
+<tr>
+  <td style="padding:5px 12px 5px 0;color:#94a3b8;font-weight:700;white-space:nowrap">⚪ WATCHING</td>
+  <td style="padding:5px 0;color:#cbd5e1">Price is consolidating between S1 and R1. No action yet — monitor and wait for R1 approach.</td>
+</tr>
+</table>
+<div style="margin-top:10px;padding-top:8px;border-top:1px solid #1e293b;color:#64748b;font-size:0.76rem">
+⏰ <b>Hard exit rule:</b> Close ALL intraday positions by <b>3:10 PM IST</b> regardless of P&L. Kite auto-squares at 3:20 PM. &nbsp;|&nbsp; Levels refresh live every 2 s during market hours.
+</div>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ── FRAGMENT 2b: intraday SHORT table (live status column) ───────────────────
+@st.fragment(run_every=2)
+def _intraday_short_live():
+    # Skip all work outside market hours — fragment still runs but is instant
+    if not _is_market_open():
+        return
+    base_df = st.session_state.get("_signals_base_df", pd.DataFrame())
+    if base_df.empty:
+        return
+    df_s = base_df.copy()
+    for _sym, _price in st.session_state.get("_live_ltp", {}).items():
+        df_s.loc[df_s["tradingsymbol"] == _sym, "ltp"] = _price
+
+    _ss = (
+        df_s[df_s["intraday_signal"] == "SELL_BELOW"]
+        .sort_values("composite_score", ascending=True)
+        .reset_index(drop=True)
+    )
+    if _ss.empty:
+        st.info("No intraday short setups for today's session.")
+        return
+
+    st.caption(
+        "Watch for price to break **below S1**. "
+        "Short with cover-stop just above Pivot. "
+        "**Only for stocks eligible for intraday short selling (check Kite margin).**"
+    )
+    _ss_rows = []
+    for _, r in _ss.iterrows():
+        sym       = r.get("tradingsymbol", "")
+        ltp_now   = r.get("ltp") or 0
+        s1_val    = r.get("intraday_s1") or 0
+        entry_val = r.get("intraday_entry") or 0
+        piv_val   = float(r.get("intraday_pivot") or 0)
+        if s1_val and ltp_now:
+            if ltp_now <= entry_val:
+                short_status = "TRIGGERED"
+            elif ltp_now <= s1_val * 1.005:
+                short_status = "APPROACHING"
+            elif piv_val and ltp_now > piv_val:
+                short_status = "REVERSED"
+            else:
+                short_status = "WATCHING"
+        else:
+            short_status = "—"
+        # For shorts: gain = entry → T1 (price drops), risk = entry → stop (price rises)
+        try:
+            _se = float(r.get("intraday_entry") or 0)
+            _ss2 = float(r.get("intraday_stop")  or 0)
+            _st1 = float(r.get("intraday_t1")    or 0)
+            _rr_val = round((_se - _st1) / (_ss2 - _se), 1) if (_ss2 > _se > _st1 > 0) else None
+            _rr_str = f"{_rr_val:.1f}×" if _rr_val else "—"
+        except Exception:
+            _rr_str = "—"
+
+        _ss_rows.append([
+            short_status,
+            sym,
+            r.get("company_name", ""),
+            _fmt(ltp_now,                  "₹{:,.2f}"),
+            _delta_str(sym),
+            _gain_pct(r.get("intraday_t1"), r.get("intraday_entry")),   # short: t1 < entry
+            _risk_pct(r.get("intraday_stop"), r.get("intraday_entry")), # short: stop > entry
+            _rr_str,
+            _fmt(r.get("intraday_entry"),  "₹{:,.2f}"),
+            _fmt(r.get("intraday_stop"),   "₹{:,.2f}"),
+            _fmt(r.get("intraday_t1"),     "₹{:,.2f}"),
+            _fmt(r.get("intraday_pivot"),  "₹{:,.2f}"),
+            _fmt(r.get("intraday_s1"),     "₹{:,.2f}"),
+            _fmt(r.get("intraday_s2"),     "₹{:,.2f}"),
+            _fmt(r.get("intraday_r1"),     "₹{:,.2f}"),
+        ])
+
+    _ss_df = pd.DataFrame(_ss_rows, columns=[
+        "Status", "Symbol", "Company", "LTP", "Δ",
+        "Gain %", "Risk %", "R/R",
+        "Sell Below", "Cover Stop", "T1 (S2)", "Pivot", "S1", "S2", "R1",
+    ])
+    st.dataframe(
+        _ss_df.style
+            .map(_short_status_color, subset=["Status"])
+            .map(_delta_color,        subset=["Δ"])
+            .map(_gain_color,         subset=["Gain %"])
+            .map(_risk_color,         subset=["Risk %"])
+            .map(_gain_color,         subset=["R/R"]),
+        use_container_width=True,
+        height=min(450, 50 + len(_ss_rows) * 38),
+        hide_index=True,
+        column_config={
+            "Status":     st.column_config.TextColumn("Status",
+                help=(
+                    "Live signal state for the short setup (refreshes every 2 s):\n\n"
+                    "🔴 TRIGGERED — LTP is already below the Sell-Below entry. "
+                    "Breakdown confirmed. Short is live. Trail your cover-stop downward.\n\n"
+                    "🟡 APPROACHING — LTP is within 0.5% above S1. "
+                    "Breakdown is imminent. Be ready to place a sell/short order.\n\n"
+                    "🟢 REVERSED — LTP recovered above Pivot. "
+                    "Bearish setup has failed. Do NOT short — cover any existing short.\n\n"
+                    "⚪ WATCHING — LTP is between Pivot and S1. "
+                    "Bearish bias but no trigger yet. Monitor only."
+                )),
+            "Δ":          st.column_config.TextColumn("Δ",
+                help="LTP change since last 2-second refresh tick. "
+                     "▲ green = price rising (bad for shorts), ▼ red = price falling (good)."),
+            "Gain %":     st.column_config.TextColumn("Gain %",
+                help="Potential profit from Sell-Below entry to T1/S2 target (short direction)."),
+            "Risk %":     st.column_config.TextColumn("Risk %",
+                help="Distance from entry to cover-stop (0.3% above S1). "
+                     "Tight — if price recovers above S1 the breakdown failed."),
+            "R/R":        st.column_config.TextColumn("R/R",
+                help="Risk/Reward ratio for the short trade. "
+                     "Only signals with R/R ≥ 1.5× are shown."),
+            "Sell Below": st.column_config.TextColumn("Sell Below",
+                help="Short entry trigger — place a sell-stop order 0.1% below S1."),
+            "Cover Stop": st.column_config.TextColumn("Cover Stop",
+                help="Buy-to-cover stop just above Pivot. Cover if price recovers above Pivot."),
+            "T1 (S2)":   st.column_config.TextColumn("T1 (S2)",
+                help="First intraday short target = S2. Cover full short here."),
+            "Pivot":      st.column_config.TextColumn("Pivot",
+                help="(Prev H + L + C) / 3. Below Pivot = bearish bias."),
+            "S1":         st.column_config.TextColumn("S1",
+                help="Support 1. Break below = short trigger."),
+            "S2":         st.column_config.TextColumn("S2",
+                help="Support 2. Intraday short target."),
+            "R1":         st.column_config.TextColumn("R1",
+                help="Resistance 1. If price runs above R1, cover the short."),
+        },
+    )
+    st.markdown(
+        """
+<div style="background:#0f172a;border:1px solid #1e293b;border-radius:10px;padding:16px 20px;margin-top:8px">
+<div style="font-size:0.78rem;font-weight:700;color:#94a3b8;letter-spacing:0.08em;margin-bottom:10px">STATUS GUIDE — INTRADAY SHORT</div>
+<table style="width:100%;border-collapse:collapse;font-size:0.82rem">
+<tr>
+  <td style="padding:5px 12px 5px 0;color:#ef4444;font-weight:700;white-space:nowrap">🔴 TRIGGERED</td>
+  <td style="padding:5px 0;color:#cbd5e1">LTP already <b>below Sell-Below entry</b>. Breakdown is confirmed, short is live. Enter only if still within 1% of entry — trail cover-stop down as price falls.</td>
+</tr>
+<tr>
+  <td style="padding:5px 12px 5px 0;color:#f59e0b;font-weight:700;white-space:nowrap">🟡 APPROACHING</td>
+  <td style="padding:5px 0;color:#cbd5e1">LTP is <b>within 0.5% above S1</b>. Breakdown is imminent. <b>Place your sell-stop order now</b> at the "Sell Below" price.</td>
+</tr>
+<tr>
+  <td style="padding:5px 12px 5px 0;color:#22c55e;font-weight:700;white-space:nowrap">🟢 REVERSED</td>
+  <td style="padding:5px 0;color:#cbd5e1">LTP recovered <b>above Pivot</b>. Bearish setup has failed. <b>Do not short.</b> Cover any existing short immediately.</td>
+</tr>
+<tr>
+  <td style="padding:5px 12px 5px 0;color:#94a3b8;font-weight:700;white-space:nowrap">⚪ WATCHING</td>
+  <td style="padding:5px 0;color:#cbd5e1">Price is between Pivot and S1. Bearish bias exists but no trigger yet — monitor for approach to S1.</td>
+</tr>
+</table>
+<div style="margin-top:10px;padding-top:8px;border-top:1px solid #1e293b;color:#64748b;font-size:0.76rem">
+⏰ <b>Hard exit rule:</b> Cover ALL short positions by <b>3:10 PM IST</b>. &nbsp;|&nbsp;
+⚠ <b>Check Kite margin:</b> Not all stocks are eligible for intraday short selling. Verify availability in your Kite account before placing orders. &nbsp;|&nbsp; Levels refresh live every 2 s.
+</div>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ── STABLE signal tables (no fragment — tabs never re-create themselves) ──────
+def _signals_main():
+    """
+    Renders all 4 signal tabs. Deliberately NOT a fragment so that tab widgets
+    are never re-created and their selected-tab state is always preserved.
+    LTP is read from st.session_state["_live_ltp"] which the header fragment
+    keeps fresh every 2 s.
+    """
+    base_df = st.session_state.get("_signals_base_df", pd.DataFrame())
+    if base_df.empty:
+        st.info("No data yet. Click 'Full Rescan' in the sidebar to bootstrap.", icon="ℹ️")
+        return
+    if "swing_signal" not in base_df.columns:
+        st.info(
+            "Signal columns not found. Run a Full Rescan to compute entry/exit signals.",
+            icon="ℹ️",
+        )
+        return
+
+    # Apply most-recent live LTP (updated by the header fragment every 2 s)
+    df_live = base_df.copy()
+    for _sym, _price in st.session_state.get("_live_ltp", {}).items():
+        df_live.loc[df_live["tradingsymbol"] == _sym, "ltp"] = _price
+
+    st.markdown("---")
+
+    _sig_t1, _sig_t2, _sig_t3, _sig_t4 = st.tabs(
+        ["Swing Buy", "Exit / Sell", "Intraday Plan", "Scaling"]
+    )
+
+    # ── SWING BUY ─────────────────────────────────────────────────
+    with _sig_t1:
+        _sb = (
+            df_live[df_live["swing_signal"] == "BUY"]
+            .sort_values(["swing_quality", "composite_score"], ascending=False)
+            .reset_index(drop=True)
+        )
+        if _sb.empty:
+            st.info("No swing buy setups detected in the current universe.")
+        else:
+            st.caption(
+                "**How to use:** Place a limit/SL-M order at the Entry price. "
+                "Set a hard stop-loss at Stop. Book 50% at T1, let the rest run to T2 "
+                "with a trailing stop. Minimum R/R to consider: 1.5×."
+            )
+            _sb_rows = []
+            for _, r in _sb.iterrows():
+                _sb_rows.append([
+                    r.get("tradingsymbol", ""),
+                    r.get("company_name", ""),
+                    r.get("swing_setup", ""),
+                    _fmt(r.get("ltp"),         "₹{:,.2f}"),
+                    _gain_pct(r.get("swing_entry"), r.get("swing_t1")),
+                    _risk_pct(r.get("swing_entry"), r.get("swing_stop")),
+                    _fmt(r.get("swing_entry"),  "₹{:,.2f}"),
+                    _fmt(r.get("swing_stop"),   "₹{:,.2f}"),
+                    _fmt(r.get("swing_t1"),     "₹{:,.2f}"),
+                    _fmt(r.get("swing_t2"),     "₹{:,.2f}"),
+                    _fmt(r.get("swing_rr"),     "{:.2f}×"),
+                    _stars(r.get("swing_quality")),
+                    str(r.get("swing_reason", ""))[:120],
+                ])
+            _sb_df = pd.DataFrame(_sb_rows, columns=[
+                "Symbol", "Company", "Setup", "LTP",
+                "Gain %", "Risk %",
+                "Entry", "Stop", "T1", "T2", "R/R", "Quality", "Reason",
+            ])
+            st.dataframe(
+                _sb_df.style
+                    .map(_gain_color, subset=["Gain %"])
+                    .map(_risk_color, subset=["Risk %"]),
+                use_container_width=True,
+                height=min(400, 50 + len(_sb_rows) * 38),
+                hide_index=True,
+                column_config={
+                    "Setup":   st.column_config.TextColumn("Setup",   help="PULLBACK = retracement to EMA20 | BREAKOUT = 20D high break | NR7 = narrowest range coil"),
+                    "Gain %":  st.column_config.TextColumn("Gain %",  help="Upside to T1 from entry price. Swing trades typically target 5–15%."),
+                    "Risk %":  st.column_config.TextColumn("Risk %",  help="Downside from entry to hard stop-loss. Ideal risk per trade: 2–4%."),
+                    "Entry":   st.column_config.TextColumn("Entry",   help="Suggested entry price. For NR7 this is a buy-stop order above today's high."),
+                    "Stop":    st.column_config.TextColumn("Stop",    help="Hard stop-loss. Exit the full position if price closes below this level."),
+                    "T1":      st.column_config.TextColumn("T1",      help="First target = Entry + 2×ATR. Book 50% here."),
+                    "T2":      st.column_config.TextColumn("T2",      help="Second target = Entry + 4×ATR. Trail stop on the remaining 50%."),
+                    "R/R":     st.column_config.TextColumn("R/R",     help="Risk/Reward ratio at T1. Minimum 1.5× recommended."),
+                    "Quality": st.column_config.TextColumn("Quality", help="★★★★★ = best (full EMA stack + ADX confirmed + strong volume)"),
+                },
+            )
+
+    # ── EXIT / SELL ───────────────────────────────────────────────
+    with _sig_t2:
+        _se = (
+            df_live[df_live["swing_signal"] == "SELL"]
+            .sort_values("composite_score", ascending=True)
+            .reset_index(drop=True)
+        )
+        if _se.empty:
+            st.info("No exit signals currently. All trend structures intact.")
+        else:
+            st.caption(
+                "**How to use:** These are stocks where the uptrend structure has broken or "
+                "the stock is severely overbought. If you hold any of these, review your position."
+            )
+            _se_rows = []
+            for _, r in _se.iterrows():
+                ltp_v  = r.get("ltp")    or 0
+                ema_v  = r.get("ema_20") or 0
+                # Dist above EMA20: positive = price stretched above EMA20 (overbought signal)
+                try:
+                    dist_ema = f"+{(ltp_v - ema_v) / ema_v * 100:.1f}%" if ema_v > 0 else "—"
+                except Exception:
+                    dist_ema = "—"
+                _se_rows.append([
+                    r.get("tradingsymbol", ""),
+                    r.get("company_name", ""),
+                    _fmt(ltp_v,  "₹{:,.2f}"),
+                    _fmt(ema_v,  "₹{:,.2f}"),
+                    dist_ema,
+                    _fmt(r.get("rsi_14"), "{:.1f}"),
+                    str(r.get("swing_reason", "")),
+                ])
+
+            def _dist_color(val):
+                v = str(val)
+                if v.startswith("+"):
+                    return "color: #f59e0b"   # amber: stretched above EMA — bearish
+                return "color: #94a3b8"
+
+            _se_df = pd.DataFrame(_se_rows, columns=[
+                "Symbol", "Company", "LTP", "EMA20", "EMA20 Dist", "RSI", "Exit Reason",
+            ])
+            st.dataframe(
+                _se_df.style.map(_dist_color, subset=["EMA20 Dist"]),
+                use_container_width=True,
+                height=min(400, 50 + len(_se_rows) * 38),
+                hide_index=True,
+                column_config={
+                    "EMA20 Dist": st.column_config.TextColumn(
+                        "EMA20 Dist",
+                        help="How far LTP is above EMA20. "
+                             "A large positive value (+10%+) means the stock is stretched "
+                             "and likely to mean-revert — this is what triggers the SELL signal. "
+                             "The larger this number, the more urgently you should consider exiting.",
+                    ),
+                    "RSI": st.column_config.TextColumn(
+                        "RSI",
+                        help="RSI > 70 = overbought. RSI > 80 = strongly overbought. "
+                             "Combined with a high EMA20 Dist, this confirms an exit is warranted.",
+                    ),
+                },
+            )
+
+    # ── INTRADAY PLAN ─────────────────────────────────────────────
+    with _sig_t3:
+        st.caption(
+            "**Hard rule: close ALL intraday positions by 3:10 PM regardless of P&L.** "
+            "LTP and Status update automatically every 2 s during market hours."
+        )
+        _n_il = st.session_state.get("_n_intra_long",  0)
+        _n_is = st.session_state.get("_n_intra_short", 0)
+        _it_long_tab, _it_short_tab = st.tabs([
+            f"📈 Long (BUY_ABOVE)  {_n_il}",
+            f"📉 Short (SELL_BELOW)  {_n_is}",
+        ])
+        with _it_long_tab:
+            _intraday_long_live()   # fragment: live status, runs every 2 s
+        with _it_short_tab:
+            _intraday_short_live()  # fragment: live status, runs every 2 s
+
+    # ── SCALING ───────────────────────────────────────────────────
+    with _sig_t4:
+        _ssc = (
+            df_live[df_live["scale_signal"] == "INITIAL_ENTRY"]
+            .sort_values(["scale_quality", "composite_score"], ascending=False)
+            .reset_index(drop=True)
+        )
+        if _ssc.empty:
+            st.info("No scaling entry setups. Stocks need full EMA stack + EMA50 pullback + positive RS.")
+        else:
+            st.caption(
+                "**How to use:** Deploy **40% of intended position** at Entry 1 (EMA50 pullback). "
+                "Add **30% more** when price breaks above the 20-day high. "
+                "Add the final **30%** on a new 52W high with volume. "
+                "Trailing stop: close below EMA50 on any day."
+            )
+            _ssc_rows = []
+            for _, r in _ssc.iterrows():
+                _ssc_rows.append([
+                    r.get("tradingsymbol", ""),
+                    r.get("company_name", ""),
+                    _fmt(r.get("ltp"),                  "₹{:,.2f}"),
+                    _gain_pct(r.get("scale_entry_1"), r.get("scale_target")),
+                    _risk_pct(r.get("scale_entry_1"), r.get("scale_stop")),
+                    _fmt(r.get("scale_entry_1"),        "₹{:,.2f}"),
+                    _fmt(r.get("scale_stop"),           "₹{:,.2f}"),
+                    _fmt(r.get("scale_trailing_stop"),  "₹{:,.2f}"),
+                    _fmt(r.get("scale_target"),         "₹{:,.2f}"),
+                    _fmt(r.get("ret_6m"),               "{:+.1f}%"),
+                    _fmt(r.get("rs_vs_nifty_3m"),       "{:+.1f}%"),
+                    _stars(r.get("scale_quality")),
+                    str(r.get("scale_reason", ""))[:120],
+                ])
+            _ssc_df = pd.DataFrame(_ssc_rows, columns=[
+                "Symbol", "Company", "LTP",
+                "Gain %", "Risk %",
+                "Entry 1 (40%)", "Hard Stop", "Trail Stop (EMA50)",
+                "Target (+18%)", "6M Return", "RS vs Nifty",
+                "Quality", "Reason",
+            ])
+            st.dataframe(
+                _ssc_df.style
+                    .map(_gain_color, subset=["Gain %"])
+                    .map(_risk_color, subset=["Risk %"]),
+                use_container_width=True,
+                height=min(450, 50 + len(_ssc_rows) * 38),
+                hide_index=True,
+                column_config={
+                    "Gain %":             st.column_config.TextColumn("Gain %",     help="Upside from Entry 1 to the 18% target. Scaling trades typically run 15–25%."),
+                    "Risk %":             st.column_config.TextColumn("Risk %",     help="Downside from Entry 1 to hard stop. Acceptable for a position you intend to scale into."),
+                    "Entry 1 (40%)":      st.column_config.TextColumn("Entry 1",    help="0.5% above EMA50 — confirms EMA50 held as support. Deploy 40% of position here."),
+                    "Hard Stop":          st.column_config.TextColumn("Hard Stop",  help="1.5×ATR below EMA50. Full exit if price closes below this."),
+                    "Trail Stop (EMA50)": st.column_config.TextColumn("Trail Stop", help="Move this stop up every week as EMA50 rises. Exit if day close is below EMA50."),
+                    "Target (+18%)":      st.column_config.TextColumn("Target",     help="18% measured-move from Entry 1. Take 25–50% off here and trail the rest."),
+                    "Quality":            st.column_config.TextColumn("Quality",    help="★★★★★ = best. Requires full EMA stack + positive RS + strong 6M return."),
+                },
+            )
+
+
+with tab_signals:
+    if st.session_state.get("_signals_base_df", pd.DataFrame()).empty:
+        st.info("No data yet. Click 'Full Rescan' in the sidebar to bootstrap.", icon="ℹ️")
+    elif "swing_signal" not in st.session_state.get("_signals_base_df", pd.DataFrame()).columns:
+        st.info("Signal columns not found. Run a Full Rescan to compute entry/exit signals.", icon="ℹ️")
+    else:
+        _live_signals_header()   # Fragment: live clock + LTP fetch + metric pills (no tabs)
+        _signals_main()          # Stable: all 4 tabs + tables (never re-creates tab widgets)
