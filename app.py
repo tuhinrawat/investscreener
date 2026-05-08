@@ -3880,15 +3880,15 @@ def _activity_log_live():
             if _entry_p:
                 _log_df.at[_idx, "pnl_pct"] = (_ltp_v - _entry_p) / _entry_p * 100 * _mult
 
-    # Status first, then symbol, then LTP, then the rest
+    # Status first, then symbol, LTP, P&L immediately after, then the rest
     _disp_cols = [
         "status",
-        "id", "trade_date", "tradingsymbol", "ltp", "trade_type", "setup_type", "signal_type",
+        "id", "trade_date", "tradingsymbol", "ltp", "pnl_amount", "pnl_pct",
+        "trade_type", "setup_type", "signal_type",
         "quantity",
         "rec_entry", "actual_entry",
         "rec_stop",
         "rec_t1", "actual_exit",
-        "pnl_amount", "pnl_pct",
         "rr_realised", "slippage_entry_pct",
         "kite_order_id", "kite_status",
         "notes",
