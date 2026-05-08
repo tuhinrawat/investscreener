@@ -4052,8 +4052,62 @@ with tab_signals:
 # ============================================================
 @st.fragment(run_every=2)
 def _activity_log_live():
-    """Auto-refreshes every 2 s: summary pills, trade table, paper performance."""
+    """Auto-refreshes every 2 s: portfolio snapshot, summary banners, trade table."""
     _uid = st.session_state.get("kite_user_id", "")
+
+    # ── PORTFOLIO SNAPSHOT — live Kite margin + holdings + positions ────────
+    _pf_kc = st.session_state.get("kite_client")
+    _pf_ok = _pf_kc is not None and getattr(_pf_kc, "authenticated", False)
+    if _pf_ok:
+        try:
+            _margins   = _pf_kc.get_margins("equity")
+            _eq        = _margins.get("equity", _margins)
+            _avail     = _eq.get("available", {})
+            _used      = _eq.get("used", {})
+            _net_bal   = float(_eq.get("net", 0) or 0)
+            _live_bal  = float(_avail.get("live_balance", _avail.get("cash", 0)) or 0)
+            _used_deb  = float(_used.get("debits", 0) or 0)
+            _holdings  = _pf_kc.get_holdings()
+            _h_value   = sum(float(h.get("last_price", 0)) * float(h.get("quantity", 0))
+                             for h in _holdings if h.get("quantity", 0) > 0)
+            _h_pnl     = sum(float(h.get("pnl", 0)) for h in _holdings)
+            _h_day_pnl = sum(float(h.get("day_change", 0)) * float(h.get("quantity", 0))
+                             for h in _holdings if h.get("quantity", 0) > 0)
+            _h_count   = sum(1 for h in _holdings if h.get("quantity", 0) > 0)
+            _positions = _pf_kc.get_positions()
+            _net_pos   = _positions.get("net", []) if isinstance(_positions, dict) else []
+            _pos_open  = [p for p in _net_pos if p.get("quantity", 0) != 0]
+            _pos_value = sum(abs(float(p.get("value", 0))) for p in _pos_open)
+            _pos_m2m   = sum(float(p.get("m2m", 0)) for p in _net_pos)
+            _pf_m2m_c  = "#22c55e" if _pos_m2m >= 0 else "#ef4444"
+            _pf_hp_c   = "#22c55e" if _h_pnl   >= 0 else "#ef4444"
+            st.markdown(
+                f'<div style="background:#0f172a;border:1px solid #334155;border-radius:8px;'
+                f'padding:10px 18px;margin-bottom:8px;display:flex;flex-wrap:wrap;'
+                f'gap:22px;align-items:center">'
+                f'<span style="font-size:0.78rem;color:#64748b;font-weight:600;'
+                f'letter-spacing:0.05em;text-transform:uppercase;white-space:nowrap">'
+                f'🏦 Portfolio Snapshot</span>'
+                f'<span style="font-size:0.8rem;color:#94a3b8">Available '
+                f'<b style="color:#f8fafc">₹{_live_bal:,.0f}</b></span>'
+                f'<span style="font-size:0.8rem;color:#94a3b8">Net Balance '
+                f'<b style="color:#f8fafc">₹{_net_bal:,.0f}</b></span>'
+                f'<span style="font-size:0.8rem;color:#94a3b8">Margin Used '
+                f'<b style="color:#f8fafc">₹{_used_deb:,.0f}</b></span>'
+                f'<span style="font-size:0.8rem;color:#94a3b8">Holdings ({_h_count}) '
+                f'<b style="color:#f8fafc">₹{_h_value:,.0f}</b> '
+                f'<span style="color:{_pf_hp_c};font-size:0.75rem">{_h_pnl:+,.0f}</span></span>'
+                f'<span style="font-size:0.8rem;color:#94a3b8">Positions ({len(_pos_open)}) '
+                f'<b style="color:#f8fafc">₹{_pos_value:,.0f}</b></span>'
+                f'<span style="font-size:0.8rem;color:#94a3b8">Today\'s P&amp;L '
+                f'<b style="color:{_pf_m2m_c};font-weight:700">₹{_pos_m2m:+,.0f}</b>'
+                f'<span style="font-size:0.7rem;color:#64748b"> holdings ₹{_h_day_pnl:+,.0f}</span>'
+                f'</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        except Exception as _pf_err:
+            st.caption(f"⚠ Portfolio data unavailable: {_pf_err}")
 
     # ── Summary banners: Paper | Real ──────────────────────────────────────
     _stats_paper = db.get_trade_stats(user_id=_uid, is_paper=True)
@@ -4535,58 +4589,5 @@ with tab_activity:
                 except Exception as _sync_err:
                     st.error(f"Sync failed: {_sync_err}")
 
-    # ── PORTFOLIO SNAPSHOT — compact dark banner ───────────────────────────
-    if _act_kite_ok:
-        try:
-            _margins   = _act_kc.get_margins("equity")
-            _eq        = _margins.get("equity", _margins)
-            _avail     = _eq.get("available", {})
-            _used      = _eq.get("used", {})
-            _net_bal   = float(_eq.get("net", 0) or 0)
-            _live_bal  = float(_avail.get("live_balance", _avail.get("cash", 0)) or 0)
-            _used_deb  = float(_used.get("debits", 0) or 0)
-            _holdings  = _act_kc.get_holdings()
-            _h_value   = sum(float(h.get("last_price", 0)) * float(h.get("quantity", 0))
-                             for h in _holdings if h.get("quantity", 0) > 0)
-            _h_pnl     = sum(float(h.get("pnl", 0)) for h in _holdings)
-            _h_day_pnl = sum(float(h.get("day_change", 0)) * float(h.get("quantity", 0))
-                             for h in _holdings if h.get("quantity", 0) > 0)
-            _h_count   = sum(1 for h in _holdings if h.get("quantity", 0) > 0)
-            _positions = _act_kc.get_positions()
-            _net_pos   = _positions.get("net", []) if isinstance(_positions, dict) else []
-            _pos_open  = [p for p in _net_pos if p.get("quantity", 0) != 0]
-            _pos_value = sum(abs(float(p.get("value", 0))) for p in _pos_open)
-            _pos_pnl   = sum(float(p.get("unrealised", 0)) for p in _pos_open)
-            _pos_m2m   = sum(float(p.get("m2m", 0)) for p in _net_pos)
-            _pf_m2m_c  = "#22c55e" if _pos_m2m >= 0 else "#ef4444"
-            _pf_hp_c   = "#22c55e" if _h_pnl   >= 0 else "#ef4444"
-            st.markdown(
-                f'<div style="background:#0f172a;border:1px solid #334155;border-radius:8px;'
-                f'padding:10px 18px;margin-bottom:8px;display:flex;flex-wrap:wrap;'
-                f'gap:22px;align-items:center">'
-                f'<span style="font-size:0.78rem;color:#64748b;font-weight:600;'
-                f'letter-spacing:0.05em;text-transform:uppercase;white-space:nowrap">'
-                f'🏦 Portfolio Snapshot</span>'
-                f'<span style="font-size:0.8rem;color:#94a3b8">Available '
-                f'<b style="color:#f8fafc">₹{_live_bal:,.0f}</b></span>'
-                f'<span style="font-size:0.8rem;color:#94a3b8">Net Balance '
-                f'<b style="color:#f8fafc">₹{_net_bal:,.0f}</b></span>'
-                f'<span style="font-size:0.8rem;color:#94a3b8">Margin Used '
-                f'<b style="color:#f8fafc">₹{_used_deb:,.0f}</b></span>'
-                f'<span style="font-size:0.8rem;color:#94a3b8">Holdings ({_h_count}) '
-                f'<b style="color:#f8fafc">₹{_h_value:,.0f}</b> '
-                f'<span style="color:{_pf_hp_c};font-size:0.75rem">{_h_pnl:+,.0f}</span></span>'
-                f'<span style="font-size:0.8rem;color:#94a3b8">Positions ({len(_pos_open)}) '
-                f'<b style="color:#f8fafc">₹{_pos_value:,.0f}</b></span>'
-                f'<span style="font-size:0.8rem;color:#94a3b8">Today\'s P&amp;L '
-                f'<b style="color:{_pf_m2m_c};font-weight:700">₹{_pos_m2m:+,.0f}</b>'
-                f'<span style="font-size:0.7rem;color:#64748b"> holdings ₹{_h_day_pnl:+,.0f}</span>'
-                f'</span>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-        except Exception as _pf_err:
-            st.caption(f"⚠ Portfolio data unavailable: {_pf_err}")
-
-    # ── Live-refreshing stats + table (fragment) ────────────────────────────
+    # ── Live-refreshing portfolio snapshot + stats + table (fragment) ────────
     _activity_log_live()
