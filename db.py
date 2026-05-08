@@ -72,6 +72,7 @@ def _migrate_signal_columns(con):
         ("intraday_stop",       "DOUBLE"),
         ("intraday_t1",         "DOUBLE"),
         ("intraday_reason",     "VARCHAR"),
+        ("intraday_confidence", "INTEGER"),
         ("scale_signal",        "VARCHAR"),
         ("scale_setup",         "VARCHAR"),
         ("scale_entry_1",       "DOUBLE"),
@@ -178,6 +179,7 @@ def init_schema():
             intraday_stop           DOUBLE,
             intraday_t1             DOUBLE,
             intraday_reason         VARCHAR,
+            intraday_confidence     INTEGER,
             -- Scaling signals (multi-week position build)
             scale_signal            VARCHAR,
             scale_setup             VARCHAR,

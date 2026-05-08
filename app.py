@@ -440,7 +440,7 @@ _cur_user_id: str = st.session_state.get("kite_user_id", "")
 
 # ── Paper trade session state ────────────────────────────────────────────────
 # paper_triggered: {(date_str, sym): trade_id} — prevents re-triggering same signal
-# paper_open:      {trade_id: {sym, stop, t1, signal_type, entry}} — exit monitoring
+# paper_open:      {trade_id: {sym, stop, t1, signal_type, entry, cap}} — exit monitoring; cap = capital allocated (tier-based)
 import datetime as _dt
 _today_str = _dt.date.today().isoformat()
 
@@ -2676,6 +2676,22 @@ def _is_market_open() -> bool:
 
 
 # ── Shared styling helpers (used by signal tabs and intraday fragments) ───────
+def _conf_color(val):
+    """Color-code the Conf column by tier: green=STRONG, yellow=MODERATE, orange=MARGINAL, red=LOW."""
+    v = str(val)
+    try:
+        n = int(v.split("/")[0])
+    except Exception:
+        return "color: #64748b"
+    if n >= 8:
+        return "color: #22c55e; font-weight: 700"
+    if n >= 6:
+        return "color: #f59e0b; font-weight: 600"
+    if n >= 5:
+        return "color: #fb923c; font-weight: 600"
+    return "color: #ef4444"
+
+
 def _long_status_color(val):
     return {
         "TRIGGERED":   "color: #22c55e; font-weight: 700",
@@ -3117,16 +3133,18 @@ def _intraday_paper_banner():
     _n_today       = len(st.session_state.get("paper_triggered", {}))
     _live_ltp_now  = st.session_state.get("_live_ltp", {})
     _open_mtm      = 0.0
+    _capital_deployed = 0
     for _ppid, _pp in _open_pt.items():
-        _p_ltp = _live_ltp_now.get(_pp["sym"], _pp.get("entry", 0))
-        _dir   = -1 if _pp["signal_type"] == "SELL_BELOW" else 1
-        _p_qty = max(1, int((_cap // config.PAPER_MAX_POSITIONS) / (_pp.get("entry") or 1)))
-        _open_mtm += _dir * (_p_ltp - _pp["entry"]) * _p_qty
+        _p_ltp    = _live_ltp_now.get(_pp["sym"], _pp.get("entry", 0))
+        _dir      = -1 if _pp["signal_type"] == "SELL_BELOW" else 1
+        _slot_cap = _pp.get("cap", config.PAPER_CAP_MODERATE)
+        _p_qty    = max(1, int(_slot_cap / (_pp.get("entry") or 1)))
+        _open_mtm         += _dir * (_p_ltp - _pp["entry"]) * _p_qty
+        _capital_deployed += _slot_cap
 
     _total_pnl   = _today_paper_pnl + _open_mtm   # realised + unrealised
     _total_ret   = (_total_pnl / _cap * 100) if _cap else 0.0
     _pnl_color   = "#22c55e" if _total_pnl >= 0 else "#ef4444"
-    _capital_deployed = min(_n_open, config.PAPER_MAX_POSITIONS) * (_cap // config.PAPER_MAX_POSITIONS)
 
     # ── Gate status label ─────────────────────────────────────────────────────
     if _blocked:
@@ -3220,6 +3238,13 @@ def _intraday_long_live():
         st.info("No intraday long setups for today's session.")
         return
 
+    # ── LTP freshness guard ───────────────────────────────────────────────────
+    _ltp_ts     = st.session_state.get("_live_ltp_ts")
+    _ltp_stale  = (_ltp_ts is None or
+                   (datetime.now(_IST) - _ltp_ts).total_seconds() > config.LTP_FRESHNESS_SECS)
+    if _ltp_stale:
+        st.warning("⚠ LTP prices are stale (>10 s old) — auto-trading paused until fresh data arrives.")
+
     st.caption("Watch for price to trade **above R1**. Enter with stop just below Pivot.")
 
     _long_sym_q = st.text_input(
@@ -3230,13 +3255,13 @@ def _intraday_long_live():
         _si = _si[_si["tradingsymbol"].str.contains(_long_sym_q.strip(), case=False, na=False, regex=False)]
 
     _si_rows = []
-    _paper_cap_per_trade = config.PAPER_CAPITAL // config.PAPER_MAX_POSITIONS
     for _, r in _si.iterrows():
-        sym       = r.get("tradingsymbol", "")
-        ltp_now   = r.get("ltp") or 0
-        r1_val    = r.get("intraday_r1") or 0
-        entry_val = r.get("intraday_entry") or 0
-        s1_val    = float(r.get("intraday_s1") or 0)
+        sym        = r.get("tradingsymbol", "")
+        ltp_now    = r.get("ltp") or 0
+        r1_val     = r.get("intraday_r1") or 0
+        entry_val  = r.get("intraday_entry") or 0
+        s1_val     = float(r.get("intraday_s1") or 0)
+        confidence = int(r.get("intraday_confidence") or 0)
         if r1_val and ltp_now:
             if ltp_now >= entry_val:
                 live_status = "TRIGGERED"
@@ -3249,15 +3274,38 @@ def _intraday_long_live():
         else:
             live_status = "—"
 
-        # ── Auto-trade when TRIGGERED (paper or real, based on trading_mode) ──
-        _trade_mode   = st.session_state.get("trading_mode", "paper")
-        _paper_key    = (_today_str, sym)
-        _real_key     = (_today_str, sym)
-        _total_open_ct = len(st.session_state.get("paper_open", {}))
-        _within_limit  = _total_open_ct < config.PAPER_MAX_POSITIONS
-        _pqty = max(1, int(_paper_cap_per_trade / (entry_val or 1)))
+        # ── Confidence-based capital tier ─────────────────────────────────────
+        if confidence >= config.CONFIDENCE_STRONG_MIN:
+            _cap_this_trade = config.PAPER_CAP_STRONG
+            _conf_tier = "STRONG"
+        elif confidence >= config.CONFIDENCE_MODERATE_MIN:
+            _cap_this_trade = config.PAPER_CAP_MODERATE
+            _conf_tier = "MODERATE"
+        elif confidence >= config.CONFIDENCE_MARGINAL_MIN:
+            _cap_this_trade = config.PAPER_CAP_MARGINAL
+            _conf_tier = "MARGINAL"
+        else:
+            _cap_this_trade = 0
+            _conf_tier = "LOW"
 
-        if live_status == "TRIGGERED" and _within_limit:
+        # ── Capital availability gate (replaces fixed slot count) ─────────────
+        _deployed = sum(
+            v.get("cap", config.PAPER_CAP_MODERATE)
+            for v in st.session_state.get("paper_open", {}).values()
+        )
+        _remaining = config.PAPER_CAPITAL - _deployed
+        _within_limit = (_cap_this_trade > 0) and (_remaining >= _cap_this_trade)
+
+        # Quantity based on tier capital and actual trigger price
+        _trigger_price = ltp_now if ltp_now > 0 else entry_val
+        _pqty = max(1, int(_cap_this_trade / (_trigger_price or 1))) if _cap_this_trade else 1
+
+        # ── Auto-trade when TRIGGERED ─────────────────────────────────────────
+        _trade_mode = st.session_state.get("trading_mode", "paper")
+        _paper_key  = (_today_str, sym)
+        _real_key   = (_today_str, sym)
+
+        if live_status == "TRIGGERED" and _within_limit and not _ltp_stale:
 
             # ── PAPER mode ────────────────────────────────────────────────────
             if (_trade_mode == "paper"
@@ -3278,18 +3326,19 @@ def _intraday_long_live():
                         "rec_composite_score": r.get("composite_score"),
                         "kite_user_id":        _cur_user_id,
                         "quantity":            _pqty,
-                        "actual_entry":        entry_val,
+                        "actual_entry":        _trigger_price,
                         "status":              "OPEN",
-                        "notes":               f"📄 Paper — auto TRIGGERED (₹{_paper_cap_per_trade:,})",
+                        "notes":               f"📄 Paper — auto TRIGGERED @ ₹{_trigger_price:.2f} (conf {confidence}/10, ₹{_cap_this_trade:,})",
                         "is_paper_trade":      True,
                     })
                     st.session_state["paper_triggered"][_paper_key] = _pid
                     st.session_state["paper_open"][_pid] = {
                         "sym": sym, "stop": float(r.get("intraday_stop") or 0),
                         "t1": float(r.get("intraday_t1") or 0),
-                        "signal_type": "BUY_ABOVE", "entry": entry_val,
+                        "signal_type": "BUY_ABOVE", "entry": _trigger_price,
+                        "cap": _cap_this_trade,
                     }
-                    st.toast(f"📄 Paper BUY: {sym} @ ₹{entry_val:.2f} × {_pqty}", icon="📄")
+                    st.toast(f"📄 Paper BUY [{_conf_tier}]: {sym} @ ₹{_trigger_price:.2f} × {_pqty}", icon="📄")
                 except Exception:
                     pass
 
@@ -3341,13 +3390,13 @@ def _intraday_long_live():
                             "kite_sl_order_id":    _sl_oid,
                             "kite_status":         "OPEN",
                             "quantity":            _pqty,
-                            "actual_entry":        entry_val,
+                            "actual_entry":        _trigger_price,
                             "status":              "OPEN",
-                            "notes":               f"💸 Real — auto TRIGGERED (₹{_paper_cap_per_trade:,})",
+                            "notes":               f"💸 Real — auto TRIGGERED @ ₹{_trigger_price:.2f} (conf {confidence}/10, ₹{_cap_this_trade:,})",
                             "is_paper_trade":      False,
                         })
                         st.session_state["real_triggered"][_real_key] = _rid
-                        st.toast(f"💸 Real BUY placed: {sym} @ ₹{entry_val:.2f} × {_pqty} | Kite {_oid}", icon="💸")
+                        st.toast(f"💸 Real BUY [{_conf_tier}]: {sym} @ ₹{_trigger_price:.2f} × {_pqty} | Kite {_oid}", icon="💸")
                     except Exception as _re:
                         st.toast(f"⚠ Real order failed for {sym}: {_re}", icon="⚠️")
 
@@ -3361,12 +3410,14 @@ def _intraday_long_live():
         except Exception:
             _rr_str = "—"
 
+        _conf_str = f"{confidence}/10" if confidence else "—"
         _si_rows.append([
             live_status,
             sym,
             r.get("company_name", ""),
             _fmt(ltp_now,                  "₹{:,.2f}"),
             _delta_str(sym),
+            _conf_str,
             _gain_pct(r.get("intraday_entry"), r.get("intraday_t1")),
             _risk_pct(r.get("intraday_entry"), r.get("intraday_stop")),
             _rr_str,
@@ -3381,13 +3432,14 @@ def _intraday_long_live():
 
     _si_df = pd.DataFrame(_si_rows, columns=[
         "Status", "Symbol", "Company", "LTP", "Δ",
-        "Gain %", "Risk %", "R/R",
+        "Conf", "Gain %", "Risk %", "R/R",
         "Buy Above", "Stop", "T1 (R2)", "Pivot", "R1", "R2", "S1",
     ])
     st.dataframe(
         _si_df.style
             .map(_long_status_color, subset=["Status"])
             .map(_delta_color,       subset=["Δ"])
+            .map(_conf_color,        subset=["Conf"])
             .map(_gain_color,        subset=["Gain %"])
             .map(_risk_color,        subset=["Risk %"])
             .map(_gain_color,        subset=["R/R"]),
@@ -3412,6 +3464,15 @@ def _intraday_long_live():
             "Δ":         st.column_config.TextColumn("Δ",
                 help="LTP change since last 2-second refresh tick. "
                      "▲ green = price rising, ▼ red = price falling."),
+            "Conf":      st.column_config.TextColumn("Conf",
+                help=(
+                    "Signal confidence score (0–10) — composite of R/R, RSI zone, "
+                    "volume expansion, relative strength vs Nifty, and composite score.\n\n"
+                    "🟢 8–10 STRONG   → auto-trade ₹2,00,000/slot\n"
+                    "🟡 6–7 MODERATE  → auto-trade ₹1,50,000/slot\n"
+                    "🟠 5   MARGINAL  → auto-trade ₹1,00,000/slot (if capital available)\n"
+                    "🔴 <5  LOW       → shown only, NOT auto-traded"
+                )),
             "Gain %":    st.column_config.TextColumn("Gain %",
                 help="Potential upside from Buy-Above entry to T1 (R2) target. "
                      "Typical range: 0.8%–3%."),
@@ -3504,6 +3565,13 @@ def _intraday_short_live():
         st.info("No intraday short setups for today's session.")
         return
 
+    # ── LTP freshness guard ───────────────────────────────────────────────────
+    _ltp_ts     = st.session_state.get("_live_ltp_ts")
+    _ltp_stale  = (_ltp_ts is None or
+                   (datetime.now(_IST) - _ltp_ts).total_seconds() > config.LTP_FRESHNESS_SECS)
+    if _ltp_stale:
+        st.warning("⚠ LTP prices are stale (>10 s old) — auto-trading paused until fresh data arrives.")
+
     _short_sym_q = st.text_input(
         "🔍 Search symbol", placeholder="type to filter…",
         key="intra_short_sym_search", label_visibility="collapsed",
@@ -3518,13 +3586,13 @@ def _intraday_short_live():
     )
 
     _ss_rows = []
-    _paper_cap_per_trade = config.PAPER_CAPITAL // config.PAPER_MAX_POSITIONS
     for _, r in _ss.iterrows():
-        sym       = r.get("tradingsymbol", "")
-        ltp_now   = r.get("ltp") or 0
-        s1_val    = r.get("intraday_s1") or 0
-        entry_val = r.get("intraday_entry") or 0
-        piv_val   = float(r.get("intraday_pivot") or 0)
+        sym        = r.get("tradingsymbol", "")
+        ltp_now    = r.get("ltp") or 0
+        s1_val     = r.get("intraday_s1") or 0
+        entry_val  = r.get("intraday_entry") or 0
+        piv_val    = float(r.get("intraday_pivot") or 0)
+        confidence = int(r.get("intraday_confidence") or 0)
         if s1_val and ltp_now:
             if ltp_now <= entry_val:
                 short_status = "TRIGGERED"
@@ -3537,15 +3605,37 @@ def _intraday_short_live():
         else:
             short_status = "—"
 
-        # ── Auto-trade when TRIGGERED (paper or real, based on trading_mode) ──
-        _trade_mode    = st.session_state.get("trading_mode", "paper")
-        _paper_key     = (_today_str, sym)
-        _real_key      = (_today_str, sym)
-        _total_open_ct = len(st.session_state.get("paper_open", {}))
-        _within_limit  = _total_open_ct < config.PAPER_MAX_POSITIONS
-        _pqty = max(1, int(_paper_cap_per_trade / (entry_val or 1)))
+        # ── Confidence-based capital tier ─────────────────────────────────────
+        if confidence >= config.CONFIDENCE_STRONG_MIN:
+            _cap_this_trade = config.PAPER_CAP_STRONG
+            _conf_tier = "STRONG"
+        elif confidence >= config.CONFIDENCE_MODERATE_MIN:
+            _cap_this_trade = config.PAPER_CAP_MODERATE
+            _conf_tier = "MODERATE"
+        elif confidence >= config.CONFIDENCE_MARGINAL_MIN:
+            _cap_this_trade = config.PAPER_CAP_MARGINAL
+            _conf_tier = "MARGINAL"
+        else:
+            _cap_this_trade = 0
+            _conf_tier = "LOW"
 
-        if short_status == "TRIGGERED" and _within_limit:
+        # ── Capital availability gate ─────────────────────────────────────────
+        _deployed = sum(
+            v.get("cap", config.PAPER_CAP_MODERATE)
+            for v in st.session_state.get("paper_open", {}).values()
+        )
+        _remaining = config.PAPER_CAPITAL - _deployed
+        _within_limit = (_cap_this_trade > 0) and (_remaining >= _cap_this_trade)
+
+        _trigger_price = ltp_now if ltp_now > 0 else entry_val
+        _pqty = max(1, int(_cap_this_trade / (_trigger_price or 1))) if _cap_this_trade else 1
+
+        # ── Auto-trade when TRIGGERED ─────────────────────────────────────────
+        _trade_mode = st.session_state.get("trading_mode", "paper")
+        _paper_key  = (_today_str, sym)
+        _real_key   = (_today_str, sym)
+
+        if short_status == "TRIGGERED" and _within_limit and not _ltp_stale:
 
             # ── PAPER mode ────────────────────────────────────────────────────
             if (_trade_mode == "paper"
@@ -3566,18 +3656,19 @@ def _intraday_short_live():
                         "rec_composite_score": r.get("composite_score"),
                         "kite_user_id":        _cur_user_id,
                         "quantity":            _pqty,
-                        "actual_entry":        entry_val,
+                        "actual_entry":        _trigger_price,
                         "status":              "OPEN",
-                        "notes":               f"📄 Paper — auto TRIGGERED (₹{_paper_cap_per_trade:,})",
+                        "notes":               f"📄 Paper — auto TRIGGERED @ ₹{_trigger_price:.2f} (conf {confidence}/10, ₹{_cap_this_trade:,})",
                         "is_paper_trade":      True,
                     })
                     st.session_state["paper_triggered"][_paper_key] = _pid
                     st.session_state["paper_open"][_pid] = {
                         "sym": sym, "stop": float(r.get("intraday_stop") or 0),
                         "t1": float(r.get("intraday_t1") or 0),
-                        "signal_type": "SELL_BELOW", "entry": entry_val,
+                        "signal_type": "SELL_BELOW", "entry": _trigger_price,
+                        "cap": _cap_this_trade,
                     }
-                    st.toast(f"📄 Paper SHORT: {sym} @ ₹{entry_val:.2f} × {_pqty}", icon="📄")
+                    st.toast(f"📄 Paper SHORT [{_conf_tier}]: {sym} @ ₹{_trigger_price:.2f} × {_pqty}", icon="📄")
                 except Exception:
                     pass
 
@@ -3629,13 +3720,13 @@ def _intraday_short_live():
                             "kite_sl_order_id":    _sl_oid,
                             "kite_status":         "OPEN",
                             "quantity":            _pqty,
-                            "actual_entry":        entry_val,
+                            "actual_entry":        _trigger_price,
                             "status":              "OPEN",
-                            "notes":               f"💸 Real — auto TRIGGERED (₹{_paper_cap_per_trade:,})",
+                            "notes":               f"💸 Real — auto TRIGGERED @ ₹{_trigger_price:.2f} (conf {confidence}/10, ₹{_cap_this_trade:,})",
                             "is_paper_trade":      False,
                         })
                         st.session_state["real_triggered"][_real_key] = _rid
-                        st.toast(f"💸 Real SHORT placed: {sym} @ ₹{entry_val:.2f} × {_pqty} | Kite {_oid}", icon="💸")
+                        st.toast(f"💸 Real SHORT [{_conf_tier}]: {sym} @ ₹{_trigger_price:.2f} × {_pqty} | Kite {_oid}", icon="💸")
                     except Exception as _re:
                         st.toast(f"⚠ Real short order failed for {sym}: {_re}", icon="⚠️")
 
@@ -3649,12 +3740,14 @@ def _intraday_short_live():
         except Exception:
             _rr_str = "—"
 
+        _conf_str = f"{confidence}/10" if confidence else "—"
         _ss_rows.append([
             short_status,
             sym,
             r.get("company_name", ""),
             _fmt(ltp_now,                  "₹{:,.2f}"),
             _delta_str(sym),
+            _conf_str,
             _gain_pct(r.get("intraday_t1"), r.get("intraday_entry")),   # short: t1 < entry
             _risk_pct(r.get("intraday_stop"), r.get("intraday_entry")), # short: stop > entry
             _rr_str,
@@ -3669,13 +3762,14 @@ def _intraday_short_live():
 
     _ss_df = pd.DataFrame(_ss_rows, columns=[
         "Status", "Symbol", "Company", "LTP", "Δ",
-        "Gain %", "Risk %", "R/R",
+        "Conf", "Gain %", "Risk %", "R/R",
         "Sell Below", "Cover Stop", "T1 (S2)", "Pivot", "S1", "S2", "R1",
     ])
     st.dataframe(
         _ss_df.style
             .map(_short_status_color, subset=["Status"])
             .map(_delta_color,        subset=["Δ"])
+            .map(_conf_color,         subset=["Conf"])
             .map(_gain_color,         subset=["Gain %"])
             .map(_risk_color,         subset=["Risk %"])
             .map(_gain_color,         subset=["R/R"]),
@@ -3698,6 +3792,15 @@ def _intraday_short_live():
             "Δ":          st.column_config.TextColumn("Δ",
                 help="LTP change since last 2-second refresh tick. "
                      "▲ green = price rising (bad for shorts), ▼ red = price falling (good)."),
+            "Conf":       st.column_config.TextColumn("Conf",
+                help=(
+                    "Signal confidence score (0–10) — composite of R/R, RSI zone, "
+                    "volume expansion, relative strength vs Nifty, and composite score.\n\n"
+                    "🟢 8–10 STRONG   → auto-trade ₹2,00,000/slot\n"
+                    "🟡 6–7 MODERATE  → auto-trade ₹1,50,000/slot\n"
+                    "🟠 5   MARGINAL  → auto-trade ₹1,00,000/slot (if capital available)\n"
+                    "🔴 <5  LOW       → shown only, NOT auto-traded"
+                )),
             "Gain %":     st.column_config.TextColumn("Gain %",
                 help="Potential profit from Sell-Below entry to T1/S2 target (short direction)."),
             "Risk %":     st.column_config.TextColumn("Risk %",

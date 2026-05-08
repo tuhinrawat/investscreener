@@ -334,17 +334,96 @@ def swing_signal(df: pd.DataFrame, metrics: dict) -> dict:
 # ─── intraday signal ─────────────────────────────────────────────────────────
 
 _INTRA_NULL = {
-    "intraday_signal": None,
-    "intraday_pivot":  None,
-    "intraday_r1":     None,
-    "intraday_r2":     None,
-    "intraday_s1":     None,
-    "intraday_s2":     None,
-    "intraday_entry":  None,
-    "intraday_stop":   None,
-    "intraday_t1":     None,
-    "intraday_reason": None,
+    "intraday_signal":     None,
+    "intraday_pivot":      None,
+    "intraday_r1":         None,
+    "intraday_r2":         None,
+    "intraday_s1":         None,
+    "intraday_s2":         None,
+    "intraday_entry":      None,
+    "intraday_stop":       None,
+    "intraday_t1":         None,
+    "intraday_reason":     None,
+    "intraday_confidence": None,
 }
+
+
+def compute_intraday_confidence(metrics: dict, rr: float, signal_type: str = "BUY_ABOVE") -> int:
+    """
+    Score an intraday signal on confidence from 0 to 10.
+
+    Factors and max points:
+      R/R ratio             : 0-3 pts  (primary edge driver)
+      RSI zone              : 0-2 pts  (momentum positioning)
+      Volume expansion      : 0-2 pts  (institutional confirmation)
+      Relative strength     : 0-2 pts  (market alignment)
+      Composite score       : 0-1 pt   (catch-all trend quality)
+
+    Tiers:
+      8-10 = STRONG    → auto-trade, larger capital allocation
+      6-7  = MODERATE  → auto-trade, standard allocation
+      5    = MARGINAL  → auto-trade only if slots available, smaller allocation
+      <5   = LOW       → skip auto-trade (shown in table but not executed)
+    """
+    is_long = signal_type == "BUY_ABOVE"
+    score = 0
+
+    # R/R ratio: 0-3 pts — the single strongest predictor of payout
+    if rr >= 3.0:
+        score += 3
+    elif rr >= 2.0:
+        score += 2
+    elif rr >= 1.5:
+        score += 1
+
+    # RSI zone: 0-2 pts — ideal momentum window differs by direction
+    rsi = _v(metrics.get("rsi_14"))
+    if rsi is not None:
+        if is_long:
+            # Sweet spot: building momentum without being overbought
+            if 45 <= rsi <= 65:
+                score += 2
+            elif (35 <= rsi < 45) or (65 < rsi <= 72):
+                score += 1
+        else:
+            # Sweet spot for shorts: weakening but not yet oversold (room to fall)
+            if 30 <= rsi <= 55:
+                score += 2
+            elif (55 < rsi <= 65) or (25 <= rsi < 30):
+                score += 1
+
+    # Volume expansion: 0-2 pts — institutional activity confirms breakout
+    vexp = _v(metrics.get("vol_expansion_ratio"))
+    if vexp is not None:
+        if vexp >= 1.5:
+            score += 2
+        elif vexp >= 1.2:
+            score += 1
+
+    # Relative strength vs Nifty: 0-2 pts — trading with market momentum
+    rs = _v(metrics.get("rs_vs_nifty_3m"))
+    if rs is not None:
+        if is_long:
+            if rs >= 2.0:
+                score += 2
+            elif rs >= 0.0:
+                score += 1
+        else:
+            # Negative RS = weak relative to market = good short candidate
+            if rs <= -2.0:
+                score += 2
+            elif rs <= 0.0:
+                score += 1
+
+    # Composite score: 0-1 pt — overall trend quality (EMA alignment + RS + volume)
+    comp = _v(metrics.get("composite_score"))
+    if comp is not None:
+        if is_long and comp >= 65:
+            score += 1
+        elif not is_long and comp <= 40:
+            score += 1
+
+    return min(10, score)
 
 
 def intraday_signal(
@@ -434,21 +513,24 @@ def intraday_signal(
                 "intraday_s1": S1, "intraday_s2": S2,
                 "intraday_reason": f"R/R {rr:.1f}× < {min_rr:.1f}× minimum — risk not justified.",
             }
+        _conf = compute_intraday_confidence(metrics, rr, "BUY_ABOVE")
         return {
-            "intraday_signal": "BUY_ABOVE",
-            "intraday_pivot":  P,
-            "intraday_r1":     R1,
-            "intraday_r2":     R2,
-            "intraday_s1":     S1,
-            "intraday_s2":     S2,
-            "intraday_entry":  entry,
-            "intraday_stop":   stop,
-            "intraday_t1":     t1,
+            "intraday_signal":     "BUY_ABOVE",
+            "intraday_pivot":      P,
+            "intraday_r1":         R1,
+            "intraday_r2":         R2,
+            "intraday_s1":         S1,
+            "intraday_s2":         S2,
+            "intraday_entry":      entry,
+            "intraday_stop":       stop,
+            "intraday_t1":         t1,
+            "intraday_confidence": _conf,
             "intraday_reason": (
                 f"Trend up (above EMA20 ₹{e20:.2f}). "
                 f"BUY when price trades above R1 ₹{R1:.2f}. "
                 f"Stop just below R1 ₹{stop:.2f}. "
-                f"Target R2 ₹{R2:.2f}. R/R {rr:.1f}×. Hard exit 3:10 PM."
+                f"Target R2 ₹{R2:.2f}. R/R {rr:.1f}×. "
+                f"Confidence {_conf}/10. Hard exit 3:10 PM."
             ),
         }
 
@@ -472,21 +554,24 @@ def intraday_signal(
                 "intraday_s1": S1, "intraday_s2": S2,
                 "intraday_reason": f"Short R/R {rr:.1f}× < {min_rr:.1f}× minimum — risk not justified.",
             }
+        _conf = compute_intraday_confidence(metrics, rr, "SELL_BELOW")
         return {
-            "intraday_signal": "SELL_BELOW",
-            "intraday_pivot":  P,
-            "intraday_r1":     R1,
-            "intraday_r2":     R2,
-            "intraday_s1":     S1,
-            "intraday_s2":     S2,
-            "intraday_entry":  entry,
-            "intraday_stop":   stop,
-            "intraday_t1":     t1,
+            "intraday_signal":     "SELL_BELOW",
+            "intraday_pivot":      P,
+            "intraday_r1":         R1,
+            "intraday_r2":         R2,
+            "intraday_s1":         S1,
+            "intraday_s2":         S2,
+            "intraday_entry":      entry,
+            "intraday_stop":       stop,
+            "intraday_t1":         t1,
+            "intraday_confidence": _conf,
             "intraday_reason": (
                 f"Trend down (below EMA20 ₹{e20:.2f}). "
                 f"SHORT when price breaks below S1 ₹{S1:.2f}. "
                 f"Stop just above S1 ₹{stop:.2f}. "
-                f"Target S2 ₹{S2:.2f}. R/R {rr:.1f}×. Hard exit 3:10 PM."
+                f"Target S2 ₹{S2:.2f}. R/R {rr:.1f}×. "
+                f"Confidence {_conf}/10. Hard exit 3:10 PM."
             ),
         }
 

@@ -153,8 +153,22 @@ NIFTY_50_TOKEN = 256265
 # PAPER TRADING — virtual capital for signal evaluation
 # ============================================================
 PAPER_CAPITAL       = 900_000   # ₹9,00,000 virtual capital
-PAPER_MAX_POSITIONS = 6         # max concurrent paper trades (mix of long + short)
-# Per-trade allocation: PAPER_CAPITAL / PAPER_MAX_POSITIONS = ₹1,50,000 each
+PAPER_MAX_POSITIONS = 6         # legacy: kept for reference; capital-based gating now used
+
+# ── Confidence-based capital allocation ──────────────────────────────────────
+# Intraday signals are scored 0-10 before auto-triggering.
+# Tier thresholds and per-trade capital:
+CONFIDENCE_STRONG_MIN   = 8        # 8-10 → STRONG: large allocation
+CONFIDENCE_MODERATE_MIN = 6        # 6-7  → MODERATE: standard allocation
+CONFIDENCE_MARGINAL_MIN = 5        # 5    → MARGINAL: small allocation, only if capital available
+# Below CONFIDENCE_MARGINAL_MIN → LOW: shown in table, NOT auto-traded
+PAPER_CAP_STRONG   = 200_000       # ₹2,00,000 per STRONG trade
+PAPER_CAP_MODERATE = 150_000       # ₹1,50,000 per MODERATE trade (was the old fixed default)
+PAPER_CAP_MARGINAL = 100_000       # ₹1,00,000 per MARGINAL trade
+# Total capital hard cap: PAPER_CAPITAL (₹9L) — never exceed regardless of confidence
+# Effective max slots: 4 STRONG (₹8L) or 6 MODERATE (₹9L) or 9 MARGINAL (₹9L)
+# LTP freshness gate: if last LTP update older than this, pause auto-triggers
+LTP_FRESHNESS_SECS = 10
 
 # Daily gain target / trailing cutoff (applies to both paper & real trading)
 # Rule:
