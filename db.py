@@ -678,7 +678,14 @@ def get_open_paper_trades(user_id: str = "", trade_date=None) -> list:
 
 def get_today_closed_pnl(user_id: str = "", is_paper: bool | None = None) -> float:
     """
-    Returns the total realised P&L (sum of pnl_amount) for TODAY's closed trades.
+    Returns the total realised P&L for trades closed TODAY.
+
+    "Closed today" means the trade has a non-OPEN status AND was either:
+      • opened today (trade_date = today), OR
+      • logged/updated today (logged_at date = today)
+    We use GREATEST(trade_date, DATE(logged_at)) so intraday trades opened and
+    closed on the same day are always captured, even if the exit timestamp
+    rounds to a different date in edge cases.
 
     Parameters
     ----------
@@ -689,11 +696,11 @@ def get_today_closed_pnl(user_id: str = "", is_paper: bool | None = None) -> flo
     import datetime as _dt
     _today = _dt.date.today().isoformat()
     clauses: list[str] = [
-        "trade_date = ?",
         "status IN ('CLOSED', 'TARGET_HIT', 'STOPPED_OUT')",
         "pnl_amount IS NOT NULL",
+        "(trade_date = ? OR CAST(logged_at AS DATE) = ?)",
     ]
-    params: list = [_today]
+    params: list = [_today, _today]
     if user_id:
         clauses.append("kite_user_id = ?")
         params.append(user_id)

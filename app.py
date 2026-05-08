@@ -3838,14 +3838,19 @@ def _activity_log_live():
     elif _filter_trade_type == "Real only" and "is_paper_trade" in _log_df.columns:
         _log_df = _log_df[(_log_df["is_paper_trade"] != True) | _log_df["is_paper_trade"].isna()]
 
+    # Always put OPEN trades first, then apply user's secondary sort
+    _log_df["_status_order"] = (_log_df["status"] != "OPEN").astype(int)
     if _sort_by == "Oldest first":
-        _log_df = _log_df.sort_values("logged_at", ascending=True)
+        _log_df = _log_df.sort_values(["_status_order", "logged_at"], ascending=[True, True])
     elif _sort_by == "P&L ↓":
-        _log_df = _log_df.sort_values("pnl_amount", ascending=False, na_position="last")
+        _log_df = _log_df.sort_values(["_status_order", "pnl_amount"], ascending=[True, False], na_position="last")
     elif _sort_by == "P&L ↑":
-        _log_df = _log_df.sort_values("pnl_amount", ascending=True,  na_position="last")
+        _log_df = _log_df.sort_values(["_status_order", "pnl_amount"], ascending=[True, True],  na_position="last")
+    else:  # Newest first (default)
+        _log_df = _log_df.sort_values(["_status_order", "logged_at"], ascending=[True, False])
+    _log_df = _log_df.drop(columns=["_status_order"])
 
-    st.caption(f"Showing {len(_log_df)} of {_stats['total']} entries · auto-refreshes every 2 s")
+    st.caption(f"Showing {len(_log_df)} of {_stats_all.get('total', 0)} entries · auto-refreshes every 2 s")
 
     if _log_df.empty:
         return
@@ -3858,26 +3863,27 @@ def _activity_log_live():
     else:
         _log_df["trade_type"] = "💸 Real"
 
-    # Mark-to-market P&L for open paper trades using live LTP
+    # Inject live LTP and compute MTM P&L for open trades
     _live_ltp_now = st.session_state.get("_live_ltp", {})
-    if _live_ltp_now and "is_paper_trade" in _log_df.columns:
-        _open_paper_mask = (
-            (_log_df["is_paper_trade"] == True) &
-            (_log_df["status"] == "OPEN")
-        )
-        for _idx, _row in _log_df[_open_paper_mask].iterrows():
-            _ltp_p = _live_ltp_now.get(_row.get("tradingsymbol", ""), 0)
-            if _ltp_p and _row.get("actual_entry"):
-                _entry_p = float(_row["actual_entry"])
-                _qty_p   = float(_row.get("quantity", 0) or 0)
-                _sig_p   = _row.get("signal_type", "")
-                _mult    = 1 if _sig_p == "BUY_ABOVE" else -1
-                _log_df.at[_idx, "pnl_amount"] = (_ltp_p - _entry_p) * _qty_p * _mult
-                if _entry_p:
-                    _log_df.at[_idx, "pnl_pct"] = (_ltp_p - _entry_p) / _entry_p * 100 * _mult
+    _log_df["ltp"] = _log_df["tradingsymbol"].map(
+        lambda s: _live_ltp_now.get(s, None)
+    )
+    _open_mask = _log_df["status"] == "OPEN"
+    for _idx, _row in _log_df[_open_mask].iterrows():
+        _ltp_v = _live_ltp_now.get(_row.get("tradingsymbol", ""), 0)
+        if _ltp_v and _row.get("actual_entry"):
+            _entry_p = float(_row["actual_entry"])
+            _qty_p   = float(_row.get("quantity", 0) or 0)
+            _is_short = _row.get("signal_type", "") == "SELL_BELOW"
+            _mult    = -1 if _is_short else 1
+            _log_df.at[_idx, "pnl_amount"] = (_ltp_v - _entry_p) * _qty_p * _mult
+            if _entry_p:
+                _log_df.at[_idx, "pnl_pct"] = (_ltp_v - _entry_p) / _entry_p * 100 * _mult
 
+    # Status first, then symbol, then LTP, then the rest
     _disp_cols = [
-        "id", "trade_date", "tradingsymbol", "trade_type", "setup_type", "signal_type",
+        "status",
+        "id", "trade_date", "tradingsymbol", "ltp", "trade_type", "setup_type", "signal_type",
         "quantity",
         "rec_entry", "actual_entry",
         "rec_stop",
@@ -3885,7 +3891,7 @@ def _activity_log_live():
         "pnl_amount", "pnl_pct",
         "rr_realised", "slippage_entry_pct",
         "kite_order_id", "kite_status",
-        "status", "notes",
+        "notes",
     ]
     _disp_cols = [c for c in _disp_cols if c in _log_df.columns]
     _log_show  = _log_df[_disp_cols].copy()
@@ -3912,7 +3918,8 @@ def _activity_log_live():
     _pnl_sub  = [c for c in ["pnl_amount", "pnl_pct", "rr_realised"] if c in _log_show.columns]
     _stat_sub = [c for c in ["status"] if c in _log_show.columns]
 
-    styled_log = _log_show.style.format({
+    _fmt_map = {
+        "ltp":         "₹{:,.2f}",
         "rec_entry":   "₹{:,.2f}",
         "actual_entry":"₹{:,.2f}",
         "rec_stop":    "₹{:,.2f}",
@@ -3922,11 +3929,23 @@ def _activity_log_live():
         "pnl_pct":     "{:+.2f}%",
         "rr_realised": "{:.2f}×",
         "slippage_entry_pct": "{:+.2f}%",
-    }, na_rep="—")
+    }
+    _fmt_active = {k: v for k, v in _fmt_map.items() if k in _log_show.columns}
+    styled_log = _log_show.style.format(_fmt_active, na_rep="—")
     if _pnl_sub:
         styled_log = styled_log.map(_pnl_color, subset=_pnl_sub)
     if _stat_sub:
         styled_log = styled_log.map(_status_badge_color, subset=_stat_sub)
+
+    def _ltp_color(val):
+        try:
+            float(str(val).replace("₹","").replace(",",""))
+            return "color:#60a5fa;font-weight:600"   # blue — live price
+        except Exception:
+            return ""
+
+    if "ltp" in _log_show.columns:
+        styled_log = styled_log.map(_ltp_color, subset=["ltp"])
 
     st.dataframe(
         styled_log,
@@ -3934,9 +3953,12 @@ def _activity_log_live():
         height=min(600, 60 + len(_log_show) * 38),
         hide_index=True,
         column_config={
-            "id":                  st.column_config.NumberColumn("ID",         width="small"),
+            "status":              st.column_config.TextColumn("Status",        width="small"),
+            "id":                  st.column_config.NumberColumn("ID",          width="small"),
             "trade_date":          st.column_config.DateColumn("Date"),
             "tradingsymbol":       st.column_config.TextColumn("Symbol"),
+            "ltp":                 st.column_config.TextColumn("LTP",
+                help="Last traded price — live from market during trading hours"),
             "trade_type":          st.column_config.TextColumn("Type",
                 help="📄 Paper = virtual paper trade auto-created by the system\n💸 Real = actual order placed / logged manually"),
             "setup_type":          st.column_config.TextColumn("Setup"),
@@ -3947,14 +3969,13 @@ def _activity_log_live():
             "rec_stop":            st.column_config.TextColumn("Rec Stop",      help="Recommended stop-loss"),
             "rec_t1":              st.column_config.TextColumn("Rec T1",        help="Recommended first target"),
             "actual_exit":         st.column_config.TextColumn("Actual Exit",   help="Your actual exit price"),
-            "pnl_amount":          st.column_config.TextColumn("P&L ₹",         help="(Exit − Entry) × Qty — live MTM for open paper trades"),
-            "pnl_pct":             st.column_config.TextColumn("P&L %",          help="(Exit − Entry) / Entry × 100"),
+            "pnl_amount":          st.column_config.TextColumn("P&L ₹",         help="(Exit − Entry) × Qty — live MTM for open trades"),
+            "pnl_pct":             st.column_config.TextColumn("P&L %",         help="(Exit − Entry) / Entry × 100"),
             "rr_realised":         st.column_config.TextColumn("R/R actual",    help="Actual gain ÷ actual risk"),
             "slippage_entry_pct":  st.column_config.TextColumn("Entry slip %",  help="How far your entry was from the recommended entry"),
-            "kite_order_id":       st.column_config.TextColumn("Kite Order ID", help="Order ID from Zerodha Kite — use this to look up the order in your Kite app"),
-            "kite_status":         st.column_config.TextColumn("Kite Status",   help="Last known order status from Kite (OPEN / COMPLETE / REJECTED / CANCELLED). Hit 'Sync from Kite' to refresh."),
-            "status":              st.column_config.TextColumn("Status"),
-            "notes":               st.column_config.TextColumn("Notes",          width="large"),
+            "kite_order_id":       st.column_config.TextColumn("Kite Order ID", help="Order ID from Zerodha Kite"),
+            "kite_status":         st.column_config.TextColumn("Kite Status",   help="Last known order status. Hit 'Sync from Kite' to refresh."),
+            "notes":               st.column_config.TextColumn("Notes",         width="large"),
         },
     )
 
