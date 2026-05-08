@@ -955,6 +955,33 @@ def get_paper_trade_perf(user_id: str = "", days: int = 30) -> dict:
     return result
 
 
+def get_archived_paper_trades_for_analysis(user_id: str = "") -> "pd.DataFrame":
+    """
+    Return all closed paper trades from days BEFORE today for algorithm re-tuning.
+    Includes confidence, planned vs actual R/R, stop details.
+    """
+    import datetime as _dt
+    today = str(_dt.date.today())
+    con = get_conn()
+    _uid_clause = "AND kite_user_id = ?" if user_id else ""
+    _params = [today] + ([user_id] if user_id else [])
+    df = con.execute(
+        f"""SELECT id, tradingsymbol, signal_type, trade_date, logged_at,
+                   actual_entry, actual_exit, rec_entry, rec_stop, rec_t1,
+                   pnl_amount, pnl_pct, rr_realised, intraday_confidence,
+                   intraday_rr, status, quantity
+            FROM trade_log
+            WHERE is_paper_trade = TRUE
+              AND status IN ('TARGET_HIT', 'STOPPED_OUT', 'CLOSED')
+              AND trade_date < ?
+              {_uid_clause}
+            ORDER BY trade_date DESC, id DESC""",
+        _params,
+    ).df()
+    con.close()
+    return df
+
+
 # ─── Signal config (algo-tuning overrides) ───────────────────────────────────
 
 _SIGNAL_CONFIG_DEFAULTS = {

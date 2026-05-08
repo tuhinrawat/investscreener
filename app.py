@@ -4370,6 +4370,257 @@ with tab_signals:
 
 
 # ============================================================
+# ALGORITHM READJUSTMENT DIALOG
+# ============================================================
+@st.dialog("🔬 Algorithm Readjustment Insights", width="large")
+def _show_algo_readjust_dialog(uid: str) -> None:
+    """Analyse archived paper trades and propose signal-config changes."""
+    import datetime as _dt_mod
+
+    df = db.get_archived_paper_trades_for_analysis(user_id=uid)
+    if df.empty:
+        st.info(
+            "No archived paper trades found yet. "
+            "This section populates from completed trades on past trading days.",
+            icon="📭",
+        )
+        return
+
+    # ── Numeric coercion ────────────────────────────────────────────────
+    for _nc in ("pnl_amount", "pnl_pct", "rr_realised", "intraday_confidence",
+                "actual_entry", "actual_exit", "rec_stop", "rec_t1", "intraday_rr"):
+        if _nc in df.columns:
+            df[_nc] = pd.to_numeric(df[_nc], errors="coerce")
+
+    total      = len(df)
+    wins       = int((df["pnl_amount"] > 0).sum())
+    stopped    = int((df["status"] == "STOPPED_OUT").sum())
+    target_hit = int((df["status"] == "TARGET_HIT").sum())
+    win_rate   = wins / total * 100 if total else 0.0
+    stop_rate  = stopped / total * 100 if total else 0.0
+    th_rate    = target_hit / total * 100 if total else 0.0
+
+    cur_cfg   = db.get_signal_config(user_id=uid)
+    proposals = dict(cur_cfg)
+
+    # ── Gap analysis ────────────────────────────────────────────────────
+    gaps = []
+
+    # 1. Stop-out rate
+    if stop_rate > 55:
+        gaps.append(
+            f"🔴 **High stop-out rate ({stop_rate:.0f}%)** — more than half of trades are being "
+            f"stopped out before reaching the target. Causes: stops too tight, ATR volatility higher "
+            f"than expected, or entries on false breakouts. Consider raising the min R/R filter so only "
+            f"wider-stop setups qualify."
+        )
+        proposals["intraday_min_rr"] = round(min(2.5, cur_cfg["intraday_min_rr"] + 0.25), 2)
+    elif stop_rate < 20 and win_rate < 40:
+        gaps.append(
+            f"⚠️ **Stop-out rate is low ({stop_rate:.0f}%) but win rate is also low ({win_rate:.0f}%)** — "
+            f"trades are not being stopped out but are closing at a loss (CLOSED status). "
+            f"Check if exits at 3:10 PM hard-exit are realising losses instead of letting winners run."
+        )
+
+    # 2. Signal-type breakdown
+    _buys  = df[df["signal_type"] == "BUY_ABOVE"]
+    _sells = df[df["signal_type"] == "SELL_BELOW"]
+    _buy_wr  = float((_buys["pnl_amount"] > 0).mean() * 100)  if len(_buys)  >= 3 else None
+    _sell_wr = float((_sells["pnl_amount"] > 0).mean() * 100) if len(_sells) >= 3 else None
+
+    if _buy_wr is not None:
+        if _buy_wr < 40:
+            gaps.append(
+                f"🔴 **Long signals (BUY_ABOVE) win rate is {_buy_wr:.0f}%** — below acceptable threshold. "
+                f"Market may be in a downtrend or RSI ceiling ({cur_cfg['intraday_rsi_buy_max']:.0f}) is "
+                f"allowing overbought entries. Tightening RSI threshold."
+            )
+            proposals["intraday_rsi_buy_max"] = round(max(55.0, cur_cfg["intraday_rsi_buy_max"] - 5.0), 1)
+        elif _buy_wr > 65:
+            gaps.append(
+                f"✅ **Long signals performing well ({_buy_wr:.0f}% win rate)** — "
+                f"RSI buy threshold ({cur_cfg['intraday_rsi_buy_max']:.0f}) is well-calibrated."
+            )
+
+    if _sell_wr is not None:
+        if _sell_wr < 40:
+            gaps.append(
+                f"🔴 **Short signals (SELL_BELOW) win rate is {_sell_wr:.0f}%** — "
+                f"RSI floor ({cur_cfg['intraday_rsi_sell_min']:.0f}) may be too permissive. "
+                f"Raising threshold to reduce oversold bounce traps."
+            )
+            proposals["intraday_rsi_sell_min"] = round(min(45.0, cur_cfg["intraday_rsi_sell_min"] + 5.0), 1)
+        elif _sell_wr > 65:
+            gaps.append(
+                f"✅ **Short signals performing well ({_sell_wr:.0f}% win rate)** — threshold calibrated correctly."
+            )
+
+    # 3. Avg realised R/R vs planned
+    _rrv = df["rr_realised"].dropna()
+    _planned_rr = df["intraday_rr"].dropna() if "intraday_rr" in df.columns else pd.Series(dtype=float)
+    if len(_rrv) >= 3:
+        _avg_rr = float(_rrv.mean())
+        _avg_plan = float(_planned_rr.mean()) if len(_planned_rr) >= 3 else None
+        if _avg_rr < 1.0:
+            gaps.append(
+                f"⚠️ **Average realised R/R is {_avg_rr:.2f}x** (below 1:1) — "
+                f"trades are exiting with losses larger than their gains. "
+                f"{'Planned avg R/R was ' + f'{_avg_plan:.1f}x' + ', meaning targets are not being reached.' if _avg_plan else ''} "
+                f"Raising the minimum R/R filter will pre-screen out lower-probability setups."
+            )
+            proposals["intraday_min_rr"] = round(min(2.5, max(proposals["intraday_min_rr"], cur_cfg["intraday_min_rr"] + 0.25)), 2)
+        elif _avg_rr > 1.8 and win_rate > 55:
+            gaps.append(
+                f"✅ **Strong realised R/R of {_avg_rr:.2f}x** with {win_rate:.0f}% win rate — "
+                f"current parameters are effective. Consider slightly relaxing min R/R to capture more setups."
+            )
+            if cur_cfg["intraday_min_rr"] > 1.5:
+                proposals["intraday_min_rr"] = round(max(1.5, cur_cfg["intraday_min_rr"] - 0.25), 2)
+
+    # 4. Confidence correlation
+    if "intraday_confidence" in df.columns and df["intraday_confidence"].notna().sum() >= 4:
+        _hc = df[df["intraday_confidence"] >= 7]
+        _lc = df[df["intraday_confidence"] < 7]
+        _hcwr = float((_hc["pnl_amount"] > 0).mean() * 100) if len(_hc) >= 2 else None
+        _lcwr = float((_lc["pnl_amount"] > 0).mean() * 100) if len(_lc) >= 2 else None
+        if _hcwr is not None and _lcwr is not None:
+            if _hcwr - _lcwr > 15:
+                gaps.append(
+                    f"✅ **Confidence score is predictive** — high-confidence signals (≥7) win at "
+                    f"{_hcwr:.0f}% vs {_lcwr:.0f}% for lower confidence. "
+                    f"The confidence gate is working correctly."
+                )
+            elif _hcwr < _lcwr - 10:
+                gaps.append(
+                    f"⚠️ **Confidence scoring may need recalibration** — high-confidence signals "
+                    f"({_hcwr:.0f}% win) underperform lower-confidence ones ({_lcwr:.0f}% win). "
+                    f"Review the RSI, ATR, and volume factors in signals.py confidence calculation."
+                )
+
+    # 5. Stop overshoot (actual_exit vs rec_stop for STOPPED_OUT trades)
+    _stopped_df = df[df["status"] == "STOPPED_OUT"].copy()
+    if len(_stopped_df) >= 3 and "actual_exit" in _stopped_df.columns and "rec_stop" in _stopped_df.columns:
+        _long_stops = _stopped_df[_stopped_df["signal_type"] == "BUY_ABOVE"]
+        if len(_long_stops) >= 2:
+            _long_stops = _long_stops.dropna(subset=["actual_exit", "rec_stop"])
+            if not _long_stops.empty:
+                _overshoot = float(
+                    ((_long_stops["rec_stop"] - _long_stops["actual_exit"]) / _long_stops["rec_stop"]).mean() * 100
+                )
+                if _overshoot > 0.3:
+                    gaps.append(
+                        f"⚠️ **Stop-loss overshoot of {_overshoot:.2f}% on long trades** — "
+                        f"actual exit is averaging {_overshoot:.2f}% below the planned stop, "
+                        f"indicating the fast-exit overshoot buffer may need tightening, "
+                        f"or slippage on volatile small-caps is high."
+                    )
+
+    if not gaps:
+        gaps.append(
+            "✅ **Algorithm is performing within expected parameters.** "
+            "Win rate and R/R metrics are healthy based on the archived trade data."
+        )
+
+    # ── Display ─────────────────────────────────────────────────────────
+    st.markdown("#### 📊 Archive Performance Summary")
+    _mc1, _mc2, _mc3, _mc4, _mc5 = st.columns(5)
+    _mc1.metric("Total Trades", total)
+    _mc2.metric("Win Rate", f"{win_rate:.1f}%", delta=f"{'↑ good' if win_rate >= 50 else '↓ low'}", delta_color="normal" if win_rate >= 50 else "inverse")
+    _mc3.metric("Stop-Out Rate", f"{stop_rate:.1f}%", delta=f"{'↑ high' if stop_rate > 55 else '✓ ok'}", delta_color="inverse" if stop_rate > 55 else "off")
+    _mc4.metric("Target Hit Rate", f"{th_rate:.1f}%")
+    _avg_pnl_pct = float(df["pnl_pct"].dropna().mean()) if "pnl_pct" in df.columns and df["pnl_pct"].notna().any() else 0.0
+    _mc5.metric("Avg P&L %", f"{_avg_pnl_pct:+.2f}%")
+
+    # Signal breakdown table
+    _br_rows = []
+    for _sk, _sdf in [("BUY_ABOVE (Long)", _buys), ("SELL_BELOW (Short)", _sells)]:
+        if len(_sdf) > 0:
+            _sw = int((_sdf["pnl_amount"] > 0).sum())
+            _wr_s = _sw / len(_sdf) * 100
+            _arr  = float(_sdf["rr_realised"].dropna().mean()) if _sdf["rr_realised"].notna().any() else None
+            _br_rows.append({
+                "Signal":     _sk,
+                "Trades":     len(_sdf),
+                "Wins":       _sw,
+                "Win Rate":   f"{_wr_s:.1f}%",
+                "Avg R/R":    f"{_arr:.2f}×" if _arr is not None else "—",
+                "Avg P&L %":  f"{float(_sdf['pnl_pct'].dropna().mean()):+.2f}%" if _sdf["pnl_pct"].notna().any() else "—",
+            })
+    if _br_rows:
+        st.dataframe(pd.DataFrame(_br_rows), hide_index=True, use_container_width=True)
+
+    st.markdown("#### 🔍 Gaps Identified")
+    for _g in gaps:
+        st.markdown(_g)
+
+    # ── Proposed changes ────────────────────────────────────────────────
+    st.markdown("#### ⚙️ Proposed Algorithm Adjustments")
+    _changed = {k: v for k, v in proposals.items() if abs(float(v) - float(cur_cfg.get(k, v))) > 1e-6}
+    if _changed:
+        _ch_rows = []
+        _param_labels = {
+            "intraday_rsi_buy_max":  "RSI Buy Max",
+            "intraday_rsi_sell_min": "RSI Sell Min",
+            "intraday_min_rr":       "Min R/R",
+        }
+        for _k, _new_v in _changed.items():
+            _old_v = cur_cfg.get(_k)
+            _ch_rows.append({
+                "Parameter": _param_labels.get(_k, _k),
+                "Current":   f"{_old_v:.2f}",
+                "Proposed":  f"{_new_v:.2f}",
+                "Direction": "↓ Tighter" if float(_new_v) < float(_old_v) else "↑ Relaxed",
+            })
+        st.dataframe(pd.DataFrame(_ch_rows), hide_index=True, use_container_width=True)
+    else:
+        st.success("No parameter changes needed — current settings are well-tuned.", icon="✅")
+
+    # ── What to expect next day ──────────────────────────────────────────
+    st.markdown("#### 🔭 What to Expect Next Day")
+    _expectations = []
+    if "intraday_rsi_buy_max" in _changed:
+        _new_rsi_b = _changed["intraday_rsi_buy_max"]
+        _dir = "fewer" if _new_rsi_b < cur_cfg["intraday_rsi_buy_max"] else "more"
+        _expectations.append(
+            f"• RSI buy ceiling → `{_new_rsi_b:.0f}`: expect **{_dir} BUY_ABOVE signals** per day, "
+            f"{'filtering overbought entries in weak markets' if _dir == 'fewer' else 'capturing more trending setups'}."
+        )
+    if "intraday_rsi_sell_min" in _changed:
+        _new_rsi_s = _changed["intraday_rsi_sell_min"]
+        _dir = "fewer" if _new_rsi_s > cur_cfg["intraday_rsi_sell_min"] else "more"
+        _expectations.append(
+            f"• RSI sell floor → `{_new_rsi_s:.0f}`: expect **{_dir} SELL_BELOW signals**, "
+            f"{'reducing mean-reversion bounce traps' if _dir == 'fewer' else 'capturing more short setups'}."
+        )
+    if "intraday_min_rr" in _changed:
+        _new_rr = _changed["intraday_min_rr"]
+        _dir_rr = "fewer" if _new_rr > cur_cfg["intraday_min_rr"] else "more"
+        _expectations.append(
+            f"• Min R/R → `{_new_rr:.2f}×`: expect **{_dir_rr} total signals**, "
+            f"{'focusing on higher-quality wide-stop setups with better expected value' if _dir_rr == 'fewer' else 'more signals qualifying the R/R gate'}."
+        )
+    if not _expectations:
+        _expectations.append("• No changes applied → signal frequency and quality unchanged from today.")
+    for _exp in _expectations:
+        st.markdown(_exp)
+
+    st.markdown("---")
+    _dc1, _dc2 = st.columns([2, 1])
+    if _changed:
+        if _dc1.button("✅ Confirm & Apply Adjustments", type="primary", use_container_width=True):
+            db.save_signal_config(proposals, user_id=uid)
+            st.success(
+                "Algorithm updated! Run **Refresh Signals** or **Full Rescan** on the "
+                "Trade Signals tab to see updated signals tomorrow.",
+                icon="✅",
+            )
+    else:
+        _dc1.info("No changes to apply.", icon="ℹ️")
+    if _dc2.button("❌ Cancel", use_container_width=True):
+        st.rerun()
+
+
+# ============================================================
 # ACTIVITY LOG — live fragment (stats + table + paper perf)
 # ============================================================
 @st.fragment(run_every=2)
@@ -4553,332 +4804,390 @@ def _activity_log_live():
 
     st.markdown("---")
 
-    # ── Filters ────────────────────────────────────────────────────────────
-    _f1, _f2, _f3, _f4, _f5 = st.columns(5)
-    _filter_status = _f1.multiselect(
-        "Status", ["OPEN", "CLOSED", "TARGET_HIT", "STOPPED_OUT", "CANCELLED"],
-        default=[], placeholder="All statuses",
-    )
-    _filter_setup  = _f2.multiselect(
-        "Setup type", ["SWING", "INTRADAY", "SCALING"],
-        default=[], placeholder="All setups",
-    )
-    _filter_sym    = _f3.text_input("Symbol search", placeholder="e.g. RELIANCE")
-    _sort_by       = _f4.selectbox("Sort by", ["Newest first", "Oldest first", "P&L ↓", "P&L ↑"])
-    _filter_trade_type = _f5.selectbox("Trade type", ["All", "Real only", "Paper only"])
-
-    # ── Load + filter ───────────────────────────────────────────────────────
-    _log_df = db.load_trade_log(
-        status_filter=_filter_status if _filter_status else None,
-        user_id=_uid,
-    )
-    if _filter_setup:
-        _log_df = _log_df[_log_df["setup_type"].isin(_filter_setup)]
-    if _filter_sym:
-        _log_df = _log_df[_log_df["tradingsymbol"].str.contains(_filter_sym.strip(), case=False, na=False, regex=False)]
-    if _filter_trade_type == "Paper only" and "is_paper_trade" in _log_df.columns:
-        _log_df = _log_df[_log_df["is_paper_trade"] == True]
-    elif _filter_trade_type == "Real only" and "is_paper_trade" in _log_df.columns:
-        _log_df = _log_df[(_log_df["is_paper_trade"] != True) | _log_df["is_paper_trade"].isna()]
-
-    # Always put OPEN trades first, then apply user's secondary sort
-    _log_df["_status_order"] = (_log_df["status"] != "OPEN").astype(int)
-    if _sort_by == "Oldest first":
-        _log_df = _log_df.sort_values(["_status_order", "logged_at"], ascending=[True, True])
-    elif _sort_by == "P&L ↓":
-        _log_df = _log_df.sort_values(["_status_order", "pnl_amount"], ascending=[True, False], na_position="last")
-    elif _sort_by == "P&L ↑":
-        _log_df = _log_df.sort_values(["_status_order", "pnl_amount"], ascending=[True, True],  na_position="last")
-    else:  # Newest first (default)
-        _log_df = _log_df.sort_values(["_status_order", "logged_at"], ascending=[True, False])
-    _log_df = _log_df.drop(columns=["_status_order"])
-
-    st.caption(f"Showing {len(_log_df)} of {_stats_all.get('total', 0)} entries · auto-refreshes every 2 s")
-
-    if _log_df.empty:
-        return
-
-    # ── Trade log table ────────────────────────────────────────────────────
-    if "is_paper_trade" in _log_df.columns:
-        _log_df["trade_type"] = _log_df["is_paper_trade"].apply(
-            lambda v: "📄 Paper" if v is True or v == 1 else "💸 Real"
-        )
+    # ── Load all trades once; split into today (active) vs past (archive) ──
+    _log_df_all = db.load_trade_log(user_id=_uid)
+    _today_pd   = pd.Timestamp.today().normalize()
+    if not _log_df_all.empty and "trade_date" in _log_df_all.columns:
+        _tdate_col    = pd.to_datetime(_log_df_all["trade_date"], errors="coerce")
+        _active_mask  = (_tdate_col >= _today_pd) | (_log_df_all["status"] == "OPEN")
+        _archive_mask = (_tdate_col < _today_pd)  & (_log_df_all["status"] != "OPEN")
+        _log_df_today = _log_df_all[_active_mask].copy()
+        _log_df_arch  = _log_df_all[_archive_mask].copy()
     else:
-        _log_df["trade_type"] = "💸 Real"
+        _log_df_today = _log_df_all.copy()
+        _log_df_arch  = pd.DataFrame()
 
-    # Inject live LTP and compute MTM P&L for open trades
+    # ── Shared helpers ──────────────────────────────────────────────────────
     _live_ltp_now = st.session_state.get("_live_ltp", {})
-    _log_df["ltp"] = _log_df["tradingsymbol"].map(
-        lambda s: _live_ltp_now.get(s, None)
-    )
-    _open_mask = _log_df["status"] == "OPEN"
-    for _idx, _row in _log_df[_open_mask].iterrows():
-        _ltp_v = _live_ltp_now.get(str(_row.get("tradingsymbol") or ""), 0)
-        if _ltp_v and not _isna(_row.get("actual_entry")) and _row.get("actual_entry"):
-            _entry_p = float(_row["actual_entry"])
-            _qty_p   = float(_row.get("quantity", 0) or 0) if not _isna(_row.get("quantity")) else 0
-            _is_short = _row.get("signal_type", "") == "SELL_BELOW"
-            _mult    = -1 if _is_short else 1
-            _log_df.at[_idx, "pnl_amount"] = (_ltp_v - _entry_p) * _qty_p * _mult
-            if _entry_p:
-                _log_df.at[_idx, "pnl_pct"] = (_ltp_v - _entry_p) / _entry_p * 100 * _mult
 
-    # ── Compute statutory charges + net P&L for each trade ─────────────────
-    def _row_charges(row):
-        entry  = 0.0 if _isna(row.get("actual_entry")) else float(row.get("actual_entry") or 0)
-        exit_p = 0.0 if _isna(row.get("actual_exit"))  else float(row.get("actual_exit")  or 0)
-        qty    = 0   if _isna(row.get("quantity"))      else int(row.get("quantity")        or 0)
-        stype  = str(row.get("setup_type") or "INTRADAY")
-        status = str(row.get("status")     or "")
-        # For OPEN trades use LTP as provisional exit to get indicative charges
-        if status == "OPEN" and not exit_p:
-            exit_p = float(_live_ltp_now.get(str(row.get("tradingsymbol") or ""), 0) or 0)
-        if entry and exit_p and qty:
-            return db.compute_trade_charges(entry, exit_p, qty, stype).get("total", 0.0)
-        return 0.0
+    _TRADE_COL_CFG = {
+        "status":             st.column_config.TextColumn("Status",       width="small"),
+        "id":                 st.column_config.NumberColumn("ID",         width="small"),
+        "logged_at":          st.column_config.DatetimeColumn(
+                                  "Opened At", format="DD/MM/YY HH:mm:ss",
+                                  help="Exact timestamp when the trade was triggered and logged",
+                              ),
+        "tradingsymbol":      st.column_config.TextColumn("Symbol"),
+        "ltp":                st.column_config.TextColumn("LTP",
+            help="Last traded price — live from market during trading hours"),
+        "trade_type":         st.column_config.TextColumn("Type",
+            help="📄 Paper = virtual paper trade\n💸 Real = actual Kite order"),
+        "setup_type":         st.column_config.TextColumn("Setup"),
+        "signal_type":        st.column_config.TextColumn("Signal"),
+        "quantity":           st.column_config.NumberColumn("Qty"),
+        "rec_entry":          st.column_config.TextColumn("Rec Entry",    help="Screener-recommended entry price"),
+        "actual_entry":       st.column_config.TextColumn("Actual Entry", help="Your actual execution price"),
+        "rec_stop":           st.column_config.TextColumn("Rec Stop",     help="Recommended stop-loss"),
+        "rec_t1":             st.column_config.TextColumn("Rec T1",       help="Recommended first target"),
+        "actual_exit":        st.column_config.TextColumn("Actual Exit",  help="Your actual exit price"),
+        "pnl_amount":         st.column_config.TextColumn("Gross P&L ₹",  help="(Exit − Entry) × Qty — live MTM for open trades"),
+        "pnl_pct":            st.column_config.TextColumn("Gross P&L %",  help="(Exit − Entry) / Entry × 100, before charges"),
+        "charges":            st.column_config.TextColumn("Charges ₹",    help=(
+            "Zerodha statutory charges per round-trip (intraday):\n"
+            "• Brokerage: min(₹20, 0.03%) × 2 orders\n"
+            "• STT: 0.025% on sell value\n"
+            "• NSE txn: 0.00307% on total turnover\n"
+            "• SEBI: ₹10/crore\n"
+            "• GST: 18% on (brokerage + txn + SEBI)\n"
+            "• Stamp: 0.003% on buy value\n"
+            "For open trades, provisional charges based on LTP."
+        )),
+        "net_pnl":            st.column_config.TextColumn("Net P&L ₹",    help="Gross P&L minus all statutory charges"),
+        "net_pnl_pct":        st.column_config.TextColumn("Net P&L %",    help="Net P&L as % of capital deployed (entry × qty)"),
+        "rr_realised":        st.column_config.TextColumn("R/R actual",   help="Actual gain ÷ actual risk"),
+        "slippage_entry_pct": st.column_config.TextColumn("Entry slip %", help="How far your entry was from the recommended entry"),
+        "kite_order_id":      st.column_config.TextColumn("Kite Order ID"),
+        "kite_status":        st.column_config.TextColumn("Kite Status"),
+        "notes":              st.column_config.TextColumn("Notes",        width="large"),
+    }
 
-    _log_df["charges"]     = _log_df.apply(_row_charges, axis=1)
-    _log_df["net_pnl"]     = _log_df["pnl_amount"].fillna(0) - _log_df["charges"]
-    # net_pnl_pct = net_pnl / invested_capital * 100
-    _log_df["net_pnl_pct"] = _log_df.apply(
-        lambda r: (
-            float(r["net_pnl"]) / (float(r.get("actual_entry") or 0) * float(r.get("quantity") or 1)) * 100
-            if not _isna(r.get("actual_entry")) and not _isna(r.get("quantity"))
-               and r.get("actual_entry") and r.get("quantity") else None
-        ), axis=1
-    )
-    # Null out charges/net cols for rows with no P&L data at all
-    _no_pnl = _log_df["pnl_amount"].isna() & (_log_df["status"] != "OPEN")
-    _log_df.loc[_no_pnl, ["charges", "net_pnl", "net_pnl_pct"]] = None
-
-    # Status first, then symbol, LTP, gross P&L, charges, net P&L, then the rest
-    # Use logged_at (TIMESTAMP) instead of trade_date (DATE-only) for accurate open time
-    _disp_cols = [
-        "status",
-        "id", "logged_at", "tradingsymbol", "ltp",
-        "pnl_amount", "pnl_pct",
-        "charges", "net_pnl", "net_pnl_pct",
-        "trade_type", "setup_type", "signal_type",
-        "quantity",
-        "rec_entry", "actual_entry",
-        "rec_stop",
-        "rec_t1", "actual_exit",
-        "rr_realised", "slippage_entry_pct",
-        "kite_order_id", "kite_status",
-        "notes",
-    ]
-    _disp_cols = [c for c in _disp_cols if c in _log_df.columns]
-    _log_show  = _log_df[_disp_cols].copy()
+    _FMT_MAP = {
+        "ltp": "₹{:,.2f}", "rec_entry": "₹{:,.2f}", "actual_entry": "₹{:,.2f}",
+        "rec_stop": "₹{:,.2f}", "rec_t1": "₹{:,.2f}", "actual_exit": "₹{:,.2f}",
+        "pnl_amount": "₹{:+,.2f}", "pnl_pct": "{:+.2f}%",
+        "charges": "₹{:,.2f}", "net_pnl": "₹{:+,.2f}", "net_pnl_pct": "{:+.2f}%",
+        "rr_realised": "{:.2f}×", "slippage_entry_pct": "{:+.2f}%",
+    }
 
     def _pnl_color(val):
         try:
             v = float(str(val).replace("₹","").replace(",","").replace("+",""))
-            if v > 0:  return "color:#22c55e;font-weight:600"
-            if v < 0:  return "color:#ef4444;font-weight:600"
+            if v > 0: return "color:#22c55e;font-weight:600"
+            if v < 0: return "color:#ef4444;font-weight:600"
         except Exception:
             pass
         return ""
 
     def _status_badge_color(val):
-        colors = {
+        return {
             "TARGET_HIT":  "color:#22c55e;font-weight:700",
             "STOPPED_OUT": "color:#ef4444;font-weight:700",
             "OPEN":        "color:#f59e0b;font-weight:600",
             "CANCELLED":   "color:#94a3b8",
             "CLOSED":      "color:#3b82f6;font-weight:600",
-        }
-        return colors.get(str(val).upper(), "")
+        }.get(str(val).upper(), "")
 
-    _pnl_sub  = [c for c in ["pnl_amount", "pnl_pct", "net_pnl", "net_pnl_pct", "rr_realised"] if c in _log_show.columns]
-    _stat_sub = [c for c in ["status"] if c in _log_show.columns]
+    def _enrich_df(df: pd.DataFrame, inject_mtm: bool = False) -> pd.DataFrame:
+        """Add trade_type, ltp, live MTM, charges, net P&L columns."""
+        df = df.copy()
+        if "is_paper_trade" in df.columns:
+            df["trade_type"] = df["is_paper_trade"].apply(
+                lambda v: "📄 Paper" if v is True or v == 1 else "💸 Real"
+            )
+        else:
+            df["trade_type"] = "💸 Real"
 
-    _fmt_map = {
-        "ltp":              "₹{:,.2f}",
-        "rec_entry":        "₹{:,.2f}",
-        "actual_entry":     "₹{:,.2f}",
-        "rec_stop":         "₹{:,.2f}",
-        "rec_t1":           "₹{:,.2f}",
-        "actual_exit":      "₹{:,.2f}",
-        "pnl_amount":       "₹{:+,.2f}",
-        "pnl_pct":          "{:+.2f}%",
-        "charges":          "₹{:,.2f}",
-        "net_pnl":          "₹{:+,.2f}",
-        "net_pnl_pct":      "{:+.2f}%",
-        "rr_realised":      "{:.2f}×",
-        "slippage_entry_pct": "{:+.2f}%",
-    }
-    _fmt_active = {k: v for k, v in _fmt_map.items() if k in _log_show.columns}
-    styled_log = _log_show.style.format(_fmt_active, na_rep="—")
-    if _pnl_sub:
-        styled_log = styled_log.map(_pnl_color, subset=_pnl_sub)
-    if _stat_sub:
-        styled_log = styled_log.map(_status_badge_color, subset=_stat_sub)
+        df["ltp"] = df["tradingsymbol"].map(lambda s: _live_ltp_now.get(s, None))
 
-    def _ltp_color(val):
-        try:
-            float(str(val).replace("₹","").replace(",",""))
-            return "color:#60a5fa;font-weight:600"   # blue — live price
-        except Exception:
-            return ""
+        if inject_mtm:
+            _om = df["status"] == "OPEN"
+            for _idx, _row in df[_om].iterrows():
+                _ltp_v = _live_ltp_now.get(str(_row.get("tradingsymbol") or ""), 0)
+                if _ltp_v and not _isna(_row.get("actual_entry")) and _row.get("actual_entry"):
+                    _ep   = float(_row["actual_entry"])
+                    _qp   = float(_row.get("quantity", 0) or 0) if not _isna(_row.get("quantity")) else 0
+                    _mult = -1 if _row.get("signal_type","") == "SELL_BELOW" else 1
+                    df.at[_idx, "pnl_amount"] = (_ltp_v - _ep) * _qp * _mult
+                    if _ep:
+                        df.at[_idx, "pnl_pct"] = (_ltp_v - _ep) / _ep * 100 * _mult
 
-    if "ltp" in _log_show.columns:
-        styled_log = styled_log.map(_ltp_color, subset=["ltp"])
+        def _charges_row(row):
+            entry  = 0.0 if _isna(row.get("actual_entry")) else float(row.get("actual_entry") or 0)
+            exit_p = 0.0 if _isna(row.get("actual_exit"))  else float(row.get("actual_exit")  or 0)
+            qty    = 0   if _isna(row.get("quantity"))      else int(row.get("quantity") or 0)
+            stype  = str(row.get("setup_type") or "INTRADAY")
+            if str(row.get("status","")) == "OPEN" and not exit_p:
+                exit_p = float(_live_ltp_now.get(str(row.get("tradingsymbol") or ""), 0) or 0)
+            if entry and exit_p and qty:
+                return db.compute_trade_charges(entry, exit_p, qty, stype).get("total", 0.0)
+            return 0.0
 
-    st.dataframe(
-        styled_log,
-        use_container_width=True,
-        height=min(600, 60 + len(_log_show) * 38),
-        hide_index=True,
-        column_config={
-            "status":              st.column_config.TextColumn("Status",        width="small"),
-            "id":                  st.column_config.NumberColumn("ID",          width="small"),
-            "logged_at":           st.column_config.DatetimeColumn(
-                                       "Opened At",
-                                       format="DD/MM/YY HH:mm:ss",
-                                       help="Exact timestamp when the trade was triggered and logged",
-                                   ),
-            "tradingsymbol":       st.column_config.TextColumn("Symbol"),
-            "ltp":                 st.column_config.TextColumn("LTP",
-                help="Last traded price — live from market during trading hours"),
-            "trade_type":          st.column_config.TextColumn("Type",
-                help="📄 Paper = virtual paper trade auto-created by the system\n💸 Real = actual order placed / logged manually"),
-            "setup_type":          st.column_config.TextColumn("Setup"),
-            "signal_type":         st.column_config.TextColumn("Signal"),
-            "quantity":            st.column_config.NumberColumn("Qty"),
-            "rec_entry":           st.column_config.TextColumn("Rec Entry",     help="What the screener recommended"),
-            "actual_entry":        st.column_config.TextColumn("Actual Entry",  help="Your actual execution price"),
-            "rec_stop":            st.column_config.TextColumn("Rec Stop",      help="Recommended stop-loss"),
-            "rec_t1":              st.column_config.TextColumn("Rec T1",        help="Recommended first target"),
-            "actual_exit":         st.column_config.TextColumn("Actual Exit",   help="Your actual exit price"),
-            "pnl_amount":          st.column_config.TextColumn("Gross P&L ₹",   help="(Exit − Entry) × Qty before charges — live MTM for open trades"),
-            "pnl_pct":             st.column_config.TextColumn("Gross P&L %",   help="(Exit − Entry) / Entry × 100, before charges"),
-            "charges":             st.column_config.TextColumn("Charges ₹",     help=(
-                "Zerodha statutory charges per round-trip (intraday):\n"
-                "• Brokerage: min(₹20, 0.03%) × 2 orders\n"
-                "• STT: 0.025% on sell value\n"
-                "• NSE txn: 0.00307% on total turnover\n"
-                "• SEBI: ₹10/crore\n"
-                "• GST: 18% on (brokerage + txn + SEBI)\n"
-                "• Stamp: 0.003% on buy value\n"
-                "For open trades, provisional charges based on LTP."
-            )),
-            "net_pnl":             st.column_config.TextColumn("Net P&L ₹",     help="Gross P&L minus all statutory charges — your actual take-home profit/loss"),
-            "net_pnl_pct":         st.column_config.TextColumn("Net P&L %",     help="Net P&L as % of capital deployed (entry × qty)"),
-            "rr_realised":         st.column_config.TextColumn("R/R actual",    help="Actual gain ÷ actual risk"),
-            "slippage_entry_pct":  st.column_config.TextColumn("Entry slip %",  help="How far your entry was from the recommended entry"),
-            "kite_order_id":       st.column_config.TextColumn("Kite Order ID", help="Order ID from Zerodha Kite"),
-            "kite_status":         st.column_config.TextColumn("Kite Status",   help="Last known order status. Hit 'Sync from Kite' to refresh."),
-            "notes":               st.column_config.TextColumn("Notes",         width="large"),
-        },
-    )
+        df["charges"]     = df.apply(_charges_row, axis=1)
+        df["net_pnl"]     = df["pnl_amount"].fillna(0) - df["charges"]
+        df["net_pnl_pct"] = df.apply(
+            lambda r: (
+                float(r["net_pnl"]) / (float(r.get("actual_entry") or 0) * float(r.get("quantity") or 1)) * 100
+                if not _isna(r.get("actual_entry")) and not _isna(r.get("quantity"))
+                   and r.get("actual_entry") and r.get("quantity") else None
+            ), axis=1,
+        )
+        _no_pnl = df["pnl_amount"].isna() & (df["status"] != "OPEN")
+        df.loc[_no_pnl, ["charges", "net_pnl", "net_pnl_pct"]] = None
+        return df
 
-    # ── Close an open trade ────────────────────────────────────────────────
-    _open_trades = _log_df[_log_df["status"] == "OPEN"]
-    if not _open_trades.empty:
-        st.markdown("---")
-        st.subheader("📌 Close an open trade")
-        _cl_ids = _open_trades["id"].tolist()
-        _cl_labels = []
-        for _, r in _open_trades.iterrows():
-            _ae  = r.get("actual_entry")
-            _ae_str = f"₹{float(_ae):.2f}" if _ae and not pd.isna(_ae) else "entry pending"
-            _kid = r.get("kite_order_id")
-            _kid_str = f" · Kite#{_kid}" if _kid else ""
-            _cl_labels.append(f"#{r['id']} · {r['tradingsymbol']} ({r['setup_type']}) — {_ae_str}{_kid_str}")
-        _id_map = dict(zip(_cl_labels, _cl_ids))
-        _selected_label = st.selectbox("Select open trade to close", _cl_labels, key="close_trade_sel")
-        _selected_id    = _id_map.get(_selected_label)
-        if _selected_id:
-            _ct1, _ct2, _ct3 = st.columns(3)
-            _close_exit   = _ct1.number_input("Exit price ₹", min_value=0.01, value=0.01, step=0.05, format="%.2f", key="close_exit")
-            _close_status = _ct2.selectbox("Outcome", ["CLOSED", "TARGET_HIT", "STOPPED_OUT", "CANCELLED"], key="close_status")
-            _close_notes  = _ct3.text_input("Notes", key="close_notes")
-            if st.button("✅ Close Trade", type="primary", key="close_trade_btn"):
-                db.close_trade(_selected_id, float(_close_exit), _close_status, _close_notes or None)
-                st.success(f"Trade #{_selected_id} closed as {_close_status} at ₹{_close_exit:.2f}")
+    def _render_trade_table(df: pd.DataFrame, key_sfx: str) -> None:
+        """Render a styled trade dataframe."""
+        if df.empty:
+            return
+        _disp_cols = [
+            "status", "id", "logged_at", "tradingsymbol", "ltp",
+            "pnl_amount", "pnl_pct", "charges", "net_pnl", "net_pnl_pct",
+            "trade_type", "setup_type", "signal_type", "quantity",
+            "rec_entry", "actual_entry", "rec_stop", "rec_t1", "actual_exit",
+            "rr_realised", "slippage_entry_pct", "kite_order_id", "kite_status", "notes",
+        ]
+        _disp_cols = [c for c in _disp_cols if c in df.columns]
+        _show = df[_disp_cols].copy()
+        _fmt  = {k: v for k, v in _FMT_MAP.items() if k in _show.columns}
+        _styled = _show.style.format(_fmt, na_rep="—")
+        _pnl_s  = [c for c in ["pnl_amount","pnl_pct","net_pnl","net_pnl_pct","rr_realised"] if c in _show.columns]
+        _stat_s = ["status"] if "status" in _show.columns else []
+        if _pnl_s:  _styled = _styled.map(_pnl_color,         subset=_pnl_s)
+        if _stat_s: _styled = _styled.map(_status_badge_color, subset=_stat_s)
+        if "ltp" in _show.columns:
+            _styled = _styled.map(
+                lambda v: "color:#60a5fa;font-weight:600" if str(v) not in ("—","nan","") else "",
+                subset=["ltp"],
+            )
+        st.dataframe(
+            _styled,
+            use_container_width=True,
+            height=min(600, 60 + len(_show) * 38),
+            hide_index=True,
+            column_config=_TRADE_COL_CFG,
+        )
+
+    # ── TWO TABS ───────────────────────────────────────────────────────────
+    _act_tab, _arch_tab = st.tabs(["📊 Active — Today", "📁 Archive — Past Days"])
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ACTIVE TAB  — today's trades with live MTM
+    # ════════════════════════════════════════════════════════════════════════
+    with _act_tab:
+        # ── Filters ────────────────────────────────────────────────────────
+        _af1, _af2, _af3, _af4, _af5 = st.columns(5)
+        _a_flt_status = _af1.multiselect(
+            "Status", ["OPEN","CLOSED","TARGET_HIT","STOPPED_OUT","CANCELLED"],
+            default=[], placeholder="All statuses", key="act_flt_status",
+        )
+        _a_flt_setup = _af2.multiselect(
+            "Setup type", ["SWING","INTRADAY","SCALING"],
+            default=[], placeholder="All setups", key="act_flt_setup",
+        )
+        _a_flt_sym   = _af3.text_input("Symbol search", placeholder="e.g. RELIANCE", key="act_flt_sym")
+        _a_sort_by   = _af4.selectbox("Sort by", ["Newest first","Oldest first","P&L ↓","P&L ↑"], key="act_sort")
+        _a_flt_type  = _af5.selectbox("Trade type", ["All","Real only","Paper only"], key="act_flt_type")
+
+        _cur = _log_df_today.copy()
+        if _a_flt_status:
+            _cur = _cur[_cur["status"].isin(_a_flt_status)]
+        if _a_flt_setup:
+            _cur = _cur[_cur["setup_type"].isin(_a_flt_setup)]
+        if _a_flt_sym:
+            _cur = _cur[_cur["tradingsymbol"].str.contains(_a_flt_sym.strip(), case=False, na=False, regex=False)]
+        if _a_flt_type == "Paper only" and "is_paper_trade" in _cur.columns:
+            _cur = _cur[_cur["is_paper_trade"] == True]
+        elif _a_flt_type == "Real only" and "is_paper_trade" in _cur.columns:
+            _cur = _cur[(_cur["is_paper_trade"] != True) | _cur["is_paper_trade"].isna()]
+
+        _cur["_so"] = (_cur["status"] != "OPEN").astype(int)
+        if   _a_sort_by == "Oldest first": _cur = _cur.sort_values(["_so","logged_at"],   ascending=[True, True])
+        elif _a_sort_by == "P&L ↓":        _cur = _cur.sort_values(["_so","pnl_amount"],  ascending=[True, False], na_position="last")
+        elif _a_sort_by == "P&L ↑":        _cur = _cur.sort_values(["_so","pnl_amount"],  ascending=[True, True],  na_position="last")
+        else:                               _cur = _cur.sort_values(["_so","logged_at"],   ascending=[True, False])
+        _cur = _cur.drop(columns=["_so"])
+
+        st.caption(f"Showing {len(_cur)} trade(s) for today · auto-refreshes every 2 s")
+
+        if not _cur.empty:
+            _cur = _enrich_df(_cur, inject_mtm=True)
+            _render_trade_table(_cur, key_sfx="act")
+
+        # ── Close an open trade ────────────────────────────────────────────
+        _open_trades = _cur[_cur["status"] == "OPEN"] if not _cur.empty else pd.DataFrame()
+        if not _open_trades.empty:
+            st.markdown("---")
+            st.subheader("📌 Close an open trade")
+            _cl_labels = []
+            for _, r in _open_trades.iterrows():
+                _ae = r.get("actual_entry")
+                _ae_str = f"₹{float(_ae):.2f}" if _ae and not pd.isna(_ae) else "entry pending"
+                _kid = r.get("kite_order_id")
+                _cl_labels.append(
+                    f"#{r['id']} · {r['tradingsymbol']} ({r['setup_type']}) — {_ae_str}"
+                    + (f" · Kite#{_kid}" if _kid else "")
+                )
+            _id_map = dict(zip(_cl_labels, _open_trades["id"].tolist()))
+            _sel_lbl = st.selectbox("Select open trade to close", _cl_labels, key="close_trade_sel")
+            _sel_id  = _id_map.get(_sel_lbl)
+            if _sel_id:
+                _ct1, _ct2, _ct3 = st.columns(3)
+                _close_exit   = _ct1.number_input("Exit price ₹", min_value=0.01, value=0.01, step=0.05, format="%.2f", key="close_exit")
+                _close_status = _ct2.selectbox("Outcome", ["CLOSED","TARGET_HIT","STOPPED_OUT","CANCELLED"], key="close_status")
+                _close_notes  = _ct3.text_input("Notes", key="close_notes")
+                if st.button("✅ Close Trade", type="primary", key="close_trade_btn"):
+                    db.close_trade(_sel_id, float(_close_exit), _close_status, _close_notes or None)
+                    st.success(f"Trade #{_sel_id} closed as {_close_status} at ₹{_close_exit:.2f}")
+                    st.rerun()
+
+        # ── Delete a trade ─────────────────────────────────────────────────
+        with st.expander("🗑️ Delete a trade entry", expanded=False):
+            _del_id = st.number_input("Trade ID to delete", min_value=1, step=1, key="del_trade_id")
+            if st.button("Delete", type="secondary", key="del_trade_btn"):
+                db.delete_trade(int(_del_id))
+                st.success(f"Trade #{_del_id} deleted.")
                 st.rerun()
 
-    # ── Delete a trade ──────────────────────────────────────────────────────
-    with st.expander("🗑️ Delete a trade entry", expanded=False):
-        _del_id = st.number_input("Trade ID to delete", min_value=1, step=1, key="del_trade_id")
-        if st.button("Delete", type="secondary", key="del_trade_btn"):
-            db.delete_trade(int(_del_id))
-            st.success(f"Trade #{_del_id} deleted.")
-            st.rerun()
-
-    # ── Paper trade signal breakdown + algo thresholds ────────────────────
-    _paper_perf = db.get_paper_trade_perf(user_id=_uid, days=30)
-    _paper_long  = _paper_perf.get("BUY_ABOVE",  {})
-    _paper_short = _paper_perf.get("SELL_BELOW", {})
-    _pp_rows = []
-    for _sig_k, _sig_d in [("BUY_ABOVE (Long)", _paper_long),
-                            ("SELL_BELOW (Short)", _paper_short)]:
-        if _sig_d.get("total", 0) > 0:
-            _pp_rows.append({
-                "Signal":    _sig_k,
-                "Trades":    _sig_d["total"],
-                "Wins":      _sig_d["wins"],
-                "Losses":    _sig_d["losses"],
-                "Win Rate":  f"{_sig_d['win_rate']:.1f}%",
-                "Avg R/R":   f"{_sig_d['avg_rr']:.2f}×" if _sig_d.get("avg_rr") else "—",
-                "Avg P&L %": f"{_sig_d['avg_pnl_pct']:+.2f}%" if _sig_d.get("avg_pnl_pct") is not None else "—",
-            })
-    _cur_cfg = db.get_signal_config(user_id=_uid)
-    _cfg_html = (
-        f'<div style="background:#0f172a;border:1px solid #1e293b;border-radius:8px;'
-        f'padding:8px 16px;margin:6px 0;font-size:0.78rem;color:#94a3b8">'
-        f'⚙️ <b>Signal thresholds (tuned from paper):</b> &nbsp;'
-        f'RSI buy ≤ <b style="color:#f8fafc">{_cur_cfg["intraday_rsi_buy_max"]:.0f}</b> &nbsp;·&nbsp; '
-        f'RSI sell ≥ <b style="color:#f8fafc">{_cur_cfg["intraday_rsi_sell_min"]:.0f}</b> &nbsp;·&nbsp; '
-        f'Min R/R <b style="color:#f8fafc">{_cur_cfg["intraday_min_rr"]:.1f}×</b> &nbsp;·&nbsp; '
-        f'<span style="color:#64748b">Run <b>Full Rescan</b> or <b>Refresh Signals</b> to apply</span>'
-        f'</div>'
-    )
-    if _pp_rows:
-        with st.expander("📄 Paper trade breakdown by signal (30d)", expanded=False):
-            st.dataframe(pd.DataFrame(_pp_rows), hide_index=True, use_container_width=True)
+        # ── Current signal thresholds ──────────────────────────────────────
+        _cur_cfg = db.get_signal_config(user_id=_uid)
+        _cfg_html = (
+            f'<div style="background:#0f172a;border:1px solid #1e293b;border-radius:8px;'
+            f'padding:8px 16px;margin:6px 0;font-size:0.78rem;color:#94a3b8">'
+            f'⚙️ <b>Signal thresholds (tuned from paper):</b> &nbsp;'
+            f'RSI buy ≤ <b style="color:#f8fafc">{_cur_cfg["intraday_rsi_buy_max"]:.0f}</b> &nbsp;·&nbsp; '
+            f'RSI sell ≥ <b style="color:#f8fafc">{_cur_cfg["intraday_rsi_sell_min"]:.0f}</b> &nbsp;·&nbsp; '
+            f'Min R/R <b style="color:#f8fafc">{_cur_cfg["intraday_min_rr"]:.1f}×</b> &nbsp;·&nbsp; '
+            f'<span style="color:#64748b">Run <b>Full Rescan</b> or <b>Refresh Signals</b> to apply</span>'
+            f'</div>'
+        )
+        _paper_perf  = db.get_paper_trade_perf(user_id=_uid, days=30)
+        _paper_long  = _paper_perf.get("BUY_ABOVE",  {})
+        _paper_short = _paper_perf.get("SELL_BELOW", {})
+        _pp_rows = []
+        for _sig_k, _sig_d in [("BUY_ABOVE (Long)", _paper_long), ("SELL_BELOW (Short)", _paper_short)]:
+            if _sig_d.get("total", 0) > 0:
+                _pp_rows.append({
+                    "Signal":    _sig_k,
+                    "Trades":    _sig_d["total"],
+                    "Wins":      _sig_d["wins"],
+                    "Losses":    _sig_d["losses"],
+                    "Win Rate":  f"{_sig_d['win_rate']:.1f}%",
+                    "Avg R/R":   f"{_sig_d['avg_rr']:.2f}×" if _sig_d.get("avg_rr") else "—",
+                    "Avg P&L %": f"{_sig_d['avg_pnl_pct']:+.2f}%" if _sig_d.get("avg_pnl_pct") is not None else "—",
+                })
+        if _pp_rows:
+            with st.expander("📄 Paper trade breakdown by signal (30d)", expanded=False):
+                st.dataframe(pd.DataFrame(_pp_rows), hide_index=True, use_container_width=True)
+                st.markdown(_cfg_html, unsafe_allow_html=True)
+        else:
             st.markdown(_cfg_html, unsafe_allow_html=True)
-    else:
-        st.markdown(_cfg_html, unsafe_allow_html=True)
 
-    # ── Strategy Insights ──────────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("📊 Strategy Insights")
-    _closed = _log_df[_log_df["status"].isin(["CLOSED","TARGET_HIT","STOPPED_OUT"])]
-    if len(_closed) >= 3:
-        _ins1, _ins2, _ins3 = st.columns(3)
-        _wr_setup = (
-            _closed.groupby("setup_type")
-            .apply(lambda g: (g["pnl_amount"] > 0).mean() * 100, include_groups=False)
-            .reset_index(name="Win %")
-        )
-        _ins1.markdown("**Win rate by setup**")
-        _ins1.dataframe(_wr_setup, hide_index=True, use_container_width=True)
+    # ════════════════════════════════════════════════════════════════════════
+    # ARCHIVE TAB  — past days' completed trades + re-adjust button
+    # ════════════════════════════════════════════════════════════════════════
+    with _arch_tab:
+        _arch_hdr, _arch_btn_col = st.columns([3, 1])
+        with _arch_hdr:
+            st.caption(
+                "All completed trades from previous trading days. "
+                "Use **Re-adjust Algorithm** to evaluate gaps and tune signal thresholds "
+                "based on this archive."
+            )
+        with _arch_btn_col:
+            if st.button(
+                "🔬 Re-adjust Algorithm",
+                type="primary",
+                use_container_width=True,
+                help="Analyse archived paper trades and propose + apply algorithm improvements",
+                key="btn_readjust_algo",
+            ):
+                _show_algo_readjust_dialog(uid=_uid)
 
-        _avg_pnl = (
-            _closed.groupby("signal_type")["pnl_pct"]
-            .mean()
-            .reset_index(name="Avg P&L %")
-            .sort_values("Avg P&L %", ascending=False)
-        )
-        _ins2.markdown("**Avg P&L % by signal**")
-        _ins2.dataframe(_avg_pnl.style.format({"Avg P&L %": "{:+.2f}%"}), hide_index=True, use_container_width=True)
+        if _log_df_arch.empty:
+            st.info(
+                "No archived trades yet. "
+                "Completed trades from past days will appear here automatically.",
+                icon="📭",
+            )
+        else:
+            # ── Archive filters ────────────────────────────────────────────
+            _xf1, _xf2, _xf3, _xf4, _xf5 = st.columns(5)
+            _x_flt_status = _xf1.multiselect(
+                "Status", ["CLOSED","TARGET_HIT","STOPPED_OUT","CANCELLED"],
+                default=[], placeholder="All statuses", key="arch_flt_status",
+            )
+            _x_flt_setup = _xf2.multiselect(
+                "Setup type", ["SWING","INTRADAY","SCALING"],
+                default=[], placeholder="All setups", key="arch_flt_setup",
+            )
+            _x_flt_sym  = _xf3.text_input("Symbol search", placeholder="e.g. RELIANCE", key="arch_flt_sym")
+            _x_sort_by  = _xf4.selectbox("Sort by", ["Newest first","Oldest first","P&L ↓","P&L ↑"], key="arch_sort")
+            _x_flt_type = _xf5.selectbox("Trade type", ["All","Real only","Paper only"], key="arch_flt_type")
 
-        _slip = _closed["slippage_entry_pct"].dropna()
-        if not _slip.empty:
-            _ins3.markdown("**Entry slippage**")
-            _ins3.metric("Avg slippage", f"{_slip.mean():+.2f}%", help="How much you overpaid vs recommended entry on average")
-            _ins3.metric("Max slippage", f"{_slip.max():+.2f}%")
+            _xdf = _log_df_arch.copy()
+            if _x_flt_status:
+                _xdf = _xdf[_xdf["status"].isin(_x_flt_status)]
+            if _x_flt_setup:
+                _xdf = _xdf[_xdf["setup_type"].isin(_x_flt_setup)]
+            if _x_flt_sym:
+                _xdf = _xdf[_xdf["tradingsymbol"].str.contains(_x_flt_sym.strip(), case=False, na=False, regex=False)]
+            if _x_flt_type == "Paper only" and "is_paper_trade" in _xdf.columns:
+                _xdf = _xdf[_xdf["is_paper_trade"] == True]
+            elif _x_flt_type == "Real only" and "is_paper_trade" in _xdf.columns:
+                _xdf = _xdf[(_xdf["is_paper_trade"] != True) | _xdf["is_paper_trade"].isna()]
 
-        st.download_button(
-            "⬇️ Export full log as CSV",
-            data=_log_df.to_csv(index=False).encode(),
-            file_name=f"trade_log_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
-            mime="text/csv",
-            help="Download your full trade journal for offline analysis or model training.",
-        )
-    else:
-        st.info("Log at least 3 closed trades to see strategy insights.", icon="📊")
+            if   _x_sort_by == "Oldest first": _xdf = _xdf.sort_values("logged_at",  ascending=True)
+            elif _x_sort_by == "P&L ↓":        _xdf = _xdf.sort_values("pnl_amount", ascending=False, na_position="last")
+            elif _x_sort_by == "P&L ↑":        _xdf = _xdf.sort_values("pnl_amount", ascending=True,  na_position="last")
+            else:                               _xdf = _xdf.sort_values("logged_at",  ascending=False)
+
+            st.caption(f"Showing {len(_xdf)} archived trade(s) across all past days")
+
+            _xdf = _enrich_df(_xdf, inject_mtm=False)
+            _render_trade_table(_xdf, key_sfx="arch")
+
+            # ── Export archive ─────────────────────────────────────────────
+            st.download_button(
+                "⬇️ Export archive as CSV",
+                data=_log_df_arch.to_csv(index=False).encode(),
+                file_name=f"trade_archive_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+                key="arch_export_csv",
+            )
+
+            # ── Strategy Insights (archive) ────────────────────────────────
+            st.markdown("---")
+            st.subheader("📊 Strategy Insights (Archive)")
+            _closed = _xdf[_xdf["status"].isin(["CLOSED","TARGET_HIT","STOPPED_OUT"])]
+            if len(_closed) >= 3:
+                _ins1, _ins2, _ins3 = st.columns(3)
+                _wr_setup = (
+                    _closed.groupby("setup_type")
+                    .apply(lambda g: (g["pnl_amount"] > 0).mean() * 100, include_groups=False)
+                    .reset_index(name="Win %")
+                )
+                _ins1.markdown("**Win rate by setup**")
+                _ins1.dataframe(_wr_setup, hide_index=True, use_container_width=True)
+
+                _avg_pnl_arch = (
+                    _closed.groupby("signal_type")["pnl_pct"]
+                    .mean()
+                    .reset_index(name="Avg P&L %")
+                    .sort_values("Avg P&L %", ascending=False)
+                )
+                _ins2.markdown("**Avg P&L % by signal**")
+                _ins2.dataframe(
+                    _avg_pnl_arch.style.format({"Avg P&L %": "{:+.2f}%"}),
+                    hide_index=True, use_container_width=True,
+                )
+
+                _slip = _closed["slippage_entry_pct"].dropna() if "slippage_entry_pct" in _closed.columns else pd.Series(dtype=float)
+                if not _slip.empty:
+                    _ins3.markdown("**Entry slippage**")
+                    _ins3.metric("Avg slippage", f"{_slip.mean():+.2f}%")
+                    _ins3.metric("Max slippage", f"{_slip.max():+.2f}%")
+            else:
+                st.info("Need at least 3 closed archived trades to show strategy insights.", icon="📊")
 
 
 # ============================================================
