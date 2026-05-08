@@ -1355,12 +1355,12 @@ with tab_screener:
         styled = styled.map(_color_ai_score, subset=_ai_score_col)
 
     _screener_sym_q = st.text_input(
-        "🔍 Search symbol", placeholder="e.g. HDFCBANK, RELIANCE",
+        "🔍 Search symbol", placeholder="type to filter (e.g. HDFC, RELIANCE)…",
         key="screener_sym_search", label_visibility="collapsed",
     )
     if _screener_sym_q:
         _mask = filtered["tradingsymbol"].str.contains(
-            _screener_sym_q.strip().upper(), na=False
+            _screener_sym_q.strip(), case=False, na=False, regex=False
         )
         filtered = filtered[_mask]
         styled = (
@@ -3223,11 +3223,11 @@ def _intraday_long_live():
     st.caption("Watch for price to trade **above R1**. Enter with stop just below Pivot.")
 
     _long_sym_q = st.text_input(
-        "🔍 Search symbol", placeholder="e.g. RELIANCE", key="intra_long_sym_search",
-        label_visibility="collapsed",
+        "🔍 Search symbol", placeholder="type to filter…",
+        key="intra_long_sym_search", label_visibility="collapsed",
     )
     if _long_sym_q:
-        _si = _si[_si["tradingsymbol"].str.contains(_long_sym_q.strip().upper(), na=False)]
+        _si = _si[_si["tradingsymbol"].str.contains(_long_sym_q.strip(), case=False, na=False, regex=False)]
 
     _si_rows = []
     _paper_cap_per_trade = config.PAPER_CAPITAL // config.PAPER_MAX_POSITIONS
@@ -3505,11 +3505,11 @@ def _intraday_short_live():
         return
 
     _short_sym_q = st.text_input(
-        "🔍 Search symbol", placeholder="e.g. HDFCBANK", key="intra_short_sym_search",
-        label_visibility="collapsed",
+        "🔍 Search symbol", placeholder="type to filter…",
+        key="intra_short_sym_search", label_visibility="collapsed",
     )
     if _short_sym_q:
-        _ss = _ss[_ss["tradingsymbol"].str.contains(_short_sym_q.strip().upper(), na=False)]
+        _ss = _ss[_ss["tradingsymbol"].str.contains(_short_sym_q.strip(), case=False, na=False, regex=False)]
 
     st.caption(
         "Watch for price to break **below S1**. "
@@ -3764,6 +3764,224 @@ def _intraday_short_live():
     _render_order_panel(_ss_log, setup_type="INTRADAY", form_key="intra_short")
 
 
+# ── EMA-dist colour helper (used by Exit/Sell fragment) ──────────────────────
+def _dist_color(val):
+    return "color:#f59e0b" if str(val).startswith("+") else "color:#94a3b8"
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Per-tab fragments — each one re-runs only when its own search input changes,
+# so filtering is truly real-time without triggering a full-page rerun.
+# ────────────────────────────────────────────────────────────────────────────
+
+@st.fragment
+def _swing_buy_tab_content():
+    base_df = st.session_state.get("_signals_base_df", pd.DataFrame())
+    if base_df.empty:
+        return
+    df_live = base_df.copy()
+    for _sym, _price in st.session_state.get("_live_ltp", {}).items():
+        df_live.loc[df_live["tradingsymbol"] == _sym, "ltp"] = _price
+
+    _sb = (
+        df_live[df_live["swing_signal"] == "BUY"]
+        .sort_values(["swing_quality", "composite_score"], ascending=False)
+        .reset_index(drop=True)
+    )
+    if _sb.empty:
+        st.info("No swing buy setups detected in the current universe.")
+        return
+    st.caption(
+        "**How to use:** Place a limit/SL-M order at the Entry price. "
+        "Set a hard stop-loss at Stop. Book 50% at T1, let the rest run to T2 "
+        "with a trailing stop. Minimum R/R to consider: 1.5×."
+    )
+    _swing_sym_q = st.text_input(
+        "🔍 Search symbol", placeholder="type to filter...",
+        key="swing_buy_sym_search", label_visibility="collapsed",
+    )
+    if _swing_sym_q:
+        _sb = _sb[_sb["tradingsymbol"].str.contains(
+            _swing_sym_q.strip(), case=False, na=False, regex=False)]
+    _sb_rows = []
+    for _, r in _sb.iterrows():
+        _sb_rows.append([
+            r.get("tradingsymbol", ""), r.get("company_name", ""),
+            r.get("swing_setup", ""),
+            _fmt(r.get("ltp"),         "₹{:,.2f}"),
+            _gain_pct(r.get("swing_entry"), r.get("swing_t1")),
+            _risk_pct(r.get("swing_entry"), r.get("swing_stop")),
+            _fmt(r.get("swing_entry"),  "₹{:,.2f}"),
+            _fmt(r.get("swing_stop"),   "₹{:,.2f}"),
+            _fmt(r.get("swing_t1"),     "₹{:,.2f}"),
+            _fmt(r.get("swing_t2"),     "₹{:,.2f}"),
+            _fmt(r.get("swing_rr"),     "{:.2f}×"),
+            _stars(r.get("swing_quality")),
+            str(r.get("swing_reason", ""))[:120],
+        ])
+    _sb_df = pd.DataFrame(_sb_rows, columns=[
+        "Symbol", "Company", "Setup", "LTP",
+        "Gain %", "Risk %", "Entry", "Stop", "T1", "T2", "R/R", "Quality", "Reason",
+    ])
+    st.dataframe(
+        _sb_df.style.map(_gain_color, subset=["Gain %"]).map(_risk_color, subset=["Risk %"]),
+        use_container_width=True, height=min(400, 50 + len(_sb_rows) * 38), hide_index=True,
+        column_config={
+            "Setup":   st.column_config.TextColumn("Setup",   help="PULLBACK = retracement to EMA20 | BREAKOUT = 20D high break | NR7 = narrowest range coil"),
+            "Gain %":  st.column_config.TextColumn("Gain %",  help="Upside to T1 from entry price. Swing trades typically target 5–15%."),
+            "Risk %":  st.column_config.TextColumn("Risk %",  help="Downside from entry to hard stop-loss. Ideal risk per trade: 2–4%."),
+            "Entry":   st.column_config.TextColumn("Entry",   help="Suggested entry price. For NR7 this is a buy-stop order above today's high."),
+            "Stop":    st.column_config.TextColumn("Stop",    help="Hard stop-loss. Exit the full position if price closes below this level."),
+            "T1":      st.column_config.TextColumn("T1",      help="First target = Entry + 2×ATR. Book 50% here."),
+            "T2":      st.column_config.TextColumn("T2",      help="Second target = Entry + 4×ATR. Trail stop on the remaining 50%."),
+            "R/R":     st.column_config.TextColumn("R/R",     help="Risk/Reward ratio at T1. Minimum 1.5× recommended."),
+            "Quality": st.column_config.TextColumn("Quality", help="★★★★★ = best (full EMA stack + ADX confirmed + strong volume)"),
+        },
+    )
+    _render_order_panel(_sb, setup_type="SWING", form_key="sw_buy")
+
+
+@st.fragment
+def _exit_sell_tab_content():
+    base_df = st.session_state.get("_signals_base_df", pd.DataFrame())
+    if base_df.empty:
+        return
+    df_live = base_df.copy()
+    for _sym, _price in st.session_state.get("_live_ltp", {}).items():
+        df_live.loc[df_live["tradingsymbol"] == _sym, "ltp"] = _price
+
+    _se = (
+        df_live[df_live["swing_signal"] == "SELL"]
+        .sort_values("composite_score", ascending=True)
+        .reset_index(drop=True)
+    )
+    if _se.empty:
+        st.info("No exit signals currently. All trend structures intact.")
+        return
+    st.caption(
+        "**How to use:** These are stocks where the uptrend structure has broken or "
+        "the stock is severely overbought. If you hold any of these, review your position."
+    )
+    _exit_sym_q = st.text_input(
+        "🔍 Search symbol", placeholder="type to filter...",
+        key="exit_sym_search", label_visibility="collapsed",
+    )
+    if _exit_sym_q:
+        _se = _se[_se["tradingsymbol"].str.contains(
+            _exit_sym_q.strip(), case=False, na=False, regex=False)]
+    _se_rows = []
+    for _, r in _se.iterrows():
+        ltp_v = r.get("ltp") or 0
+        ema_v = r.get("ema_20") or 0
+        try:
+            dist_ema = f"+{(ltp_v - ema_v) / ema_v * 100:.1f}%" if ema_v > 0 else "—"
+        except Exception:
+            dist_ema = "—"
+        _se_rows.append([
+            r.get("tradingsymbol", ""), r.get("company_name", ""),
+            _fmt(ltp_v, "₹{:,.2f}"), _fmt(ema_v, "₹{:,.2f}"),
+            dist_ema, _fmt(r.get("rsi_14"), "{:.1f}"),
+            str(r.get("swing_reason", "")),
+        ])
+    _se_df = pd.DataFrame(_se_rows, columns=[
+        "Symbol", "Company", "LTP", "EMA20", "EMA20 Dist", "RSI", "Exit Reason",
+    ])
+    st.dataframe(
+        _se_df.style.map(_dist_color, subset=["EMA20 Dist"]),
+        use_container_width=True, height=min(400, 50 + len(_se_rows) * 38), hide_index=True,
+        column_config={
+            "EMA20 Dist": st.column_config.TextColumn("EMA20 Dist", help=(
+                "How far LTP is above EMA20. A large positive value (+10%+) means the stock is "
+                "stretched and likely to mean-revert — this is what triggers the SELL signal.")),
+            "RSI": st.column_config.TextColumn("RSI", help=(
+                "RSI > 70 = overbought. RSI > 80 = strongly overbought. "
+                "Combined with a high EMA20 Dist, this confirms an exit is warranted.")),
+        },
+    )
+    _se_log = _se.assign(
+        rec_entry=_se.get("swing_entry"), rec_stop=_se.get("swing_stop"),
+        rec_t1=_se.get("swing_t1"),       rec_t2=_se.get("swing_t2"),
+        rec_rr=_se.get("swing_rr"),       rec_reason=_se.get("swing_reason"),
+        signal_type=_se.get("swing_signal"),
+    ) if not _se.empty else _se
+    _render_order_panel(_se_log, setup_type="SWING", form_key="sw_exit")
+
+
+@st.fragment
+def _scaling_tab_content():
+    base_df = st.session_state.get("_signals_base_df", pd.DataFrame())
+    if base_df.empty:
+        return
+    df_live = base_df.copy()
+    for _sym, _price in st.session_state.get("_live_ltp", {}).items():
+        df_live.loc[df_live["tradingsymbol"] == _sym, "ltp"] = _price
+
+    _ssc = (
+        df_live[df_live["scale_signal"] == "INITIAL_ENTRY"]
+        .sort_values(["scale_quality", "composite_score"], ascending=False)
+        .reset_index(drop=True)
+    )
+    if _ssc.empty:
+        st.info("No scaling entry setups. Stocks need full EMA stack + EMA50 pullback + positive RS.")
+        return
+    st.caption(
+        "**How to use:** Deploy **40% of intended position** at Entry 1 (EMA50 pullback). "
+        "Add **30% more** when price breaks above the 20-day high. "
+        "Add the final **30%** on a new 52W high with volume. "
+        "Trailing stop: close below EMA50 on any day."
+    )
+    _scale_sym_q = st.text_input(
+        "🔍 Search symbol", placeholder="type to filter...",
+        key="scaling_sym_search", label_visibility="collapsed",
+    )
+    if _scale_sym_q:
+        _ssc = _ssc[_ssc["tradingsymbol"].str.contains(
+            _scale_sym_q.strip(), case=False, na=False, regex=False)]
+    _ssc_rows = []
+    for _, r in _ssc.iterrows():
+        _ssc_rows.append([
+            r.get("tradingsymbol", ""), r.get("company_name", ""),
+            _fmt(r.get("ltp"),                 "₹{:,.2f}"),
+            _gain_pct(r.get("scale_entry_1"), r.get("scale_target")),
+            _risk_pct(r.get("scale_entry_1"), r.get("scale_stop")),
+            _fmt(r.get("scale_entry_1"),       "₹{:,.2f}"),
+            _fmt(r.get("scale_stop"),          "₹{:,.2f}"),
+            _fmt(r.get("scale_trailing_stop"), "₹{:,.2f}"),
+            _fmt(r.get("scale_target"),        "₹{:,.2f}"),
+            _fmt(r.get("ret_6m"),              "{:+.1f}%"),
+            _fmt(r.get("rs_vs_nifty_3m"),      "{:+.1f}%"),
+            _stars(r.get("scale_quality")),
+            str(r.get("scale_reason", ""))[:120],
+        ])
+    _ssc_df = pd.DataFrame(_ssc_rows, columns=[
+        "Symbol", "Company", "LTP",
+        "Gain %", "Risk %",
+        "Entry 1 (40%)", "Hard Stop", "Trail Stop (EMA50)",
+        "Target (+18%)", "6M Return", "RS vs Nifty",
+        "Quality", "Reason",
+    ])
+    st.dataframe(
+        _ssc_df.style.map(_gain_color, subset=["Gain %"]).map(_risk_color, subset=["Risk %"]),
+        use_container_width=True, height=min(450, 50 + len(_ssc_rows) * 38), hide_index=True,
+        column_config={
+            "Gain %":             st.column_config.TextColumn("Gain %",     help="Upside from Entry 1 to the 18% target. Scaling trades typically run 15–25%."),
+            "Risk %":             st.column_config.TextColumn("Risk %",     help="Downside from Entry 1 to hard stop. Acceptable for a position you intend to scale into."),
+            "Entry 1 (40%)":      st.column_config.TextColumn("Entry 1",    help="0.5% above EMA50 — confirms EMA50 held as support. Deploy 40% of position here."),
+            "Hard Stop":          st.column_config.TextColumn("Hard Stop",  help="1.5×ATR below EMA50. Full exit if price closes below this."),
+            "Trail Stop (EMA50)": st.column_config.TextColumn("Trail Stop", help="Move this stop up every week as EMA50 rises. Exit if day close is below EMA50."),
+            "Target (+18%)":      st.column_config.TextColumn("Target",     help="18% measured-move from Entry 1. Take 25–50% off here and trail the rest."),
+            "Quality":            st.column_config.TextColumn("Quality",    help="★★★★★ = best. Requires full EMA stack + positive RS + strong 6M return."),
+        },
+    )
+    _ssc_log = _ssc.assign(
+        rec_entry=_ssc.get("scale_entry_1"), rec_stop=_ssc.get("scale_stop"),
+        rec_t1=_ssc.get("scale_target"),     rec_t2=None,
+        rec_rr=None,                          rec_reason=_ssc.get("scale_reason"),
+        signal_type=_ssc.get("scale_signal"),
+    ) if not _ssc.empty else _ssc
+    _render_order_panel(_ssc_log, setup_type="SCALING", form_key="scaling")
+
+
 # ── STABLE signal tables (no fragment — tabs never re-create themselves) ──────
 def _signals_main():
     """
@@ -3796,147 +4014,11 @@ def _signals_main():
 
     # ── SWING BUY ─────────────────────────────────────────────────
     with _sig_t1:
-        _sb = (
-            df_live[df_live["swing_signal"] == "BUY"]
-            .sort_values(["swing_quality", "composite_score"], ascending=False)
-            .reset_index(drop=True)
-        )
-        if _sb.empty:
-            st.info("No swing buy setups detected in the current universe.")
-        else:
-            st.caption(
-                "**How to use:** Place a limit/SL-M order at the Entry price. "
-                "Set a hard stop-loss at Stop. Book 50% at T1, let the rest run to T2 "
-                "with a trailing stop. Minimum R/R to consider: 1.5×."
-            )
-            _swing_sym_q = st.text_input(
-                "🔍 Search symbol", placeholder="e.g. INFY", key="swing_buy_sym_search",
-                label_visibility="collapsed",
-            )
-            if _swing_sym_q:
-                _sb = _sb[_sb["tradingsymbol"].str.contains(_swing_sym_q.strip().upper(), na=False)]
-            _sb_rows = []
-            for _, r in _sb.iterrows():
-                _sb_rows.append([
-                    r.get("tradingsymbol", ""),
-                    r.get("company_name", ""),
-                    r.get("swing_setup", ""),
-                    _fmt(r.get("ltp"),         "₹{:,.2f}"),
-                    _gain_pct(r.get("swing_entry"), r.get("swing_t1")),
-                    _risk_pct(r.get("swing_entry"), r.get("swing_stop")),
-                    _fmt(r.get("swing_entry"),  "₹{:,.2f}"),
-                    _fmt(r.get("swing_stop"),   "₹{:,.2f}"),
-                    _fmt(r.get("swing_t1"),     "₹{:,.2f}"),
-                    _fmt(r.get("swing_t2"),     "₹{:,.2f}"),
-                    _fmt(r.get("swing_rr"),     "{:.2f}×"),
-                    _stars(r.get("swing_quality")),
-                    str(r.get("swing_reason", ""))[:120],
-                ])
-            _sb_df = pd.DataFrame(_sb_rows, columns=[
-                "Symbol", "Company", "Setup", "LTP",
-                "Gain %", "Risk %",
-                "Entry", "Stop", "T1", "T2", "R/R", "Quality", "Reason",
-            ])
-            st.dataframe(
-                _sb_df.style
-                    .map(_gain_color, subset=["Gain %"])
-                    .map(_risk_color, subset=["Risk %"]),
-                use_container_width=True,
-                height=min(400, 50 + len(_sb_rows) * 38),
-                hide_index=True,
-                column_config={
-                    "Setup":   st.column_config.TextColumn("Setup",   help="PULLBACK = retracement to EMA20 | BREAKOUT = 20D high break | NR7 = narrowest range coil"),
-                    "Gain %":  st.column_config.TextColumn("Gain %",  help="Upside to T1 from entry price. Swing trades typically target 5–15%."),
-                    "Risk %":  st.column_config.TextColumn("Risk %",  help="Downside from entry to hard stop-loss. Ideal risk per trade: 2–4%."),
-                    "Entry":   st.column_config.TextColumn("Entry",   help="Suggested entry price. For NR7 this is a buy-stop order above today's high."),
-                    "Stop":    st.column_config.TextColumn("Stop",    help="Hard stop-loss. Exit the full position if price closes below this level."),
-                    "T1":      st.column_config.TextColumn("T1",      help="First target = Entry + 2×ATR. Book 50% here."),
-                    "T2":      st.column_config.TextColumn("T2",      help="Second target = Entry + 4×ATR. Trail stop on the remaining 50%."),
-                    "R/R":     st.column_config.TextColumn("R/R",     help="Risk/Reward ratio at T1. Minimum 1.5× recommended."),
-                    "Quality": st.column_config.TextColumn("Quality", help="★★★★★ = best (full EMA stack + ADX confirmed + strong volume)"),
-                },
-            )
-            _render_order_panel(_sb, setup_type="SWING", form_key="sw_buy")
+        _swing_buy_tab_content()   # fragment: live search, reruns only on input change
 
     # ── EXIT / SELL ───────────────────────────────────────────────
     with _sig_t2:
-        _se = (
-            df_live[df_live["swing_signal"] == "SELL"]
-            .sort_values("composite_score", ascending=True)
-            .reset_index(drop=True)
-        )
-        if _se.empty:
-            st.info("No exit signals currently. All trend structures intact.")
-        else:
-            st.caption(
-                "**How to use:** These are stocks where the uptrend structure has broken or "
-                "the stock is severely overbought. If you hold any of these, review your position."
-            )
-            _exit_sym_q = st.text_input(
-                "🔍 Search symbol", placeholder="e.g. TATASTEEL", key="exit_sym_search",
-                label_visibility="collapsed",
-            )
-            if _exit_sym_q:
-                _se = _se[_se["tradingsymbol"].str.contains(_exit_sym_q.strip().upper(), na=False)]
-            _se_rows = []
-            for _, r in _se.iterrows():
-                ltp_v  = r.get("ltp")    or 0
-                ema_v  = r.get("ema_20") or 0
-                # Dist above EMA20: positive = price stretched above EMA20 (overbought signal)
-                try:
-                    dist_ema = f"+{(ltp_v - ema_v) / ema_v * 100:.1f}%" if ema_v > 0 else "—"
-                except Exception:
-                    dist_ema = "—"
-                _se_rows.append([
-                    r.get("tradingsymbol", ""),
-                    r.get("company_name", ""),
-                    _fmt(ltp_v,  "₹{:,.2f}"),
-                    _fmt(ema_v,  "₹{:,.2f}"),
-                    dist_ema,
-                    _fmt(r.get("rsi_14"), "{:.1f}"),
-                    str(r.get("swing_reason", "")),
-                ])
-
-            def _dist_color(val):
-                v = str(val)
-                if v.startswith("+"):
-                    return "color: #f59e0b"   # amber: stretched above EMA — bearish
-                return "color: #94a3b8"
-
-            _se_df = pd.DataFrame(_se_rows, columns=[
-                "Symbol", "Company", "LTP", "EMA20", "EMA20 Dist", "RSI", "Exit Reason",
-            ])
-            st.dataframe(
-                _se_df.style.map(_dist_color, subset=["EMA20 Dist"]),
-                use_container_width=True,
-                height=min(400, 50 + len(_se_rows) * 38),
-                hide_index=True,
-                column_config={
-                    "EMA20 Dist": st.column_config.TextColumn(
-                        "EMA20 Dist",
-                        help="How far LTP is above EMA20. "
-                             "A large positive value (+10%+) means the stock is stretched "
-                             "and likely to mean-revert — this is what triggers the SELL signal. "
-                             "The larger this number, the more urgently you should consider exiting.",
-                    ),
-                    "RSI": st.column_config.TextColumn(
-                        "RSI",
-                        help="RSI > 70 = overbought. RSI > 80 = strongly overbought. "
-                             "Combined with a high EMA20 Dist, this confirms an exit is warranted.",
-                    ),
-                },
-            )
-            # Enrich _se with field aliases so form pre-fills correctly
-            _se_log = _se.assign(
-                rec_entry=_se.get("swing_entry"),
-                rec_stop=_se.get("swing_stop"),
-                rec_t1=_se.get("swing_t1"),
-                rec_t2=_se.get("swing_t2"),
-                rec_rr=_se.get("swing_rr"),
-                rec_reason=_se.get("swing_reason"),
-                signal_type=_se.get("swing_signal"),
-            ) if not _se.empty else _se
-            _render_order_panel(_se_log, setup_type="SWING", form_key="sw_exit")
+        _exit_sell_tab_content()   # fragment: live search
 
     # ── INTRADAY PLAN ─────────────────────────────────────────────
     with _sig_t3:
@@ -3964,77 +4046,7 @@ def _signals_main():
 
     # ── SCALING ───────────────────────────────────────────────────
     with _sig_t4:
-        _ssc = (
-            df_live[df_live["scale_signal"] == "INITIAL_ENTRY"]
-            .sort_values(["scale_quality", "composite_score"], ascending=False)
-            .reset_index(drop=True)
-        )
-        if _ssc.empty:
-            st.info("No scaling entry setups. Stocks need full EMA stack + EMA50 pullback + positive RS.")
-        else:
-            st.caption(
-                "**How to use:** Deploy **40% of intended position** at Entry 1 (EMA50 pullback). "
-                "Add **30% more** when price breaks above the 20-day high. "
-                "Add the final **30%** on a new 52W high with volume. "
-                "Trailing stop: close below EMA50 on any day."
-            )
-            _scale_sym_q = st.text_input(
-                "🔍 Search symbol", placeholder="e.g. WIPRO", key="scaling_sym_search",
-                label_visibility="collapsed",
-            )
-            if _scale_sym_q:
-                _ssc = _ssc[_ssc["tradingsymbol"].str.contains(_scale_sym_q.strip().upper(), na=False)]
-            _ssc_rows = []
-            for _, r in _ssc.iterrows():
-                _ssc_rows.append([
-                    r.get("tradingsymbol", ""),
-                    r.get("company_name", ""),
-                    _fmt(r.get("ltp"),                  "₹{:,.2f}"),
-                    _gain_pct(r.get("scale_entry_1"), r.get("scale_target")),
-                    _risk_pct(r.get("scale_entry_1"), r.get("scale_stop")),
-                    _fmt(r.get("scale_entry_1"),        "₹{:,.2f}"),
-                    _fmt(r.get("scale_stop"),           "₹{:,.2f}"),
-                    _fmt(r.get("scale_trailing_stop"),  "₹{:,.2f}"),
-                    _fmt(r.get("scale_target"),         "₹{:,.2f}"),
-                    _fmt(r.get("ret_6m"),               "{:+.1f}%"),
-                    _fmt(r.get("rs_vs_nifty_3m"),       "{:+.1f}%"),
-                    _stars(r.get("scale_quality")),
-                    str(r.get("scale_reason", ""))[:120],
-                ])
-            _ssc_df = pd.DataFrame(_ssc_rows, columns=[
-                "Symbol", "Company", "LTP",
-                "Gain %", "Risk %",
-                "Entry 1 (40%)", "Hard Stop", "Trail Stop (EMA50)",
-                "Target (+18%)", "6M Return", "RS vs Nifty",
-                "Quality", "Reason",
-            ])
-            st.dataframe(
-                _ssc_df.style
-                    .map(_gain_color, subset=["Gain %"])
-                    .map(_risk_color, subset=["Risk %"]),
-                use_container_width=True,
-                height=min(450, 50 + len(_ssc_rows) * 38),
-                hide_index=True,
-                column_config={
-                    "Gain %":             st.column_config.TextColumn("Gain %",     help="Upside from Entry 1 to the 18% target. Scaling trades typically run 15–25%."),
-                    "Risk %":             st.column_config.TextColumn("Risk %",     help="Downside from Entry 1 to hard stop. Acceptable for a position you intend to scale into."),
-                    "Entry 1 (40%)":      st.column_config.TextColumn("Entry 1",    help="0.5% above EMA50 — confirms EMA50 held as support. Deploy 40% of position here."),
-                    "Hard Stop":          st.column_config.TextColumn("Hard Stop",  help="1.5×ATR below EMA50. Full exit if price closes below this."),
-                    "Trail Stop (EMA50)": st.column_config.TextColumn("Trail Stop", help="Move this stop up every week as EMA50 rises. Exit if day close is below EMA50."),
-                    "Target (+18%)":      st.column_config.TextColumn("Target",     help="18% measured-move from Entry 1. Take 25–50% off here and trail the rest."),
-                    "Quality":            st.column_config.TextColumn("Quality",    help="★★★★★ = best. Requires full EMA stack + positive RS + strong 6M return."),
-                },
-            )
-            _ssc_log = _ssc.assign(
-                rec_entry=_ssc.get("scale_entry_1"),
-                rec_stop=_ssc.get("scale_stop"),
-                rec_t1=_ssc.get("scale_target"),
-                rec_t2=None,
-                rec_rr=None,
-                rec_reason=_ssc.get("scale_reason"),
-                signal_type=_ssc.get("scale_signal"),
-            ) if not _ssc.empty else _ssc
-            _render_order_panel(_ssc_log, setup_type="SCALING", form_key="scaling")
+        _scaling_tab_content()     # fragment: live search
 
 
 with tab_signals:
@@ -4253,7 +4265,7 @@ def _activity_log_live():
     if _filter_setup:
         _log_df = _log_df[_log_df["setup_type"].isin(_filter_setup)]
     if _filter_sym:
-        _log_df = _log_df[_log_df["tradingsymbol"].str.contains(_filter_sym.upper(), na=False)]
+        _log_df = _log_df[_log_df["tradingsymbol"].str.contains(_filter_sym.strip(), case=False, na=False, regex=False)]
     if _filter_trade_type == "Paper only" and "is_paper_trade" in _log_df.columns:
         _log_df = _log_df[_log_df["is_paper_trade"] == True]
     elif _filter_trade_type == "Real only" and "is_paper_trade" in _log_df.columns:
