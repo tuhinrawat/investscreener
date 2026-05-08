@@ -3724,9 +3724,12 @@ def _activity_log_live():
     """Auto-refreshes every 2 s: summary pills, trade table, paper performance."""
     _uid = st.session_state.get("kite_user_id", "")
 
-    # ── Summary stat pills ──────────────────────────────────────────────────
-    _stats = db.get_trade_stats(user_id=_uid)
-    if _stats.get("total", 0) == 0:
+    # ── Summary banners: Paper | Real ──────────────────────────────────────
+    _stats_paper = db.get_trade_stats(user_id=_uid, is_paper=True)
+    _stats_real  = db.get_trade_stats(user_id=_uid, is_paper=False)
+    _stats_all   = db.get_trade_stats(user_id=_uid)
+
+    if _stats_all.get("total", 0) == 0:
         st.info(
             "No trades yet. Go to **🎯 Trade Signals** tab and click "
             "**🚀 Place Order via Kite** (or **📝 Log a trade** if not connected) below any signal table.",
@@ -3734,20 +3737,76 @@ def _activity_log_live():
         )
         return
 
-    _s1, _s2, _s3, _s4, _s5, _s6 = st.columns(6)
-    _s1.metric("Total trades",   _stats["total"])
-    _s2.metric("Open",           _stats["open"])
-    _s3.metric("Win rate",
-               f"{_stats['win_rate']:.1f}%" if _stats["closed"] > 0 else "—",
-               help="% of closed trades with positive P&L")
-    _s4.metric("Total P&L",
-               f"₹{_stats['total_pnl']:+,.2f}",
-               delta=f"{'▲' if _stats['total_pnl'] >= 0 else '▼'} overall")
-    _s5.metric("Best trade",
-               f"₹{_stats['best_trade']:+,.2f}" if _stats["best_trade"] else "—")
-    _s6.metric("Avg R/R realised",
-               f"{_stats['avg_rr']:.2f}×" if _stats["avg_rr"] else "—",
-               help="Actual gain/risk ratio achieved across closed trades")
+    def _stat_banner(label: str, icon: str, s: dict, accent: str, extra_html: str = "") -> str:
+        """Build a compact dark banner for one category of trades."""
+        if not s or s.get("total", 0) == 0:
+            return (
+                f'<div style="background:#0f172a;border:1px solid #334155;border-radius:8px;'
+                f'padding:10px 18px;flex:1;min-width:280px">'
+                f'<span style="font-size:0.78rem;color:#64748b;font-weight:600;'
+                f'text-transform:uppercase">{icon} {label}</span>'
+                f'<span style="color:#475569;font-size:0.8rem;margin-left:16px">No trades yet</span>'
+                f'</div>'
+            )
+        _pnl     = s["total_pnl"]
+        _pnl_c   = "#22c55e" if _pnl >= 0 else "#ef4444"
+        _wr      = f"{s['win_rate']:.1f}%" if s["closed"] > 0 else "—"
+        _rr      = f"{s['avg_rr']:.2f}×" if s.get("avg_rr") else "—"
+        _best    = f"₹{s['best_trade']:+,.0f}" if s.get("best_trade") else "—"
+        return (
+            f'<div style="background:#0f172a;border:1px solid #334155;border-radius:8px;'
+            f'padding:10px 18px;flex:1;min-width:280px;display:flex;flex-wrap:wrap;gap:16px;align-items:center">'
+            f'<span style="font-size:0.78rem;color:{accent};font-weight:700;'
+            f'text-transform:uppercase;white-space:nowrap">{icon} {label}</span>'
+            f'<span style="font-size:0.8rem;color:#94a3b8">Trades '
+            f'<b style="color:#f8fafc">{s["total"]}</b></span>'
+            f'<span style="font-size:0.8rem;color:#94a3b8">Open '
+            f'<b style="color:#f59e0b">{s["open"]}</b></span>'
+            f'<span style="font-size:0.8rem;color:#94a3b8">Win rate '
+            f'<b style="color:#f8fafc">{_wr}</b></span>'
+            f'<span style="font-size:0.8rem;color:#94a3b8">Total P&amp;L '
+            f'<b style="color:{_pnl_c}">₹{_pnl:+,.0f}</b></span>'
+            f'<span style="font-size:0.8rem;color:#94a3b8">Best '
+            f'<b style="color:#f8fafc">{_best}</b></span>'
+            f'<span style="font-size:0.8rem;color:#94a3b8">Avg R/R '
+            f'<b style="color:#f8fafc">{_rr}</b></span>'
+            f'{extra_html}'
+            f'</div>'
+        )
+
+    # Extra info on the paper banner: today's gate status
+    _p_today_pnl = 0.0
+    try:
+        _p_today_pnl = db.get_today_closed_pnl(user_id=_uid, is_paper=True)
+    except Exception:
+        pass
+    _p_today_ret   = (_p_today_pnl / config.PAPER_CAPITAL * 100) if config.PAPER_CAPITAL else 0.0
+    _p_hwm         = st.session_state.get("paper_day_hwm_pct", 0.0)
+    _p_cutoff      = (_p_hwm - config.DAILY_TRAIL_PCT) if _p_hwm >= config.DAILY_TARGET_LOW_PCT else None
+    _p_blocked_now = st.session_state.get("paper_day_blocked", False)
+    if _p_blocked_now:
+        _paper_extra = (
+            f'<span style="font-size:0.73rem;color:#ef4444;font-weight:600">'
+            f'🚫 Gate closed · Today: {_p_today_ret:+.2f}%</span>'
+        )
+    elif _p_cutoff is not None:
+        _paper_extra = (
+            f'<span style="font-size:0.73rem;color:#f59e0b">'
+            f'⚡ Today: {_p_today_ret:+.2f}% · Cutoff: {_p_cutoff:.2f}%</span>'
+        )
+    else:
+        _paper_extra = (
+            f'<span style="font-size:0.73rem;color:#64748b">'
+            f'Today: {_p_today_ret:+.2f}% · Target ≥{config.DAILY_TARGET_LOW_PCT:.0f}%</span>'
+        )
+
+    st.markdown(
+        f'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:6px">'
+        + _stat_banner("Paper Trades", "📄", _stats_paper, "#94a3b8", _paper_extra)
+        + _stat_banner("Real Trades",  "💸", _stats_real,  "#22c55e")
+        + f'</div>',
+        unsafe_allow_html=True,
+    )
 
     st.markdown("---")
 
@@ -3933,61 +3992,40 @@ def _activity_log_live():
             st.success(f"Trade #{_del_id} deleted.")
             st.rerun()
 
-    # ── Paper Trade Performance ────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("📄 Paper Trade Performance")
-    _paper_perf    = db.get_paper_trade_perf(user_id=_uid, days=30)
-    _paper_overall = _paper_perf.get("overall", {})
-    _paper_long    = _paper_perf.get("BUY_ABOVE",  {})
-    _paper_short   = _paper_perf.get("SELL_BELOW", {})
-    if _paper_overall.get("total", 0) == 0:
-        st.info(
-            "No closed paper trades yet. Paper trades are auto-created when an "
-            "intraday signal reaches TRIGGERED status during market hours.",
-            icon="📄",
-        )
-    else:
-        _pp1, _pp2, _pp3, _pp4 = st.columns(4)
-        _pp1.metric("Total paper trades", _paper_overall["total"])
-        _pp2.metric("Win rate (30d)", f"{_paper_overall['win_rate']:.1f}%",
-                    help="% of closed paper trades that hit T1")
-        _pp3.metric("Avg R/R achieved",
-                    f"{_paper_overall['avg_rr']:.2f}×" if _paper_overall.get("avg_rr") else "—",
-                    help="Actual risk/reward ratio across closed paper trades")
-        _sig_cfg_disp = db.get_signal_config(user_id=_uid)
-        _pp4.metric("RSI buy max (tuned)",
-                    f"{_sig_cfg_disp['intraday_rsi_buy_max']:.0f}",
-                    delta=f"{_sig_cfg_disp['intraday_rsi_buy_max'] - 75:.0f} from default" if _sig_cfg_disp['intraday_rsi_buy_max'] != 75 else None,
-                    help="Current RSI overbought threshold for BUY_ABOVE signals")
-
-        _pp_rows = []
-        for _sig_k, _sig_d in [("BUY_ABOVE (Long)", _paper_long),
-                                ("SELL_BELOW (Short)", _paper_short)]:
-            if _sig_d.get("total", 0) > 0:
-                _pp_rows.append({
-                    "Signal":     _sig_k,
-                    "Trades":     _sig_d["total"],
-                    "Wins":       _sig_d["wins"],
-                    "Losses":     _sig_d["losses"],
-                    "Win Rate":   f"{_sig_d['win_rate']:.1f}%",
-                    "Avg R/R":    f"{_sig_d['avg_rr']:.2f}×" if _sig_d.get("avg_rr") else "—",
-                    "Avg P&L %": f"{_sig_d['avg_pnl_pct']:+.2f}%" if _sig_d.get("avg_pnl_pct") is not None else "—",
-                })
-        if _pp_rows:
+    # ── Paper trade signal breakdown + algo thresholds ────────────────────
+    _paper_perf = db.get_paper_trade_perf(user_id=_uid, days=30)
+    _paper_long  = _paper_perf.get("BUY_ABOVE",  {})
+    _paper_short = _paper_perf.get("SELL_BELOW", {})
+    _pp_rows = []
+    for _sig_k, _sig_d in [("BUY_ABOVE (Long)", _paper_long),
+                            ("SELL_BELOW (Short)", _paper_short)]:
+        if _sig_d.get("total", 0) > 0:
+            _pp_rows.append({
+                "Signal":    _sig_k,
+                "Trades":    _sig_d["total"],
+                "Wins":      _sig_d["wins"],
+                "Losses":    _sig_d["losses"],
+                "Win Rate":  f"{_sig_d['win_rate']:.1f}%",
+                "Avg R/R":   f"{_sig_d['avg_rr']:.2f}×" if _sig_d.get("avg_rr") else "—",
+                "Avg P&L %": f"{_sig_d['avg_pnl_pct']:+.2f}%" if _sig_d.get("avg_pnl_pct") is not None else "—",
+            })
+    _cur_cfg = db.get_signal_config(user_id=_uid)
+    _cfg_html = (
+        f'<div style="background:#0f172a;border:1px solid #1e293b;border-radius:8px;'
+        f'padding:8px 16px;margin:6px 0;font-size:0.78rem;color:#94a3b8">'
+        f'⚙️ <b>Signal thresholds (tuned from paper):</b> &nbsp;'
+        f'RSI buy ≤ <b style="color:#f8fafc">{_cur_cfg["intraday_rsi_buy_max"]:.0f}</b> &nbsp;·&nbsp; '
+        f'RSI sell ≥ <b style="color:#f8fafc">{_cur_cfg["intraday_rsi_sell_min"]:.0f}</b> &nbsp;·&nbsp; '
+        f'Min R/R <b style="color:#f8fafc">{_cur_cfg["intraday_min_rr"]:.1f}×</b> &nbsp;·&nbsp; '
+        f'<span style="color:#64748b">Run <b>Full Rescan</b> or <b>Refresh Signals</b> to apply</span>'
+        f'</div>'
+    )
+    if _pp_rows:
+        with st.expander("📄 Paper trade breakdown by signal (30d)", expanded=False):
             st.dataframe(pd.DataFrame(_pp_rows), hide_index=True, use_container_width=True)
-
-        _cur_cfg = db.get_signal_config(user_id=_uid)
-        st.markdown(
-            f'<div style="background:#0f172a;border:1px solid #1e293b;border-radius:8px;'
-            f'padding:10px 16px;margin:8px 0;font-size:0.8rem;color:#94a3b8">'
-            f'⚙️ <b>Active signal thresholds</b> (tuned from paper results): &nbsp;'
-            f'RSI buy max = <b style="color:#f8fafc">{_cur_cfg["intraday_rsi_buy_max"]:.0f}</b> &nbsp;|&nbsp; '
-            f'RSI sell min = <b style="color:#f8fafc">{_cur_cfg["intraday_rsi_sell_min"]:.0f}</b> &nbsp;|&nbsp; '
-            f'Min R/R = <b style="color:#f8fafc">{_cur_cfg["intraday_min_rr"]:.1f}×</b> &nbsp;|&nbsp; '
-            f'<span style="color:#64748b">Run <b>Full Rescan</b> or <b>Refresh Signals</b> to apply tuned thresholds to the signal universe</span>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
+            st.markdown(_cfg_html, unsafe_allow_html=True)
+    else:
+        st.markdown(_cfg_html, unsafe_allow_html=True)
 
     # ── Strategy Insights ──────────────────────────────────────────────────
     st.markdown("---")
@@ -4065,83 +4103,58 @@ with tab_activity:
                 except Exception as _sync_err:
                     st.error(f"Sync failed: {_sync_err}")
 
-    # ── PORTFOLIO SNAPSHOT (live from Kite) ────────────────────────────────
+    # ── PORTFOLIO SNAPSHOT — compact dark banner ───────────────────────────
     if _act_kite_ok:
-        with st.container():
+        try:
+            _margins   = _act_kc.get_margins("equity")
+            _eq        = _margins.get("equity", _margins)
+            _avail     = _eq.get("available", {})
+            _used      = _eq.get("used", {})
+            _net_bal   = float(_eq.get("net", 0) or 0)
+            _live_bal  = float(_avail.get("live_balance", _avail.get("cash", 0)) or 0)
+            _used_deb  = float(_used.get("debits", 0) or 0)
+            _holdings  = _act_kc.get_holdings()
+            _h_value   = sum(float(h.get("last_price", 0)) * float(h.get("quantity", 0))
+                             for h in _holdings if h.get("quantity", 0) > 0)
+            _h_pnl     = sum(float(h.get("pnl", 0)) for h in _holdings)
+            _h_day_pnl = sum(float(h.get("day_change", 0)) * float(h.get("quantity", 0))
+                             for h in _holdings if h.get("quantity", 0) > 0)
+            _h_count   = sum(1 for h in _holdings if h.get("quantity", 0) > 0)
+            _positions = _act_kc.get_positions()
+            _net_pos   = _positions.get("net", []) if isinstance(_positions, dict) else []
+            _pos_open  = [p for p in _net_pos if p.get("quantity", 0) != 0]
+            _pos_value = sum(abs(float(p.get("value", 0))) for p in _pos_open)
+            _pos_pnl   = sum(float(p.get("unrealised", 0)) for p in _pos_open)
+            _pos_m2m   = sum(float(p.get("m2m", 0)) for p in _net_pos)
+            _pf_m2m_c  = "#22c55e" if _pos_m2m >= 0 else "#ef4444"
+            _pf_hp_c   = "#22c55e" if _h_pnl   >= 0 else "#ef4444"
             st.markdown(
-                '<div style="font-size:0.78rem;color:#64748b;font-weight:600;'
-                'letter-spacing:0.05em;text-transform:uppercase;margin-bottom:6px;">'
-                'Portfolio Snapshot — live from Kite</div>',
+                f'<div style="background:#0f172a;border:1px solid #334155;border-radius:8px;'
+                f'padding:10px 18px;margin-bottom:8px;display:flex;flex-wrap:wrap;'
+                f'gap:22px;align-items:center">'
+                f'<span style="font-size:0.78rem;color:#64748b;font-weight:600;'
+                f'letter-spacing:0.05em;text-transform:uppercase;white-space:nowrap">'
+                f'🏦 Portfolio Snapshot</span>'
+                f'<span style="font-size:0.8rem;color:#94a3b8">Available '
+                f'<b style="color:#f8fafc">₹{_live_bal:,.0f}</b></span>'
+                f'<span style="font-size:0.8rem;color:#94a3b8">Net Balance '
+                f'<b style="color:#f8fafc">₹{_net_bal:,.0f}</b></span>'
+                f'<span style="font-size:0.8rem;color:#94a3b8">Margin Used '
+                f'<b style="color:#f8fafc">₹{_used_deb:,.0f}</b></span>'
+                f'<span style="font-size:0.8rem;color:#94a3b8">Holdings ({_h_count}) '
+                f'<b style="color:#f8fafc">₹{_h_value:,.0f}</b> '
+                f'<span style="color:{_pf_hp_c};font-size:0.75rem">{_h_pnl:+,.0f}</span></span>'
+                f'<span style="font-size:0.8rem;color:#94a3b8">Positions ({len(_pos_open)}) '
+                f'<b style="color:#f8fafc">₹{_pos_value:,.0f}</b></span>'
+                f'<span style="font-size:0.8rem;color:#94a3b8">Today\'s P&amp;L '
+                f'<b style="color:{_pf_m2m_c};font-weight:700">₹{_pos_m2m:+,.0f}</b>'
+                f'<span style="font-size:0.7rem;color:#64748b"> holdings ₹{_h_day_pnl:+,.0f}</span>'
+                f'</span>'
+                f'</div>',
                 unsafe_allow_html=True,
             )
-            try:
-                _margins   = _act_kc.get_margins("equity")
-                _eq        = _margins.get("equity", _margins)   # some SDK versions return flat dict
-                _avail     = _eq.get("available", {})
-                _used      = _eq.get("used", {})
-                _net_bal   = float(_eq.get("net", 0) or 0)
-                _live_bal  = float(_avail.get("live_balance", _avail.get("cash", 0)) or 0)
-                _used_deb  = float(_used.get("debits", 0) or 0)
-
-                _holdings  = _act_kc.get_holdings()
-                _h_value   = sum(float(h.get("last_price", 0)) * float(h.get("quantity", 0))
-                                 for h in _holdings if h.get("quantity", 0) > 0)
-                _h_pnl     = sum(float(h.get("pnl", 0)) for h in _holdings)
-                _h_day_pnl = sum(float(h.get("day_change", 0)) * float(h.get("quantity", 0))
-                                 for h in _holdings if h.get("quantity", 0) > 0)
-                _h_count   = sum(1 for h in _holdings if h.get("quantity", 0) > 0)
-
-                _positions = _act_kc.get_positions()
-                _net_pos   = _positions.get("net", []) if isinstance(_positions, dict) else []
-                _pos_open  = [p for p in _net_pos if p.get("quantity", 0) != 0]
-                _pos_value = sum(abs(float(p.get("value", 0))) for p in _pos_open)
-                _pos_pnl   = sum(float(p.get("unrealised", 0)) for p in _pos_open)
-                _pos_m2m   = sum(float(p.get("m2m", 0)) for p in _net_pos)
-
-                _p1, _p2, _p3, _p4, _p5, _p6, _p7 = st.columns(7)
-                _p1.metric(
-                    "Available Funds",
-                    f"₹{_live_bal:,.2f}",
-                    help="Cash available to place new orders right now",
-                )
-                _p2.metric(
-                    "Net Balance",
-                    f"₹{_net_bal:,.2f}",
-                    help="Total account value = cash + collateral − debits",
-                )
-                _p3.metric(
-                    "Margin Used",
-                    f"₹{_used_deb:,.2f}",
-                    help="Total debits / margin currently blocked",
-                )
-                _p4.metric(
-                    "Holdings Value",
-                    f"₹{_h_value:,.2f}",
-                    delta=f"₹{_h_day_pnl:+,.2f} today" if _h_count else None,
-                    help=f"Current market value of {_h_count} holding(s) in your DEMAT",
-                )
-                _p5.metric(
-                    "Holdings P&L",
-                    f"₹{_h_pnl:+,.2f}",
-                    delta=f"{(_h_pnl / (_h_value - _h_pnl) * 100) if (_h_value - _h_pnl) > 0 else 0:+.1f}% overall",
-                    help="Total unrealised gain/loss on long-term holdings (vs avg buy price)",
-                )
-                _p6.metric(
-                    "Open Positions",
-                    f"₹{_pos_value:,.2f}",
-                    delta=f"₹{_pos_pnl:+,.2f} unrealised" if _pos_open else None,
-                    help=f"{len(_pos_open)} open short-term position(s) — intraday/swing MIS",
-                )
-                _p7.metric(
-                    "Today's P&L",
-                    f"₹{_pos_m2m:+,.2f}",
-                    delta=f"₹{_h_day_pnl:+,.2f} holdings" if _h_count else None,
-                    help="Mark-to-market P&L on all positions today (realised + unrealised)",
-                )
-            except Exception as _pf_err:
-                st.caption(f"Portfolio data unavailable: {_pf_err}")
-
-        st.markdown("---")
+        except Exception as _pf_err:
+            st.caption(f"⚠ Portfolio data unavailable: {_pf_err}")
 
     # ── Live-refreshing stats + table (fragment) ────────────────────────────
     _activity_log_live()

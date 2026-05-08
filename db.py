@@ -587,10 +587,26 @@ def sync_from_kite_orders(orders: list, user_id: str = "") -> int:
     return updated
 
 
-def get_trade_stats(user_id: str = "") -> dict:
-    """Aggregate stats for the Activity Log summary header, scoped to user."""
+def get_trade_stats(user_id: str = "", is_paper: bool | None = None) -> dict:
+    """
+    Aggregate stats for the Activity Log summary header, scoped to user.
+
+    Parameters
+    ----------
+    user_id  : Kite user ID filter ('' = all users).
+    is_paper : True → paper trades only | False → real trades only | None → all.
+    """
     con = get_conn()
-    _uid_clause = "WHERE kite_user_id = ?" if user_id else ""
+    clauses: list[str] = []
+    params: list = []
+    if user_id:
+        clauses.append("kite_user_id = ?")
+        params.append(user_id)
+    if is_paper is True:
+        clauses.append("is_paper_trade = TRUE")
+    elif is_paper is False:
+        clauses.append("(is_paper_trade = FALSE OR is_paper_trade IS NULL)")
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     row = con.execute(f"""
         SELECT
             COUNT(*)                                             AS total,
@@ -601,8 +617,8 @@ def get_trade_stats(user_id: str = "") -> dict:
             AVG(CASE WHEN rr_realised IS NOT NULL THEN rr_realised END) AS avg_rr,
             MAX(pnl_amount)                                      AS best_trade,
             MIN(pnl_amount)                                      AS worst_trade
-        FROM trade_log {_uid_clause}
-    """, [user_id] if user_id else []).fetchone()
+        FROM trade_log {where}
+    """, params).fetchone()
     con.close()
     if row is None:
         return {}
