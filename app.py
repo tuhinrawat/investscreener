@@ -2981,12 +2981,14 @@ def _live_signals_header():
     # which tab the user is viewing — not just when the Intraday Plan tab is open.
     if _market_open and st.session_state.get("paper_open"):
         _live_ltp_now = st.session_state.get("_live_ltp", {})
+
+        # ── Pass 1: T1 / stop-loss exits ─────────────────────────────────────
         _exits = []
         for _pid, _pt in list(st.session_state["paper_open"].items()):
             _pt_ltp = _live_ltp_now.get(_pt.get("sym", ""), 0)
             if not _pt_ltp:
                 continue
-            _sig = _pt.get("signal_type", "")
+            _sig  = _pt.get("signal_type", "")
             _t1   = _pt.get("t1", 0)
             _stop = _pt.get("stop", 0)
             if _sig == "BUY_ABOVE":
@@ -3008,6 +3010,57 @@ def _live_signals_header():
                 st.toast(f"{_icon} Paper {_sym_e}: {_outcome} at ₹{_ep:.2f}", icon=_icon)
             except Exception:
                 pass
+
+        # ── Pass 2: Option-C trailing-cutoff gate — close losing open trades ─
+        # Trigger: total return (realized P&L + open MTM) drops to the cutoff.
+        # Only NEGATIVE-MTM trades are closed; profitable open trades keep running.
+        _g_hwm    = st.session_state.get("paper_day_hwm_pct", 0.0)
+        _g_low    = config.DAILY_TARGET_LOW_PCT     # 2.0 %
+        _g_trail  = config.DAILY_TRAIL_PCT          # 0.3 %
+        _g_cutoff = (_g_hwm - _g_trail) if _g_hwm >= _g_low else None
+
+        if _g_cutoff is not None and st.session_state.get("paper_open"):
+            _g_uid  = st.session_state.get("kite_user_id", "")
+            try:
+                _g_real = db.get_today_closed_pnl(user_id=_g_uid, is_paper=True)
+            except Exception:
+                _g_real = 0.0
+
+            # Compute per-trade MTM and total
+            _g_per_trade: dict[int, tuple[float, float]] = {}  # pid → (mtm_pnl, ltp)
+            _g_mtm_sum = 0.0
+            for _g_pid, _g_pt in list(st.session_state["paper_open"].items()):
+                _g_ltp = _live_ltp_now.get(_g_pt.get("sym", ""), 0)
+                if not _g_ltp:
+                    continue
+                _g_dir      = -1 if _g_pt.get("signal_type") == "SELL_BELOW" else 1
+                _g_slot_cap = _g_pt.get("cap", config.PAPER_CAP_MODERATE)
+                _g_qty      = max(1, int(_g_slot_cap / (_g_pt.get("entry") or 1)))
+                _g_trade_mtm = _g_dir * (_g_ltp - _g_pt["entry"]) * _g_qty
+                _g_per_trade[_g_pid] = (_g_trade_mtm, _g_ltp)
+                _g_mtm_sum += _g_trade_mtm
+
+            _g_total_ret = ((_g_real + _g_mtm_sum) / config.PAPER_CAPITAL * 100)
+
+            if _g_total_ret <= _g_cutoff:
+                # Close only the loss-making legs; winners keep running
+                for _g_pid, (_g_trade_mtm, _g_exit_ltp) in _g_per_trade.items():
+                    if _g_trade_mtm < 0 and _g_pid in st.session_state["paper_open"]:
+                        _g_sym = st.session_state["paper_open"][_g_pid].get("sym", "")
+                        try:
+                            db.close_trade(
+                                _g_pid, _g_exit_ltp, "STOPPED_OUT",
+                                f"📄 Gate-C: total return {_g_total_ret:.2f}% ≤ cutoff "
+                                f"{_g_cutoff:.2f}% — loss position auto-closed"
+                            )
+                            st.session_state["paper_open"].pop(_g_pid, None)
+                            st.toast(
+                                f"🛡 Gate: {_g_sym} loss closed @ ₹{_g_exit_ltp:.2f} "
+                                f"(total return touched cutoff {_g_cutoff:.2f}%)",
+                                icon="🛡",
+                            )
+                        except Exception:
+                            pass
 
 
 # ── FRAGMENT 2c: trading mode control strip + kill switch ────────────────────
@@ -3167,24 +3220,6 @@ def _intraday_paper_banner():
     _cap = config.PAPER_CAPITAL
     _ret_pct = (_today_paper_pnl / _cap * 100) if _cap else 0.0
 
-    # ── Update high-water mark ────────────────────────────────────────────────
-    _hwm = max(st.session_state.get("paper_day_hwm_pct", 0.0), _ret_pct)
-    st.session_state["paper_day_hwm_pct"] = _hwm
-
-    _LOW   = config.DAILY_TARGET_LOW_PCT    # 2.0
-    _HIGH  = config.DAILY_TARGET_HIGH_PCT   # 5.0
-    _TRAIL = config.DAILY_TRAIL_PCT         # 0.3
-
-    # Cutoff = hwm − TRAIL (but only active once hwm ≥ LOW)
-    _cutoff_pct: float | None = (_hwm - _TRAIL) if _hwm >= _LOW else None
-
-    _blocked = (
-        (_cutoff_pct is not None and _ret_pct <= _cutoff_pct)
-        or _ret_pct >= _HIGH
-    )
-    # Persist so auto-trigger code can read it without re-computing
-    st.session_state["paper_day_blocked"] = _blocked
-
     # ── Live MTM on open positions ────────────────────────────────────────────
     _open_pt       = st.session_state.get("paper_open", {})
     _n_open        = len(_open_pt)
@@ -3204,7 +3239,28 @@ def _intraday_paper_banner():
     _total_ret   = (_total_pnl / _cap * 100) if _cap else 0.0
     _pnl_color   = "#22c55e" if _total_pnl >= 0 else "#ef4444"
 
-    # ── Gate status label ─────────────────────────────────────────────────────
+    # ── Update high-water mark (based on realized P&L — stable, not swung by MTM) ─
+    _hwm = max(st.session_state.get("paper_day_hwm_pct", 0.0), _ret_pct)
+    st.session_state["paper_day_hwm_pct"] = _hwm
+    # Also persist total return so Option-C gate in header fragment can read it
+    st.session_state["_paper_total_ret"] = _total_ret
+
+    _LOW   = config.DAILY_TARGET_LOW_PCT    # 2.0
+    _HIGH  = config.DAILY_TARGET_HIGH_PCT   # 5.0
+    _TRAIL = config.DAILY_TRAIL_PCT         # 0.3
+
+    # Cutoff = hwm − TRAIL (but only active once hwm ≥ LOW)
+    _cutoff_pct: float | None = (_hwm - _TRAIL) if _hwm >= _LOW else None
+
+    # New entries blocked when REALIZED return drops to cutoff (or hits ceiling)
+    _blocked = (
+        (_cutoff_pct is not None and _ret_pct <= _cutoff_pct)
+        or _ret_pct >= _HIGH
+    )
+    # Persist so auto-trigger code can read it without re-computing
+    st.session_state["paper_day_blocked"] = _blocked
+
+    # ── Gate status label — show total return (realized + MTM) ───────────────
     if _blocked:
         if _ret_pct >= _HIGH:
             _gate_html = (
@@ -3214,20 +3270,22 @@ def _intraday_paper_banner():
         else:
             _gate_html = (
                 f'<span style="color:#ef4444;font-weight:700;font-size:0.75rem">'
-                f'🚫 CUTOFF HIT — return dropped to {_ret_pct:.2f}% '
-                f'(peak {_hwm:.2f}% − {_TRAIL:.1f}% trail = {_cutoff_pct:.2f}%)</span>'
+                f'🚫 CUTOFF HIT — total return {_total_ret:.2f}% '
+                f'(realized {_ret_pct:.2f}% | peak {_hwm:.2f}% − {_TRAIL:.1f}% = {_cutoff_pct:.2f}%)'
+                f'</span>'
             )
     elif _cutoff_pct is not None:
         _gate_html = (
             f'<span style="color:#f59e0b;font-weight:600;font-size:0.75rem">'
-            f'⚡ Trailing active — stop if return drops to '
-            f'<b>{_cutoff_pct:.2f}%</b> '
+            f'⚡ Trailing active · total {_total_ret:.2f}% (realized {_ret_pct:.2f}%) — '
+            f'loss positions close if total ≤ <b>{_cutoff_pct:.2f}%</b> '
             f'(peak {_hwm:.2f}% − {_TRAIL:.1f}%)</span>'
         )
     elif _hwm > 0:
         _gate_html = (
             f'<span style="color:#22c55e;font-size:0.75rem">'
-            f'✅ {_ret_pct:.2f}% gained — trailing activates at {_LOW:.0f}%</span>'
+            f'✅ Total {_total_ret:.2f}% (realized {_ret_pct:.2f}%) — trailing activates at {_LOW:.0f}%'
+            f'</span>'
         )
     else:
         _target_amt = _cap * _LOW / 100
