@@ -1290,6 +1290,27 @@ def _render_order_panel(signal_df: pd.DataFrame, setup_type: str, form_key: str)
                     st.error(f"Failed to save: {_e}")
 
 
+# ── Market Intel background poller ───────────────────────────────────────────
+# Defined here (before tab_screener renders) so both tabs can call it.
+# Runs every 5 s ONLY while a job is in flight; instant no-op when idle.
+@st.fragment(run_every=5)
+def _intel_poller():
+    """Light fragment: check if background market intel job finished."""
+    if st.session_state.get("_intel_job_status") != "running":
+        return
+    _uid_poll = st.session_state.get("kite_user_id", "")
+    result = _mi.check_job(_uid_poll)
+    if result is not None:
+        if result.get("error"):
+            st.session_state["_intel_job_status"] = f"error: {result['error']}"
+            st.toast(f"❌ Market Intel failed: {result['error'][:80]}", icon="❌")
+        else:
+            st.session_state["_intel_job_status"] = "done"
+            st.session_state["_intel_result"]     = result
+            n = len(result.get("stocks", []))
+            st.toast(f"🧠 Market Intel complete — {n} stocks identified!", icon="✅")
+
+
 # ─── SCREENER TAB ───────────────────────────────────────────
 with tab_screener:
     _hc1, _hc2, _hc3, _hc4 = st.columns(4)
@@ -2965,26 +2986,6 @@ def _delta_str(sym: str) -> str:
         return "—"
     chg = (cur - prev) / prev * 100
     return f"▲{chg:.2f}%" if chg > 0 else f"▼{abs(chg):.2f}%"
-
-
-# ── Market Intel background poller ───────────────────────────────────────────
-# Runs every 5 s ONLY while a job is in flight; stops polling once done.
-@st.fragment(run_every=5)
-def _intel_poller():
-    """Light fragment: check if background market intel job finished."""
-    if st.session_state.get("_intel_job_status") != "running":
-        return
-    _uid_poll = st.session_state.get("kite_user_id", "")
-    result = _mi.check_job(_uid_poll)
-    if result is not None:
-        if result.get("error"):
-            st.session_state["_intel_job_status"] = f"error: {result['error']}"
-            st.toast(f"❌ Market Intel failed: {result['error'][:80]}", icon="❌")
-        else:
-            st.session_state["_intel_job_status"] = "done"
-            st.session_state["_intel_result"]     = result
-            n = len(result.get("stocks", []))
-            st.toast(f"🧠 Market Intel complete — {n} stocks identified!", icon="✅")
 
 
 # ── FRAGMENT 1: live header (badge + LTP fetch + metric pills) ────────────────
