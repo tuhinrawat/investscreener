@@ -148,3 +148,10 @@ BENCHMARK_EXCHANGE = "NSE"
 # NIFTY 50 instrument token (constant) — used for benchmark queries
 # ============================================================
 NIFTY_50_TOKEN = 256265
+
+# ============================================================
+# PAPER TRADING — virtual capital for signal evaluation
+# ============================================================
+PAPER_CAPITAL       = 900_000   # ₹9,00,000 virtual capital
+PAPER_MAX_POSITIONS = 6         # max concurrent paper trades (mix of long + short)
+# Per-trade allocation: PAPER_CAPITAL / PAPER_MAX_POSITIONS = ₹1,50,000 each

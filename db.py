@@ -36,6 +36,7 @@ def _migrate_trade_log_columns(con):
         ("kite_order_id",    "VARCHAR"),
         ("kite_sl_order_id", "VARCHAR"),
         ("kite_status",      "VARCHAR"),
+        ("is_paper_trade",   "BOOLEAN"),   # True = virtual paper trade, False/NULL = real
     ]
     for col, dtype in extra_cols:
         try:
@@ -244,6 +245,16 @@ def init_schema():
         );
     """)
     _migrate_trade_log_columns(con)
+    # signal_config — persists algo-tuning overrides derived from paper trade feedback
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS signal_config (
+            config_key   VARCHAR NOT NULL,
+            kite_user_id VARCHAR NOT NULL DEFAULT '',
+            value        DOUBLE  NOT NULL,
+            updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (config_key, kite_user_id)
+        );
+    """)
     con.close()
 
 
@@ -423,8 +434,9 @@ def log_trade(trade: dict) -> int:
             rec_composite_score, rec_ai_score,
             kite_user_id, kite_order_id, kite_sl_order_id, kite_status,
             quantity, actual_entry, actual_exit, status, notes,
-            pnl_amount, pnl_pct, slippage_entry_pct, rr_realised
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            pnl_amount, pnl_pct, slippage_entry_pct, rr_realised,
+            is_paper_trade
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, [
         trade.get("trade_date"),
         trade.get("tradingsymbol"),
@@ -452,6 +464,7 @@ def log_trade(trade: dict) -> int:
         outcomes["pnl_pct"],
         outcomes["slippage_entry_pct"],
         outcomes["rr_realised"],
+        bool(trade.get("is_paper_trade", False)),
     ])
     row_id = con.execute("SELECT max(id) FROM trade_log").fetchone()[0]
     con.close()
@@ -608,3 +621,205 @@ def get_trade_stats(user_id: str = "") -> dict:
         "best_trade": best,
         "worst_trade": worst,
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PAPER TRADING — virtual trade tracking and signal tuning
+# ═══════════════════════════════════════════════════════════════════════════
+
+def get_open_paper_trades(user_id: str = "", trade_date=None) -> list:
+    """
+    Return open paper trades for a given date (defaults to today) scoped to user.
+    Each row → dict with id, tradingsymbol, signal_type, actual_entry, rec_stop, rec_t1.
+    """
+    import datetime as _dt
+    d = trade_date or _dt.date.today()
+    con = get_conn()
+    _uid_clause = "AND kite_user_id = ?" if user_id else ""
+    _params = [str(d)] + ([user_id] if user_id else [])
+    rows = con.execute(
+        f"""SELECT id, tradingsymbol, signal_type, actual_entry, rec_stop, rec_t1
+            FROM trade_log
+            WHERE is_paper_trade = TRUE
+              AND status = 'OPEN'
+              AND trade_date = ?
+              {_uid_clause}""",
+        _params,
+    ).fetchall()
+    con.close()
+    return [
+        {
+            "id":            r[0],
+            "tradingsymbol": r[1],
+            "signal_type":   r[2],
+            "actual_entry":  r[3],
+            "rec_stop":      r[4],
+            "rec_t1":        r[5],
+        }
+        for r in rows
+    ]
+
+
+def get_paper_trade_perf(user_id: str = "", days: int = 30) -> dict:
+    """
+    Aggregate paper trade performance over the last `days` calendar days,
+    broken down by signal_type (BUY_ABOVE / SELL_BELOW).
+
+    Returns:
+      {
+        "BUY_ABOVE":  {"total": int, "wins": int, "losses": int, "win_rate": float,
+                       "avg_rr": float, "avg_pnl_pct": float},
+        "SELL_BELOW": {...},
+        "overall":    {"total": int, "win_rate": float, "avg_rr": float},
+      }
+    """
+    con = get_conn()
+    _uid_clause = "AND kite_user_id = ?" if user_id else ""
+    _params = [days] + ([user_id] if user_id else [])
+    rows = con.execute(
+        f"""SELECT signal_type,
+                   COUNT(*)                                              AS total,
+                   SUM(CASE WHEN pnl_amount > 0 THEN 1 ELSE 0 END)     AS wins,
+                   SUM(CASE WHEN pnl_amount <= 0 AND pnl_amount IS NOT NULL
+                            THEN 1 ELSE 0 END)                          AS losses,
+                   AVG(CASE WHEN rr_realised IS NOT NULL
+                            THEN rr_realised END)                       AS avg_rr,
+                   AVG(pnl_pct)                                         AS avg_pnl_pct
+            FROM trade_log
+            WHERE is_paper_trade = TRUE
+              AND status IN ('TARGET_HIT','STOPPED_OUT','CLOSED')
+              AND trade_date >= CURRENT_DATE - INTERVAL (?) DAY
+              {_uid_clause}
+            GROUP BY signal_type""",
+        _params,
+    ).fetchall()
+    con.close()
+
+    result = {}
+    overall_total = overall_wins = 0
+    overall_rr_sum = overall_rr_n = 0
+    for r in rows:
+        sig, total, wins, losses, avg_rr, avg_pnl_pct = r
+        closed = total or 0
+        win_rate = (wins / closed * 100) if closed > 0 else 0.0
+        result[sig] = {
+            "total":       total or 0,
+            "wins":        wins  or 0,
+            "losses":      losses or 0,
+            "win_rate":    round(win_rate, 1),
+            "avg_rr":      round(avg_rr,   2) if avg_rr else None,
+            "avg_pnl_pct": round(avg_pnl_pct, 2) if avg_pnl_pct else None,
+        }
+        overall_total += total or 0
+        overall_wins  += wins  or 0
+        if avg_rr:
+            overall_rr_sum += avg_rr * (total or 0)
+            overall_rr_n   += total or 0
+
+    result["overall"] = {
+        "total":    overall_total,
+        "win_rate": round(overall_wins / overall_total * 100, 1) if overall_total else 0.0,
+        "avg_rr":   round(overall_rr_sum / overall_rr_n, 2) if overall_rr_n else None,
+    }
+    return result
+
+
+# ─── Signal config (algo-tuning overrides) ───────────────────────────────────
+
+_SIGNAL_CONFIG_DEFAULTS = {
+    "intraday_rsi_buy_max":  75.0,
+    "intraday_rsi_sell_min": 25.0,
+    "intraday_min_rr":        1.5,
+}
+
+
+def get_signal_config(user_id: str = "") -> dict:
+    """
+    Load per-user signal tuning overrides from signal_config table.
+    Falls back to defaults from _SIGNAL_CONFIG_DEFAULTS for missing keys.
+    """
+    con = get_conn()
+    uid = user_id or ""
+    rows = con.execute(
+        "SELECT config_key, value FROM signal_config WHERE kite_user_id = ?",
+        [uid],
+    ).fetchall()
+    con.close()
+    cfg = dict(_SIGNAL_CONFIG_DEFAULTS)
+    for key, val in rows:
+        cfg[key] = val
+    return cfg
+
+
+def save_signal_config(cfg: dict, user_id: str = "") -> None:
+    """
+    Upsert signal tuning overrides into signal_config table.
+    Only keys present in cfg are written; others are left untouched.
+    """
+    uid = user_id or ""
+    con = get_conn()
+    for key, val in cfg.items():
+        con.execute(
+            """INSERT INTO signal_config (config_key, kite_user_id, value, updated_at)
+               VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT (config_key, kite_user_id)
+               DO UPDATE SET value = excluded.value,
+                             updated_at = excluded.updated_at""",
+            [key, uid, float(val)],
+        )
+    con.close()
+
+
+def tune_signal_config_from_paper(user_id: str = "", days: int = 30) -> dict:
+    """
+    Derive updated signal thresholds from recent paper trade performance.
+
+    Tuning rules (conservative — only moves in one direction per call):
+      BUY_ABOVE win rate < 40% → tighten RSI max by 5 (floor 55)
+                                  raise min R/R by 0.5 (cap 3.0)
+      BUY_ABOVE win rate > 65% → relax RSI max by 3 (cap 75)
+                                  lower min R/R by 0.25 (floor 1.5)
+      SELL_BELOW win rate < 40% → tighten RSI min by 5 (cap 45)
+      SELL_BELOW win rate > 65% → relax RSI min by 3 (floor 25)
+
+    Returns a dict of {config_key: new_value, ...} that was changed,
+    or an empty dict if no adjustment was made.
+    """
+    perf = get_paper_trade_perf(user_id=user_id, days=days)
+    current = get_signal_config(user_id=user_id)
+    changes: dict = {}
+
+    long_data  = perf.get("BUY_ABOVE",  {})
+    short_data = perf.get("SELL_BELOW", {})
+
+    # Only tune when we have at least 5 closed trades to avoid noise
+    if long_data.get("total", 0) >= 5:
+        wr = long_data["win_rate"]
+        cur_rsi = current["intraday_rsi_buy_max"]
+        cur_rr  = current["intraday_min_rr"]
+        if wr < 40.0:
+            new_rsi = max(55.0, cur_rsi - 5.0)
+            new_rr  = min(3.0,  cur_rr  + 0.5)
+            if new_rsi != cur_rsi: changes["intraday_rsi_buy_max"] = new_rsi
+            if new_rr  != cur_rr:  changes["intraday_min_rr"]      = new_rr
+        elif wr > 65.0:
+            new_rsi = min(75.0, cur_rsi + 3.0)
+            new_rr  = max(1.5,  cur_rr  - 0.25)
+            if new_rsi != cur_rsi: changes["intraday_rsi_buy_max"] = new_rsi
+            if new_rr  != cur_rr:  changes["intraday_min_rr"]      = new_rr
+
+    if short_data.get("total", 0) >= 5:
+        wr = short_data["win_rate"]
+        cur_rsi = current["intraday_rsi_sell_min"]
+        if wr < 40.0:
+            new_rsi = min(45.0, cur_rsi + 5.0)
+            if new_rsi != cur_rsi: changes["intraday_rsi_sell_min"] = new_rsi
+        elif wr > 65.0:
+            new_rsi = max(25.0, cur_rsi - 3.0)
+            if new_rsi != cur_rsi: changes["intraday_rsi_sell_min"] = new_rsi
+
+    if changes:
+        merged = {**current, **changes}
+        save_signal_config(merged, user_id=user_id)
+
+    return changes

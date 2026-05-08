@@ -438,6 +438,33 @@ if "kite_client" not in st.session_state or not st.session_state["kite_client"]:
 # Convenience alias — current Kite user id for per-user DB filtering
 _cur_user_id: str = st.session_state.get("kite_user_id", "")
 
+# ── Paper trade session state ────────────────────────────────────────────────
+# paper_triggered: {(date_str, sym): trade_id} — prevents re-triggering same signal
+# paper_open:      {trade_id: {sym, stop, t1, signal_type, entry}} — exit monitoring
+import datetime as _dt
+_today_str = _dt.date.today().isoformat()
+
+if "paper_triggered" not in st.session_state:
+    st.session_state["paper_triggered"] = {}
+if "paper_open" not in st.session_state:
+    st.session_state["paper_open"] = {}
+
+# On first load (or after page refresh), re-sync paper_triggered + paper_open
+# from the DB so we never double-create paper trades.
+if st.session_state.get("_paper_sync_date") != _today_str:
+    _existing = db.get_open_paper_trades(user_id=_cur_user_id)
+    for _pt in _existing:
+        _k = (_today_str, _pt["tradingsymbol"])
+        st.session_state["paper_triggered"][_k] = _pt["id"]
+        st.session_state["paper_open"][_pt["id"]] = {
+            "sym":         _pt["tradingsymbol"],
+            "stop":        float(_pt["rec_stop"] or 0),
+            "t1":          float(_pt["rec_t1"] or 0),
+            "signal_type": _pt["signal_type"],
+            "entry":       float(_pt["actual_entry"] or 0),
+        }
+    st.session_state["_paper_sync_date"] = _today_str
+
 
 # ============================================================
 # SIDEBAR — Controls
@@ -539,15 +566,33 @@ if st.sidebar.button("📡 Refresh Signals (~30s)", use_container_width=True,
         _sig_status.caption(f"{idx+1}/{total}: {sym}")
 
     try:
-        _sig_result = data_pipeline.refresh_signals_only(progress_callback=_sig_progress)
+        # Tune thresholds first, then apply them during signal refresh
+        _pre_tune = db.tune_signal_config_from_paper(user_id=_cur_user_id, days=30)
+        _sig_result = data_pipeline.refresh_signals_only(
+            progress_callback=_sig_progress,
+            user_id=_cur_user_id,
+        )
         _sig_bar.progress(1.0)
         _sig_status.caption("Done")
         if "error" in _sig_result:
             st.sidebar.error(_sig_result["error"])
         else:
+            _thresholds = _sig_result.get("thresholds_used", {})
+            _thresh_str = (
+                f"RSI buy≤{_thresholds.get('rsi_buy_max', 75):.0f} · "
+                f"RSI sell≥{_thresholds.get('rsi_sell_min', 25):.0f} · "
+                f"Min R/R {_thresholds.get('min_rr', 1.5):.1f}×"
+            ) if _thresholds else ""
+            _tune_note = ""
+            if _pre_tune:
+                _tune_note = " · 🧠 " + ", ".join(
+                    f"{k.replace('intraday_', '').replace('_', ' ')}→{v}"
+                    for k, v in _pre_tune.items()
+                )
             st.sidebar.success(
                 f"✓ {_sig_result['signals_updated']} signals refreshed "
-                f"({_sig_result['errors']} errors) in {_sig_result['elapsed_sec']}s"
+                f"({_sig_result['errors']} errors) in {_sig_result['elapsed_sec']}s\n"
+                f"{_thresh_str}{_tune_note}"
             )
             st.rerun()
     except Exception as _e:
@@ -576,6 +621,22 @@ if st.sidebar.button("🔄 Full Rescan (~3-5 min)", use_container_width=True,
             f"in {result['elapsed_sec']}s"
         )
         st.sidebar.json(result)
+
+        # ── Algo feedback: tune thresholds from paper trade performance ───
+        try:
+            _tuned = db.tune_signal_config_from_paper(user_id=_cur_user_id, days=30)
+            if _tuned:
+                _tune_lines = "\n".join(
+                    f"• {k.replace('intraday_', '').replace('_', ' ')}: {v}"
+                    for k, v in _tuned.items()
+                )
+                st.sidebar.info(
+                    f"🧠 **Signal thresholds auto-tuned** from paper trade results:\n{_tune_lines}\n\n"
+                    f"Run **Refresh Signals** to apply to the current universe.",
+                    icon="🧠",
+                )
+        except Exception:
+            pass
     except Exception as e:
         st.sidebar.error(f"Failed: {e}")
         import traceback
@@ -2773,7 +2834,30 @@ def _intraday_long_live():
         return
 
     st.caption("Watch for price to trade **above R1**. Enter with stop just below Pivot.")
+
+    # ── Exit monitoring: check open long paper trades for T1 / stop hits ─────
+    _long_to_close = []
+    for _pid, _pt in list(st.session_state.get("paper_open", {}).items()):
+        if _pt.get("signal_type") != "BUY_ABOVE":
+            continue
+        _pt_ltp = st.session_state.get("_live_ltp", {}).get(_pt["sym"], 0)
+        if not _pt_ltp:
+            continue
+        if _pt.get("t1") and _pt_ltp >= _pt["t1"]:
+            db.close_trade(_pid, _pt["t1"], "TARGET_HIT",
+                           "📄 Paper trade auto-closed at T1 target")
+            _long_to_close.append((_pid, _pt["sym"], "TARGET_HIT", _pt["t1"]))
+        elif _pt.get("stop") and _pt_ltp <= _pt["stop"]:
+            db.close_trade(_pid, _pt_ltp, "STOPPED_OUT",
+                           "📄 Paper trade auto-stopped below stop-loss")
+            _long_to_close.append((_pid, _pt["sym"], "STOPPED_OUT", _pt_ltp))
+    for _pid, _sym_c, _outcome, _ep in _long_to_close:
+        st.session_state["paper_open"].pop(_pid, None)
+        _icon = "✅" if _outcome == "TARGET_HIT" else "🛑"
+        st.toast(f"{_icon} Paper {_sym_c}: {_outcome} at ₹{_ep:.2f}", icon=_icon)
+
     _si_rows = []
+    _paper_cap_per_trade = config.PAPER_CAPITAL // config.PAPER_MAX_POSITIONS
     for _, r in _si.iterrows():
         sym       = r.get("tradingsymbol", "")
         ltp_now   = r.get("ltp") or 0
@@ -2791,6 +2875,46 @@ def _intraday_long_live():
                 live_status = "WATCHING"
         else:
             live_status = "—"
+
+        # ── Auto paper trade when TRIGGERED and within position limit ────────
+        _paper_key = (_today_str, sym)
+        if (live_status == "TRIGGERED"
+                and _paper_key not in st.session_state.get("paper_triggered", {})
+                and len([p for p in st.session_state.get("paper_open", {}).values()
+                         if p.get("signal_type") == "BUY_ABOVE"]) < config.PAPER_MAX_POSITIONS // 2 + 1):
+            _pqty = max(1, int(_paper_cap_per_trade / (entry_val or 1)))
+            try:
+                _pid  = db.log_trade({
+                    "trade_date":          _dt.date.today(),
+                    "tradingsymbol":       sym,
+                    "instrument_token":    int(r.get("instrument_token") or 0),
+                    "setup_type":          "INTRADAY",
+                    "signal_type":         "BUY_ABOVE",
+                    "rec_entry":           entry_val,
+                    "rec_stop":            float(r.get("intraday_stop") or 0),
+                    "rec_t1":              float(r.get("intraday_t1") or 0),
+                    "rec_rr":              None,
+                    "rec_reason":          str(r.get("intraday_reason") or "")[:200],
+                    "rec_composite_score": r.get("composite_score"),
+                    "kite_user_id":        _cur_user_id,
+                    "quantity":            _pqty,
+                    "actual_entry":        entry_val,
+                    "status":              "OPEN",
+                    "notes":               f"📄 Paper trade — auto at TRIGGERED (₹{_paper_cap_per_trade:,} virtual capital)",
+                    "is_paper_trade":      True,
+                })
+                st.session_state["paper_triggered"][_paper_key] = _pid
+                st.session_state["paper_open"][_pid] = {
+                    "sym":         sym,
+                    "stop":        float(r.get("intraday_stop") or 0),
+                    "t1":          float(r.get("intraday_t1") or 0),
+                    "signal_type": "BUY_ABOVE",
+                    "entry":       entry_val,
+                }
+                st.toast(f"📄 Paper BUY created: {sym} @ ₹{entry_val:.2f} × {_pqty} shares", icon="📄")
+            except Exception:
+                pass
+
         # Compute R/R for display
         try:
             _e = float(r.get("intraday_entry") or 0)
@@ -2949,7 +3073,31 @@ def _intraday_short_live():
         "Short with cover-stop just above Pivot. "
         "**Only for stocks eligible for intraday short selling (check Kite margin).**"
     )
+
+    # ── Exit monitoring: check open short paper trades for T1 / stop hits ────
+    _short_to_close = []
+    for _pid, _pt in list(st.session_state.get("paper_open", {}).items()):
+        if _pt.get("signal_type") != "SELL_BELOW":
+            continue
+        _pt_ltp = st.session_state.get("_live_ltp", {}).get(_pt["sym"], 0)
+        if not _pt_ltp:
+            continue
+        # For shorts: T1 is below entry, stop is above entry
+        if _pt.get("t1") and _pt_ltp <= _pt["t1"]:
+            db.close_trade(_pid, _pt["t1"], "TARGET_HIT",
+                           "📄 Paper short auto-closed at T1 target")
+            _short_to_close.append((_pid, _pt["sym"], "TARGET_HIT", _pt["t1"]))
+        elif _pt.get("stop") and _pt_ltp >= _pt["stop"]:
+            db.close_trade(_pid, _pt_ltp, "STOPPED_OUT",
+                           "📄 Paper short auto-stopped above stop-loss")
+            _short_to_close.append((_pid, _pt["sym"], "STOPPED_OUT", _pt_ltp))
+    for _pid, _sym_c, _outcome, _ep in _short_to_close:
+        st.session_state["paper_open"].pop(_pid, None)
+        _icon = "✅" if _outcome == "TARGET_HIT" else "🛑"
+        st.toast(f"{_icon} Paper SHORT {_sym_c}: {_outcome} at ₹{_ep:.2f}", icon=_icon)
+
     _ss_rows = []
+    _paper_cap_per_trade = config.PAPER_CAPITAL // config.PAPER_MAX_POSITIONS
     for _, r in _ss.iterrows():
         sym       = r.get("tradingsymbol", "")
         ltp_now   = r.get("ltp") or 0
@@ -2967,6 +3115,46 @@ def _intraday_short_live():
                 short_status = "WATCHING"
         else:
             short_status = "—"
+
+        # ── Auto paper trade when TRIGGERED and within position limit ────────
+        _paper_key = (_today_str, sym)
+        if (short_status == "TRIGGERED"
+                and _paper_key not in st.session_state.get("paper_triggered", {})
+                and len([p for p in st.session_state.get("paper_open", {}).values()
+                         if p.get("signal_type") == "SELL_BELOW"]) < config.PAPER_MAX_POSITIONS // 2 + 1):
+            _pqty = max(1, int(_paper_cap_per_trade / (entry_val or 1)))
+            try:
+                _pid  = db.log_trade({
+                    "trade_date":          _dt.date.today(),
+                    "tradingsymbol":       sym,
+                    "instrument_token":    int(r.get("instrument_token") or 0),
+                    "setup_type":          "INTRADAY",
+                    "signal_type":         "SELL_BELOW",
+                    "rec_entry":           entry_val,
+                    "rec_stop":            float(r.get("intraday_stop") or 0),
+                    "rec_t1":              float(r.get("intraday_t1") or 0),
+                    "rec_rr":              None,
+                    "rec_reason":          str(r.get("intraday_reason") or "")[:200],
+                    "rec_composite_score": r.get("composite_score"),
+                    "kite_user_id":        _cur_user_id,
+                    "quantity":            _pqty,
+                    "actual_entry":        entry_val,
+                    "status":              "OPEN",
+                    "notes":               f"📄 Paper trade — auto at TRIGGERED (₹{_paper_cap_per_trade:,} virtual capital)",
+                    "is_paper_trade":      True,
+                })
+                st.session_state["paper_triggered"][_paper_key] = _pid
+                st.session_state["paper_open"][_pid] = {
+                    "sym":         sym,
+                    "stop":        float(r.get("intraday_stop") or 0),
+                    "t1":          float(r.get("intraday_t1") or 0),
+                    "signal_type": "SELL_BELOW",
+                    "entry":       entry_val,
+                }
+                st.toast(f"📄 Paper SHORT created: {sym} @ ₹{entry_val:.2f} × {_pqty} shares", icon="📄")
+            except Exception:
+                pass
+
         # For shorts: gain = entry → T1 (price drops), risk = entry → stop (price rises)
         try:
             _se = float(r.get("intraday_entry") or 0)
@@ -3080,6 +3268,16 @@ def _intraday_short_live():
         """,
         unsafe_allow_html=True,
     )
+    _ss_log = _ss.assign(
+        rec_entry=_ss["intraday_entry"],
+        rec_stop=_ss["intraday_stop"],
+        rec_t1=_ss["intraday_t1"],
+        rec_t2=None,
+        rec_rr=None,
+        rec_reason=_ss["intraday_reason"],
+        signal_type="SELL_BELOW",
+    ) if not _ss.empty else _ss
+    _render_order_panel(_ss_log, setup_type="INTRADAY", form_key="intra_short")
 
 
 # ── STABLE signal tables (no fragment — tabs never re-create themselves) ──────
@@ -3250,6 +3448,33 @@ def _signals_main():
             "**Hard rule: close ALL intraday positions by 3:10 PM regardless of P&L.** "
             "LTP and Status update automatically every 2 s during market hours."
         )
+
+        # ── Paper trade live dashboard ─────────────────────────────────────
+        _open_pt  = st.session_state.get("paper_open", {})
+        _n_open   = len(_open_pt)
+        _n_today  = len(st.session_state.get("paper_triggered", {}))
+        if _n_today > 0 or _n_open > 0:
+            _live_ltp_now = st.session_state.get("_live_ltp", {})
+            _paper_pnl = 0.0
+            for _ppid, _pp in _open_pt.items():
+                _p_ltp = _live_ltp_now.get(_pp["sym"], _pp.get("entry", 0))
+                _dir   = -1 if _pp["signal_type"] == "SELL_BELOW" else 1
+                _p_qty = max(1, int((config.PAPER_CAPITAL // config.PAPER_MAX_POSITIONS) / (_pp.get("entry") or 1)))
+                _paper_pnl += _dir * (_p_ltp - _pp["entry"]) * _p_qty
+            _pnl_color = "#22c55e" if _paper_pnl >= 0 else "#ef4444"
+            st.markdown(
+                f'<div style="background:#0f172a;border:1px solid #334155;border-radius:8px;'
+                f'padding:10px 16px;margin-bottom:10px;display:flex;gap:24px;align-items:center">'
+                f'<span style="font-size:0.8rem;color:#94a3b8">📄 <b>Paper Trades Today</b></span>'
+                f'<span style="color:#f8fafc;font-weight:700">{_n_today} created</span>'
+                f'<span style="color:#f59e0b;font-weight:600">{_n_open} open</span>'
+                f'<span style="color:{_pnl_color};font-weight:700">Live P&amp;L: ₹{_paper_pnl:+,.2f}</span>'
+                f'<span style="font-size:0.75rem;color:#64748b">Capital ₹{config.PAPER_CAPITAL:,} · '
+                f'₹{config.PAPER_CAPITAL//config.PAPER_MAX_POSITIONS:,}/trade</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
         _n_il = st.session_state.get("_n_intra_long",  0)
         _n_is = st.session_state.get("_n_intra_short", 0)
         _it_long_tab, _it_short_tab = st.tabs([
@@ -3481,7 +3706,7 @@ with tab_activity:
         st.markdown("---")
 
         # ── Filters ────────────────────────────────────────────────────────
-        _f1, _f2, _f3, _f4 = st.columns(4)
+        _f1, _f2, _f3, _f4, _f5 = st.columns(5)
         _filter_status = _f1.multiselect(
             "Status", ["OPEN", "CLOSED", "TARGET_HIT", "STOPPED_OUT", "CANCELLED"],
             default=[], placeholder="All statuses",
@@ -3492,6 +3717,7 @@ with tab_activity:
         )
         _filter_sym    = _f3.text_input("Symbol search", placeholder="e.g. RELIANCE")
         _sort_by       = _f4.selectbox("Sort by", ["Newest first", "Oldest first", "P&L ↓", "P&L ↑"])
+        _filter_trade_type = _f5.selectbox("Trade type", ["All", "Real only", "Paper only"])
 
         # ── Load and filter ────────────────────────────────────────────────
         _log_df = db.load_trade_log(
@@ -3503,6 +3729,10 @@ with tab_activity:
             _log_df = _log_df[_log_df["setup_type"].isin(_filter_setup)]
         if _filter_sym:
             _log_df = _log_df[_log_df["tradingsymbol"].str.contains(_filter_sym.upper(), na=False)]
+        if _filter_trade_type == "Paper only" and "is_paper_trade" in _log_df.columns:
+            _log_df = _log_df[_log_df["is_paper_trade"] == True]
+        elif _filter_trade_type == "Real only" and "is_paper_trade" in _log_df.columns:
+            _log_df = _log_df[(_log_df["is_paper_trade"] != True) | _log_df["is_paper_trade"].isna()]
 
         if _sort_by == "Oldest first":
             _log_df = _log_df.sort_values("logged_at", ascending=True)
@@ -3515,8 +3745,16 @@ with tab_activity:
 
         if not _log_df.empty:
             # ── Render trade log table ──────────────────────────────────────
+            # Add a human-readable Trade Type column
+            if "is_paper_trade" in _log_df.columns:
+                _log_df["trade_type"] = _log_df["is_paper_trade"].apply(
+                    lambda v: "📄 Paper" if v is True or v == 1 else "💸 Real"
+                )
+            else:
+                _log_df["trade_type"] = "💸 Real"
+
             _disp_cols = [
-                "id", "trade_date", "tradingsymbol", "setup_type", "signal_type",
+                "id", "trade_date", "tradingsymbol", "trade_type", "setup_type", "signal_type",
                 "quantity",
                 "rec_entry", "actual_entry",
                 "rec_stop",
@@ -3576,6 +3814,8 @@ with tab_activity:
                     "id":                  st.column_config.NumberColumn("ID",         width="small"),
                     "trade_date":          st.column_config.DateColumn("Date"),
                     "tradingsymbol":       st.column_config.TextColumn("Symbol"),
+                    "trade_type":          st.column_config.TextColumn("Type",
+                        help="📄 Paper = virtual paper trade auto-created by the system\n💸 Real = actual order placed / logged manually"),
                     "setup_type":          st.column_config.TextColumn("Setup"),
                     "signal_type":         st.column_config.TextColumn("Signal"),
                     "quantity":            st.column_config.NumberColumn("Qty"),
@@ -3628,6 +3868,65 @@ with tab_activity:
                     db.delete_trade(int(_del_id))
                     st.success(f"Trade #{_del_id} deleted.")
                     st.rerun()
+
+            # ── Paper Trade Performance ───────────────────────────────────
+            st.markdown("---")
+            st.subheader("📄 Paper Trade Performance")
+            _paper_perf = db.get_paper_trade_perf(user_id=_cur_user_id, days=30)
+            _paper_overall = _paper_perf.get("overall", {})
+            _paper_long    = _paper_perf.get("BUY_ABOVE",  {})
+            _paper_short   = _paper_perf.get("SELL_BELOW", {})
+            if _paper_overall.get("total", 0) == 0:
+                st.info(
+                    "No closed paper trades yet. Paper trades are auto-created when an "
+                    "intraday signal reaches TRIGGERED status during market hours.",
+                    icon="📄",
+                )
+            else:
+                _pp1, _pp2, _pp3, _pp4 = st.columns(4)
+                _pp1.metric("Total paper trades", _paper_overall["total"])
+                _pp2.metric("Win rate (30d)", f"{_paper_overall['win_rate']:.1f}%",
+                            help="% of closed paper trades that hit T1")
+                _pp3.metric("Avg R/R achieved",
+                            f"{_paper_overall['avg_rr']:.2f}×" if _paper_overall.get("avg_rr") else "—",
+                            help="Actual risk/reward ratio across closed paper trades")
+                # Current algo thresholds
+                _sig_cfg_disp = db.get_signal_config(user_id=_cur_user_id)
+                _pp4.metric("RSI buy max (tuned)",
+                            f"{_sig_cfg_disp['intraday_rsi_buy_max']:.0f}",
+                            delta=f"{_sig_cfg_disp['intraday_rsi_buy_max'] - 75:.0f} from default" if _sig_cfg_disp['intraday_rsi_buy_max'] != 75 else None,
+                            help="Current RSI overbought threshold for BUY_ABOVE signals")
+
+                # Per-signal breakdown table
+                _pp_rows = []
+                for _sig_k, _sig_d in [("BUY_ABOVE (Long)", _paper_long),
+                                        ("SELL_BELOW (Short)", _paper_short)]:
+                    if _sig_d.get("total", 0) > 0:
+                        _pp_rows.append({
+                            "Signal":       _sig_k,
+                            "Trades":       _sig_d["total"],
+                            "Wins":         _sig_d["wins"],
+                            "Losses":       _sig_d["losses"],
+                            "Win Rate":     f"{_sig_d['win_rate']:.1f}%",
+                            "Avg R/R":      f"{_sig_d['avg_rr']:.2f}×" if _sig_d.get("avg_rr") else "—",
+                            "Avg P&L %":   f"{_sig_d['avg_pnl_pct']:+.2f}%" if _sig_d.get("avg_pnl_pct") is not None else "—",
+                        })
+                if _pp_rows:
+                    st.dataframe(pd.DataFrame(_pp_rows), hide_index=True, use_container_width=True)
+
+                # Active thresholds banner
+                _cur_cfg = db.get_signal_config(user_id=_cur_user_id)
+                st.markdown(
+                    f'<div style="background:#0f172a;border:1px solid #1e293b;border-radius:8px;'
+                    f'padding:10px 16px;margin:8px 0;font-size:0.8rem;color:#94a3b8">'
+                    f'⚙️ <b>Active signal thresholds</b> (tuned from paper results): &nbsp;'
+                    f'RSI buy max = <b style="color:#f8fafc">{_cur_cfg["intraday_rsi_buy_max"]:.0f}</b> &nbsp;|&nbsp; '
+                    f'RSI sell min = <b style="color:#f8fafc">{_cur_cfg["intraday_rsi_sell_min"]:.0f}</b> &nbsp;|&nbsp; '
+                    f'Min R/R = <b style="color:#f8fafc">{_cur_cfg["intraday_min_rr"]:.1f}×</b> &nbsp;|&nbsp; '
+                    f'<span style="color:#64748b">Run <b>Full Rescan</b> or <b>Refresh Signals</b> to apply tuned thresholds to the signal universe</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
 
             # ── Training data export ──────────────────────────────────────
             st.markdown("---")

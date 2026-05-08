@@ -553,7 +553,7 @@ def quick_refresh(client: "KiteClient | None" = None) -> dict:
     }
 
 
-def refresh_signals_only(progress_callback=None) -> dict:
+def refresh_signals_only(progress_callback=None, user_id: str = "") -> dict:
     """
     Recompute ALL trade signals from OHLCV already stored in the DB.
 
@@ -565,6 +565,9 @@ def refresh_signals_only(progress_callback=None) -> dict:
       • After a code change to signals.py (new setups, bug fixes)
       • When signal columns are missing/NULL after a failed Full Rescan
       • To refresh signals mid-day without fetching new history
+
+    Loads per-user signal_config overrides (derived from paper trade feedback)
+    and applies them to the intraday signal computation.
     """
     from signals import compute_all_signals as _all_sigs
 
@@ -572,6 +575,12 @@ def refresh_signals_only(progress_callback=None) -> dict:
     metrics = db.load_metrics()
     if metrics.empty:
         return {"error": "No data in DB. Run Full Rescan first."}
+
+    # Load tuned thresholds from paper-trade feedback (falls back to defaults)
+    sig_cfg = db.get_signal_config(user_id=user_id)
+    _rsi_buy_max  = sig_cfg.get("intraday_rsi_buy_max",  75.0)
+    _rsi_sell_min = sig_cfg.get("intraday_rsi_sell_min", 25.0)
+    _min_rr       = sig_cfg.get("intraday_min_rr",        1.5)
 
     total   = len(metrics)
     updated = 0
@@ -591,7 +600,10 @@ def refresh_signals_only(progress_callback=None) -> dict:
             if ohlcv.empty or len(ohlcv) < 5:
                 continue
             m    = row.to_dict()
-            sigs = _all_sigs(ohlcv, m)
+            sigs = _all_sigs(ohlcv, m,
+                             rsi_buy_max=_rsi_buy_max,
+                             rsi_sell_min=_rsi_sell_min,
+                             min_rr=_min_rr)
             for col, val in sigs.items():
                 if col in metrics.columns:
                     metrics.at[idx, col] = val
@@ -608,4 +620,9 @@ def refresh_signals_only(progress_callback=None) -> dict:
         "errors":          errors,
         "total":           total,
         "elapsed_sec":     round(time.time() - t0, 1),
+        "thresholds_used": {
+            "rsi_buy_max":  _rsi_buy_max,
+            "rsi_sell_min": _rsi_sell_min,
+            "min_rr":       _min_rr,
+        },
     }

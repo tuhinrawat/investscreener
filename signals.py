@@ -347,7 +347,13 @@ _INTRA_NULL = {
 }
 
 
-def intraday_signal(df: pd.DataFrame, metrics: dict) -> dict:
+def intraday_signal(
+    df: pd.DataFrame,
+    metrics: dict,
+    rsi_buy_max: float = 75.0,
+    rsi_sell_min: float = 25.0,
+    min_rr: float = 1.5,
+) -> dict:
     """
     Day-trading plan derived from the previous session's candle.
 
@@ -358,8 +364,11 @@ def intraday_signal(df: pd.DataFrame, metrics: dict) -> dict:
 
     Key rule: ALL intraday trades must be closed by 3:10 PM regardless.
 
-    LONG  entry = 0.1% above R1  | stop = just below Pivot     | T1 = R2
-    SHORT entry = 0.1% below S1  | stop = just above Pivot     | T1 = S2
+    LONG  entry = 0.1% above R1  | stop = just below R1  | T1 = R2
+    SHORT entry = 0.1% below S1  | stop = just above S1  | T1 = S2
+
+    Thresholds (rsi_buy_max, rsi_sell_min, min_rr) are tunable via paper-trade
+    feedback — pass values from db.get_signal_config() to adjust the algo.
     """
     ltp = _v(metrics.get("ltp"))
     e20 = _v(metrics.get("ema_20"))
@@ -390,7 +399,7 @@ def intraday_signal(df: pd.DataFrame, metrics: dict) -> dict:
         }
 
     # ── LONG: above EMA20, RSI not overbought ──────────────────────────────
-    if ltp > e20 and (rsi is None or rsi < 75):
+    if ltp > e20 and (rsi is None or rsi < rsi_buy_max):
         entry = round(R1 * 1.001, 2)
         # Ensure entry is strictly above R1 (rounding can collapse them for sub-₹10 stocks)
         if entry <= R1:
@@ -416,14 +425,14 @@ def intraday_signal(df: pd.DataFrame, metrics: dict) -> dict:
         risk = entry - stop
         rr   = round((t1 - entry) / risk, 2) if risk > 0 else 0
 
-        # Enforce minimum R/R ≥ 1.5 — reject poor-quality setups
-        if rr < 1.5:
+        # Enforce minimum R/R gate (tunable via paper-trade feedback)
+        if rr < min_rr:
             return {
                 **_INTRA_NULL,
                 "intraday_signal": "AVOID",
                 "intraday_pivot": P, "intraday_r1": R1, "intraday_r2": R2,
                 "intraday_s1": S1, "intraday_s2": S2,
-                "intraday_reason": f"R/R {rr:.1f}× < 1.5 minimum — risk not justified.",
+                "intraday_reason": f"R/R {rr:.1f}× < {min_rr:.1f}× minimum — risk not justified.",
             }
         return {
             "intraday_signal": "BUY_ABOVE",
@@ -445,7 +454,7 @@ def intraday_signal(df: pd.DataFrame, metrics: dict) -> dict:
 
     # ── SHORT: below EMA20, RSI not oversold (still room to fall) ──────────
     _short_range_ok = (S1 - S2) / S1 > 0.005 if S1 > 0 else False
-    if ltp < e20 and (rsi is None or rsi > 25) and _short_range_ok:
+    if ltp < e20 and (rsi is None or rsi > rsi_sell_min) and _short_range_ok:
         entry = round(S1 * 0.999, 2)          # 0.1% below S1 = breakdown confirmation
         # Stop = just above S1 (the breakdown level).
         # If price recovers back above S1, the breakdown was false → exit tight.
@@ -454,14 +463,14 @@ def intraday_signal(df: pd.DataFrame, metrics: dict) -> dict:
         risk  = stop - entry
         rr    = round((entry - t1) / risk, 2) if risk > 0 else 0
 
-        # Enforce minimum R/R ≥ 1.5
-        if rr < 1.5:
+        # Enforce minimum R/R gate (tunable via paper-trade feedback)
+        if rr < min_rr:
             return {
                 **_INTRA_NULL,
                 "intraday_signal": "AVOID",
                 "intraday_pivot": P, "intraday_r1": R1, "intraday_r2": R2,
                 "intraday_s1": S1, "intraday_s2": S2,
-                "intraday_reason": f"Short R/R {rr:.1f}× < 1.5 minimum — risk not justified.",
+                "intraday_reason": f"Short R/R {rr:.1f}× < {min_rr:.1f}× minimum — risk not justified.",
             }
         return {
             "intraday_signal": "SELL_BELOW",
@@ -602,16 +611,28 @@ def scaling_signal(df: pd.DataFrame, metrics: dict) -> dict:
 
 # ─── master function ─────────────────────────────────────────────────────────
 
-def compute_all_signals(df: pd.DataFrame, metrics: dict) -> dict:
+def compute_all_signals(
+    df: pd.DataFrame,
+    metrics: dict,
+    rsi_buy_max: float = 75.0,
+    rsi_sell_min: float = 25.0,
+    min_rr: float = 1.5,
+) -> dict:
     """
     Runs all three setups and returns a single merged dict.
     Safe to call even if df is empty or metrics are partial.
+
+    Pass rsi_buy_max / rsi_sell_min / min_rr from db.get_signal_config() to
+    use paper-trade-tuned thresholds instead of the hard-coded defaults.
     """
     if df is None or df.empty or len(df) < 20:
         return {**_SWING_NULL, **_INTRA_NULL, **_SCALE_NULL}
 
     df = df.sort_values("date").reset_index(drop=True)
     sw = swing_signal(df, metrics)
-    it = intraday_signal(df, metrics)
+    it = intraday_signal(df, metrics,
+                         rsi_buy_max=rsi_buy_max,
+                         rsi_sell_min=rsi_sell_min,
+                         min_rr=min_rr)
     sc = scaling_signal(df, metrics)
     return {**sw, **it, **sc}
