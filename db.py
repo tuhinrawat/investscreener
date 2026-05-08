@@ -813,6 +813,41 @@ def get_open_paper_trades(user_id: str = "", trade_date=None) -> list:
     ]
 
 
+def get_all_today_paper_trades(user_id: str = "", trade_date=None) -> list:
+    """
+    Return ALL paper trades for today (any status: OPEN, TARGET_HIT, STOPPED_OUT …).
+    Used on startup to rebuild paper_triggered so closed trades can't re-fire after
+    a page refresh.
+    """
+    import datetime as _dt
+    d = trade_date or _dt.date.today()
+    con = get_conn()
+    _uid_clause = "AND kite_user_id = ?" if user_id else ""
+    _params = [str(d)] + ([user_id] if user_id else [])
+    rows = con.execute(
+        f"""SELECT id, tradingsymbol, signal_type, actual_entry, rec_stop, rec_t1, status
+            FROM trade_log
+            WHERE is_paper_trade = TRUE
+              AND trade_date = ?
+              {_uid_clause}
+            ORDER BY id""",
+        _params,
+    ).fetchall()
+    con.close()
+    return [
+        {
+            "id":            r[0],
+            "tradingsymbol": r[1],
+            "signal_type":   r[2],
+            "actual_entry":  r[3],
+            "rec_stop":      r[4],
+            "rec_t1":        r[5],
+            "status":        r[6],
+        }
+        for r in rows
+    ]
+
+
 def get_today_closed_pnl(user_id: str = "", is_paper: bool | None = None) -> float:
     """
     Returns the total realised P&L for trades closed TODAY.

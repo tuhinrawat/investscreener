@@ -484,13 +484,16 @@ def intraday_signal(
         if entry <= R1:
             entry = round(R1 + max(0.01, R1 * 0.001), 2)
 
-        # Stop = just below R1 (the breakout level).
-        # Rationale: once R1 breaks it should act as support. If price falls back
-        # below R1 the breakout has failed → exit tight. This gives a 0.3–0.5%
-        # risk vs 1–3% gain (R1→R2), producing R/R of 2–6×.
-        # The old Pivot-based stop (P – 0.25×ATR) was ≈(P–L) away from entry
-        # while the target was only (H–P) away → R/R often < 1.
-        stop = round(R1 * 0.997, 2)          # 0.3% below the breakout level
+        # Stop = max(R1×0.997, R1 − 0.5×ATR).
+        # Using a flat 0.3% was too tight for volatile mid/small caps (ATR often
+        # 1–2% of price). The ATR-based floor prevents the stop from sitting inside
+        # normal intraday noise while keeping the R1-anchor logic intact.
+        # On low-volatility large-caps the 0.3% flat wins; on small-caps the ATR
+        # floor protects against premature stops.
+        _atr_stop = round(R1 - 0.5 * atr, 2) if atr else None
+        stop = round(R1 * 0.997, 2)          # 0.3% below R1 (minimum stop)
+        if _atr_stop is not None and _atr_stop < stop:
+            stop = _atr_stop                 # widen if ATR warrants it
 
         t1   = R2
         if t1 <= entry:
@@ -528,7 +531,7 @@ def intraday_signal(
             "intraday_reason": (
                 f"Trend up (above EMA20 ₹{e20:.2f}). "
                 f"BUY when price trades above R1 ₹{R1:.2f}. "
-                f"Stop just below R1 ₹{stop:.2f}. "
+                f"Stop ₹{stop:.2f} (max of 0.3% below R1, 0.5×ATR={0.5*atr:.2f}). "
                 f"Target R2 ₹{R2:.2f}. R/R {rr:.1f}×. "
                 f"Confidence {_conf}/10. Hard exit 3:10 PM."
             ),
@@ -538,9 +541,11 @@ def intraday_signal(
     _short_range_ok = (S1 - S2) / S1 > 0.005 if S1 > 0 else False
     if ltp < e20 and (rsi is None or rsi > rsi_sell_min) and _short_range_ok:
         entry = round(S1 * 0.999, 2)          # 0.1% below S1 = breakdown confirmation
-        # Stop = just above S1 (the breakdown level).
-        # If price recovers back above S1, the breakdown was false → exit tight.
-        stop  = round(S1 * 1.003, 2)          # 0.3% above the breakdown level
+        # Stop = max(S1×1.003, S1 + 0.5×ATR) — mirror of the long-side ATR widening.
+        _atr_stop_s = round(S1 + 0.5 * atr, 2) if atr else None
+        stop = round(S1 * 1.003, 2)           # 0.3% above S1 (minimum stop)
+        if _atr_stop_s is not None and _atr_stop_s > stop:
+            stop = _atr_stop_s                # widen if ATR warrants it
         t1    = S2
         risk  = stop - entry
         rr    = round((entry - t1) / risk, 2) if risk > 0 else 0

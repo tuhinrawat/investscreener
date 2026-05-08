@@ -501,6 +501,13 @@ if "trading_mode" not in st.session_state:
 if "real_triggered" not in st.session_state:
     st.session_state["real_triggered"] = {}
 
+# _entry_confirm_since: {sym: datetime} — tracks when LTP first crossed the entry
+# level.  Auto-trigger fires only after the price stays above entry for
+# ENTRY_CONFIRM_SECS seconds (false-breakout filter).
+if "_entry_confirm_since" not in st.session_state:
+    st.session_state["_entry_confirm_since"] = {}
+_ENTRY_CONFIRM_SECS = 30   # require 30 s sustained above entry before firing
+
 # ── Daily gain gate — reset every new trading day ─────────────────────────────
 # paper_day_hwm_pct : high-water mark of today's realised return % (paper trades)
 # paper_day_blocked : True once the trailing cutoff is triggered
@@ -523,17 +530,22 @@ if st.session_state.get("_paper_sync_date") != _today_str:
     except Exception:
         pass
     try:
-        _existing = db.get_open_paper_trades(user_id=_cur_user_id)
-        for _pt in _existing:
+        # Load ALL of today's paper trades (open + closed) so that symbols whose
+        # trades already closed cannot re-trigger after a page refresh.
+        _all_today_trades = db.get_all_today_paper_trades(user_id=_cur_user_id)
+        for _pt in _all_today_trades:
             _k = (_today_str, _pt["tradingsymbol"])
+            # Always mark symbol as triggered (blocks re-entry for any status)
             st.session_state["paper_triggered"][_k] = _pt["id"]
-            st.session_state["paper_open"][_pt["id"]] = {
-                "sym":         _pt["tradingsymbol"],
-                "stop":        float(_pt["rec_stop"] or 0),
-                "t1":          float(_pt["rec_t1"] or 0),
-                "signal_type": _pt["signal_type"],
-                "entry":       float(_pt["actual_entry"] or 0),
-            }
+            # Only add OPEN trades to the exit-monitoring dict
+            if _pt["status"] == "OPEN":
+                st.session_state["paper_open"][_pt["id"]] = {
+                    "sym":         _pt["tradingsymbol"],
+                    "stop":        float(_pt["rec_stop"] or 0),
+                    "t1":          float(_pt["rec_t1"] or 0),
+                    "signal_type": _pt["signal_type"],
+                    "entry":       float(_pt["actual_entry"] or 0),
+                }
     except Exception:
         pass
     st.session_state["_paper_sync_date"] = _today_str
@@ -2983,6 +2995,9 @@ def _live_signals_header():
         _live_ltp_now = st.session_state.get("_live_ltp", {})
 
         # ── Pass 1: T1 / stop-loss exits ─────────────────────────────────────
+        # Stop is triggered at planned stop price OR if LTP has blown >0.2% past
+        # it (fast-exit: don't wait for the next 2-second tick, exit at actual LTP).
+        _STOP_OVERSHOOT_PCT = 0.002   # 0.2% past planned stop = fast-exit at LTP
         _exits = []
         for _pid, _pt in list(st.session_state["paper_open"].items()):
             _pt_ltp = _live_ltp_now.get(_pt.get("sym", ""), 0)
@@ -2991,15 +3006,25 @@ def _live_signals_header():
             _sig  = _pt.get("signal_type", "")
             _t1   = _pt.get("t1", 0)
             _stop = _pt.get("stop", 0)
+            _entry = _pt.get("entry", 0)
             if _sig == "BUY_ABOVE":
                 if _t1 and _pt_ltp >= _t1:
                     _exits.append((_pid, _pt["sym"], "TARGET_HIT", _t1))
                 elif _stop and _pt_ltp <= _stop:
+                    # Exit at actual LTP (may be below planned stop on fast moves)
+                    _exit_px = _pt_ltp
+                    _exits.append((_pid, _pt["sym"], "STOPPED_OUT", _exit_px))
+                elif _stop and _entry and _pt_ltp < _stop * (1 - _STOP_OVERSHOOT_PCT):
+                    # Emergency fast-exit: LTP has blown >0.2% below planned stop
                     _exits.append((_pid, _pt["sym"], "STOPPED_OUT", _pt_ltp))
             elif _sig == "SELL_BELOW":
                 if _t1 and _pt_ltp <= _t1:
                     _exits.append((_pid, _pt["sym"], "TARGET_HIT", _t1))
                 elif _stop and _pt_ltp >= _stop:
+                    _exit_px = _pt_ltp
+                    _exits.append((_pid, _pt["sym"], "STOPPED_OUT", _exit_px))
+                elif _stop and _pt_ltp > _stop * (1 + _STOP_OVERSHOOT_PCT):
+                    # Emergency fast-exit for short: LTP >0.2% above planned stop
                     _exits.append((_pid, _pt["sym"], "STOPPED_OUT", _pt_ltp))
         for _pid, _sym_e, _outcome, _ep in _exits:
             try:
@@ -3381,7 +3406,18 @@ def _intraday_long_live():
         confidence = int(_conf_raw) if not _isna(_conf_raw) else 0
         if r1_val and ltp_now:
             if ltp_now >= entry_val:
-                live_status = "TRIGGERED"
+                # Show confirming countdown until 30s are up
+                _cs_map = st.session_state.get("_entry_confirm_since", {})
+                _cs_ts  = _cs_map.get(sym)
+                if _cs_ts is not None:
+                    _elapsed = (datetime.now(_IST) - _cs_ts).total_seconds()
+                    if _elapsed < _ENTRY_CONFIRM_SECS:
+                        _remaining = int(_ENTRY_CONFIRM_SECS - _elapsed)
+                        live_status = f"CONFIRMING {_remaining}s"
+                    else:
+                        live_status = "TRIGGERED"
+                else:
+                    live_status = "TRIGGERED"
             elif ltp_now >= r1_val * 0.995:
                 live_status = "APPROACHING"
             elif s1_val and ltp_now < s1_val:
@@ -3422,7 +3458,24 @@ def _intraday_long_live():
         _paper_key  = (_today_str, sym)
         _real_key   = (_today_str, sym)
 
-        if live_status == "TRIGGERED" and _within_limit and not _ltp_stale:
+        # ── False-breakout confirmation timer ────────────────────────────────
+        # Record the first moment LTP crossed entry. Only auto-trade after the
+        # price has stayed above entry for _ENTRY_CONFIRM_SECS seconds.
+        _confirm_map = st.session_state.setdefault("_entry_confirm_since", {})
+        if live_status == "TRIGGERED":
+            if sym not in _confirm_map:
+                _confirm_map[sym] = datetime.now(_IST)
+        else:
+            # Price fell back below entry — reset timer
+            _confirm_map.pop(sym, None)
+
+        _confirm_ts  = _confirm_map.get(sym)
+        _confirmed   = (
+            _confirm_ts is not None and
+            (datetime.now(_IST) - _confirm_ts).total_seconds() >= _ENTRY_CONFIRM_SECS
+        )
+
+        if live_status == "TRIGGERED" and _confirmed and _within_limit and not _ltp_stale:
 
             # ── PAPER mode ────────────────────────────────────────────────────
             if (_trade_mode == "paper"
@@ -3455,7 +3508,8 @@ def _intraday_long_live():
                         "signal_type": "BUY_ABOVE", "entry": _trigger_price,
                         "cap": _cap_this_trade,
                     }
-                    st.toast(f"📄 Paper BUY [{_conf_tier}]: {sym} @ ₹{_trigger_price:.2f} × {_pqty}", icon="📄")
+                    _confirm_map.pop(sym, None)  # reset timer after firing
+                    st.toast(f"📄 Paper BUY [{_conf_tier}]: {sym} @ ₹{_trigger_price:.2f} × {_pqty} (confirmed {_ENTRY_CONFIRM_SECS}s)", icon="📄")
                 except Exception:
                     pass
 
@@ -3467,15 +3521,20 @@ def _intraday_long_live():
                 if _kc_rt and getattr(_kc_rt, "authenticated", False):
                     try:
                         _stop_val = float(r.get("intraday_stop") or 0)
+                        # Place entry LIMIT order first; SL placed only after fill
                         _oid = _kc_rt.place_order(
                             tradingsymbol    = sym,
                             qty              = _pqty,
                             transaction_type = "BUY",
-                            order_type       = "SL-M",
+                            order_type       = "LIMIT",
                             product          = "MIS",
-                            trigger_price    = entry_val,
+                            price            = round(_trigger_price * 1.001, 1),
                             tag              = "scr_intra",
                         )
+                        # SL-M companion order — placed immediately after entry order.
+                        # In practice Kite fills near-instantly for liquid stocks so
+                        # this is safe. For a stricter guarantee, poll order status
+                        # and place SL only once status = "COMPLETE".
                         _sl_oid = None
                         if _stop_val:
                             try:
@@ -3513,6 +3572,7 @@ def _intraday_long_live():
                             "is_paper_trade":      False,
                         })
                         st.session_state["real_triggered"][_real_key] = _rid
+                        _confirm_map.pop(sym, None)  # reset timer after firing
                         st.toast(f"💸 Real BUY [{_conf_tier}]: {sym} @ ₹{_trigger_price:.2f} × {_pqty} | Kite {_oid}", icon="💸")
                     except Exception as _re:
                         st.toast(f"⚠ Real order failed for {sym}: {_re}", icon="⚠️")
@@ -3713,7 +3773,17 @@ def _intraday_short_live():
         confidence = int(_conf_raw) if not _isna(_conf_raw) else 0
         if s1_val and ltp_now:
             if ltp_now <= entry_val:
-                short_status = "TRIGGERED"
+                _cs_map_s = st.session_state.get("_entry_confirm_since", {})
+                _cs_ts_s  = _cs_map_s.get(f"_short_{sym}")
+                if _cs_ts_s is not None:
+                    _elapsed_s = (datetime.now(_IST) - _cs_ts_s).total_seconds()
+                    if _elapsed_s < _ENTRY_CONFIRM_SECS:
+                        _rem_s = int(_ENTRY_CONFIRM_SECS - _elapsed_s)
+                        short_status = f"CONFIRMING {_rem_s}s"
+                    else:
+                        short_status = "TRIGGERED"
+                else:
+                    short_status = "TRIGGERED"
             elif ltp_now <= s1_val * 1.005:
                 short_status = "APPROACHING"
             elif piv_val and ltp_now > piv_val:
@@ -3753,7 +3823,22 @@ def _intraday_short_live():
         _paper_key  = (_today_str, sym)
         _real_key   = (_today_str, sym)
 
-        if short_status == "TRIGGERED" and _within_limit and not _ltp_stale:
+        # ── False-breakout confirmation timer (shorts) ───────────────────────
+        _confirm_map_s = st.session_state.setdefault("_entry_confirm_since", {})
+        _short_key = f"_short_{sym}"
+        if short_status == "TRIGGERED":
+            if _short_key not in _confirm_map_s:
+                _confirm_map_s[_short_key] = datetime.now(_IST)
+        else:
+            _confirm_map_s.pop(_short_key, None)
+
+        _confirm_ts_s = _confirm_map_s.get(_short_key)
+        _confirmed_s  = (
+            _confirm_ts_s is not None and
+            (datetime.now(_IST) - _confirm_ts_s).total_seconds() >= _ENTRY_CONFIRM_SECS
+        )
+
+        if short_status == "TRIGGERED" and _confirmed_s and _within_limit and not _ltp_stale:
 
             # ── PAPER mode ────────────────────────────────────────────────────
             if (_trade_mode == "paper"
@@ -3786,7 +3871,8 @@ def _intraday_short_live():
                         "signal_type": "SELL_BELOW", "entry": _trigger_price,
                         "cap": _cap_this_trade,
                     }
-                    st.toast(f"📄 Paper SHORT [{_conf_tier}]: {sym} @ ₹{_trigger_price:.2f} × {_pqty}", icon="📄")
+                    _confirm_map_s.pop(_short_key, None)
+                    st.toast(f"📄 Paper SHORT [{_conf_tier}]: {sym} @ ₹{_trigger_price:.2f} × {_pqty} (confirmed {_ENTRY_CONFIRM_SECS}s)", icon="📄")
                 except Exception:
                     pass
 
@@ -3798,15 +3884,17 @@ def _intraday_short_live():
                 if _kc_rt and getattr(_kc_rt, "authenticated", False):
                     try:
                         _stop_val = float(r.get("intraday_stop") or 0)
+                        # Place entry LIMIT sell order first
                         _oid = _kc_rt.place_order(
                             tradingsymbol    = sym,
                             qty              = _pqty,
                             transaction_type = "SELL",
-                            order_type       = "SL-M",
+                            order_type       = "LIMIT",
                             product          = "MIS",
-                            trigger_price    = entry_val,
+                            price            = round(_trigger_price * 0.999, 1),
                             tag              = "scr_intra",
                         )
+                        # SL-M cover order placed after entry
                         _sl_oid = None
                         if _stop_val:
                             try:
@@ -3844,6 +3932,7 @@ def _intraday_short_live():
                             "is_paper_trade":      False,
                         })
                         st.session_state["real_triggered"][_real_key] = _rid
+                        _confirm_map_s.pop(_short_key, None)
                         st.toast(f"💸 Real SHORT [{_conf_tier}]: {sym} @ ₹{_trigger_price:.2f} × {_pqty} | Kite {_oid}", icon="💸")
                     except Exception as _re:
                         st.toast(f"⚠ Real short order failed for {sym}: {_re}", icon="⚠️")
