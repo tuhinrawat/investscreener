@@ -272,6 +272,42 @@ def init_schema():
             value VARCHAR
         );
     """)
+    # ── Market Intel tables ───────────────────────────────────────────────────
+    con.execute("""
+        CREATE SEQUENCE IF NOT EXISTS market_intel_log_id_seq START 1;
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS market_intel_log (
+            id                BIGINT DEFAULT nextval('market_intel_log_id_seq') PRIMARY KEY,
+            kite_user_id      VARCHAR DEFAULT '',
+            created_at        TIMESTAMP,
+            raw_output        TEXT,
+            overall_bias      VARCHAR,
+            overall_confidence VARCHAR
+        );
+    """)
+    con.execute("""
+        CREATE SEQUENCE IF NOT EXISTS market_intel_stocks_id_seq START 1;
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS market_intel_stocks (
+            id                   BIGINT DEFAULT nextval('market_intel_stocks_id_seq') PRIMARY KEY,
+            intel_id             BIGINT,
+            kite_user_id         VARCHAR DEFAULT '',
+            created_at           TIMESTAMP,
+            tradingsymbol        VARCHAR,
+            stance               VARCHAR,   -- BUY | SHORT | AVOID | BUY_ON_COND
+            sector               VARCHAR,
+            fundamental_reason   TEXT,
+            entry_trigger        TEXT,
+            stop_loss            VARCHAR,
+            conviction           VARCHAR,   -- HIGH | MED
+            condition_required   TEXT,
+            alert_level          VARCHAR,
+            expected_move        VARCHAR
+        );
+    """)
+
     # One-time migration: shift any logged_at values stored in UTC to IST.
     # Prior to this fix, CURRENT_TIMESTAMP (UTC on cloud) was used. Now we
     # explicitly pass IST datetimes. We shift every row once using the +5:30
@@ -1081,3 +1117,133 @@ def tune_signal_config_from_paper(user_id: str = "", days: int = 30) -> dict:
         save_signal_config(merged, user_id=user_id)
 
     return changes
+
+
+# ─── Market Intel helpers ─────────────────────────────────────────────────────
+
+def save_market_intel(
+    user_id: str,
+    raw_output: str,
+    bias: str,
+    confidence: str,
+    stocks: list,
+) -> int:
+    """
+    Save a market intel run: one log row + N stock rows.
+    Replaces any previous run for this user (deletes old stocks first).
+    Returns the new intel_id.
+    """
+    con = get_conn()
+    uid = user_id or ""
+    now = _now_ist()
+
+    # Delete previous intel stocks for this user (keep only latest run)
+    con.execute(
+        "DELETE FROM market_intel_stocks WHERE kite_user_id = ?",
+        [uid],
+    )
+
+    # Insert new log entry
+    con.execute(
+        """INSERT INTO market_intel_log
+               (kite_user_id, created_at, raw_output, overall_bias, overall_confidence)
+           VALUES (?, ?, ?, ?, ?)""",
+        [uid, now, raw_output[:50_000], bias, confidence],  # cap raw at 50K chars
+    )
+    intel_id = con.execute(
+        "SELECT id FROM market_intel_log WHERE kite_user_id = ? ORDER BY created_at DESC LIMIT 1",
+        [uid],
+    ).fetchone()[0]
+
+    # Insert stock rows
+    for s in stocks:
+        con.execute(
+            """INSERT INTO market_intel_stocks
+                   (intel_id, kite_user_id, created_at, tradingsymbol, stance, sector,
+                    fundamental_reason, entry_trigger, stop_loss, conviction,
+                    condition_required, alert_level, expected_move)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                intel_id, uid, now,
+                s.get("tradingsymbol", ""),
+                s.get("stance", ""),
+                s.get("sector", "")[:200],
+                s.get("fundamental_reason", "")[:500],
+                s.get("entry_trigger", "")[:500],
+                s.get("stop_loss", "")[:100],
+                s.get("conviction", "")[:20],
+                s.get("condition_required", "")[:500],
+                s.get("alert_level", "")[:200],
+                s.get("expected_move", "")[:200],
+            ],
+        )
+    con.close()
+    return intel_id
+
+
+def get_latest_market_intel(user_id: str = "") -> dict:
+    """
+    Return the most recent market intel log row for this user as a dict.
+    Returns {} if none found.
+    """
+    con = get_conn()
+    uid = user_id or ""
+    row = con.execute(
+        """SELECT id, created_at, overall_bias, overall_confidence, raw_output
+           FROM market_intel_log
+           WHERE kite_user_id = ?
+           ORDER BY created_at DESC LIMIT 1""",
+        [uid],
+    ).fetchone()
+    con.close()
+    if not row:
+        return {}
+    return {
+        "id":         row[0],
+        "created_at": row[1],
+        "bias":       row[2] or "NEUTRAL",
+        "confidence": row[3] or "MEDIUM",
+        "raw_output": row[4] or "",
+    }
+
+
+def get_market_intel_stocks(user_id: str = "") -> list:
+    """
+    Return all stock rows from the latest market intel run for this user.
+    Each row is a dict with tradingsymbol, stance, sector, entry_trigger, etc.
+    """
+    con = get_conn()
+    uid = user_id or ""
+    rows = con.execute(
+        """SELECT mis.tradingsymbol, mis.stance, mis.sector,
+                  mis.fundamental_reason, mis.entry_trigger, mis.stop_loss,
+                  mis.conviction, mis.condition_required,
+                  mis.alert_level, mis.expected_move, mis.created_at
+           FROM market_intel_stocks mis
+           INNER JOIN market_intel_log mil ON mis.intel_id = mil.id
+           WHERE mis.kite_user_id = ?
+             AND mil.id = (
+                 SELECT id FROM market_intel_log
+                 WHERE kite_user_id = ?
+                 ORDER BY created_at DESC LIMIT 1
+             )
+           ORDER BY mis.stance, mis.id""",
+        [uid, uid],
+    ).fetchall()
+    con.close()
+    return [
+        {
+            "tradingsymbol":      r[0],
+            "stance":             r[1],
+            "sector":             r[2],
+            "fundamental_reason": r[3],
+            "entry_trigger":      r[4],
+            "stop_loss":          r[5],
+            "conviction":         r[6],
+            "condition_required": r[7],
+            "alert_level":        r[8],
+            "expected_move":      r[9],
+            "created_at":         r[10],
+        }
+        for r in rows
+    ]
