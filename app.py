@@ -1354,6 +1354,26 @@ with tab_screener:
     if _ai_score_col:
         styled = styled.map(_color_ai_score, subset=_ai_score_col)
 
+    _screener_sym_q = st.text_input(
+        "🔍 Search symbol", placeholder="e.g. HDFCBANK, RELIANCE",
+        key="screener_sym_search", label_visibility="collapsed",
+    )
+    if _screener_sym_q:
+        _mask = filtered["tradingsymbol"].str.contains(
+            _screener_sym_q.strip().upper(), na=False
+        )
+        filtered = filtered[_mask]
+        styled = (
+            filtered[display_cols]
+            .style
+            .format(formatters, na_rep="—")
+            .map(color_returns, subset=_style_cols)
+        )
+        if _verdict_col:
+            styled = styled.map(_color_verdict, subset=_verdict_col)
+        if _ai_score_col:
+            styled = styled.map(_color_ai_score, subset=_ai_score_col)
+
     _W = config.TREND_WEIGHTS
     _cc = st.column_config
     st.dataframe(
@@ -3186,6 +3206,13 @@ def _intraday_long_live():
 
     st.caption("Watch for price to trade **above R1**. Enter with stop just below Pivot.")
 
+    _long_sym_q = st.text_input(
+        "🔍 Search symbol", placeholder="e.g. RELIANCE", key="intra_long_sym_search",
+        label_visibility="collapsed",
+    )
+    if _long_sym_q:
+        _si = _si[_si["tradingsymbol"].str.contains(_long_sym_q.strip().upper(), na=False)]
+
     _si_rows = []
     _paper_cap_per_trade = config.PAPER_CAPITAL // config.PAPER_MAX_POSITIONS
     for _, r in _si.iterrows():
@@ -3210,9 +3237,8 @@ def _intraday_long_live():
         _trade_mode   = st.session_state.get("trading_mode", "paper")
         _paper_key    = (_today_str, sym)
         _real_key     = (_today_str, sym)
-        _long_open_ct = len([p for p in st.session_state.get("paper_open", {}).values()
-                              if p.get("signal_type") == "BUY_ABOVE"])
-        _within_limit = _long_open_ct < config.PAPER_MAX_POSITIONS // 2 + 1
+        _total_open_ct = len(st.session_state.get("paper_open", {}))
+        _within_limit  = _total_open_ct < config.PAPER_MAX_POSITIONS
         _pqty = max(1, int(_paper_cap_per_trade / (entry_val or 1)))
 
         if live_status == "TRIGGERED" and _within_limit:
@@ -3462,6 +3488,13 @@ def _intraday_short_live():
         st.info("No intraday short setups for today's session.")
         return
 
+    _short_sym_q = st.text_input(
+        "🔍 Search symbol", placeholder="e.g. HDFCBANK", key="intra_short_sym_search",
+        label_visibility="collapsed",
+    )
+    if _short_sym_q:
+        _ss = _ss[_ss["tradingsymbol"].str.contains(_short_sym_q.strip().upper(), na=False)]
+
     st.caption(
         "Watch for price to break **below S1**. "
         "Short with cover-stop just above Pivot. "
@@ -3492,9 +3525,8 @@ def _intraday_short_live():
         _trade_mode    = st.session_state.get("trading_mode", "paper")
         _paper_key     = (_today_str, sym)
         _real_key      = (_today_str, sym)
-        _short_open_ct = len([p for p in st.session_state.get("paper_open", {}).values()
-                               if p.get("signal_type") == "SELL_BELOW"])
-        _within_limit  = _short_open_ct < config.PAPER_MAX_POSITIONS // 2 + 1
+        _total_open_ct = len(st.session_state.get("paper_open", {}))
+        _within_limit  = _total_open_ct < config.PAPER_MAX_POSITIONS
         _pqty = max(1, int(_paper_cap_per_trade / (entry_val or 1)))
 
         if short_status == "TRIGGERED" and _within_limit:
@@ -3761,6 +3793,12 @@ def _signals_main():
                 "Set a hard stop-loss at Stop. Book 50% at T1, let the rest run to T2 "
                 "with a trailing stop. Minimum R/R to consider: 1.5×."
             )
+            _swing_sym_q = st.text_input(
+                "🔍 Search symbol", placeholder="e.g. INFY", key="swing_buy_sym_search",
+                label_visibility="collapsed",
+            )
+            if _swing_sym_q:
+                _sb = _sb[_sb["tradingsymbol"].str.contains(_swing_sym_q.strip().upper(), na=False)]
             _sb_rows = []
             for _, r in _sb.iterrows():
                 _sb_rows.append([
@@ -3818,6 +3856,12 @@ def _signals_main():
                 "**How to use:** These are stocks where the uptrend structure has broken or "
                 "the stock is severely overbought. If you hold any of these, review your position."
             )
+            _exit_sym_q = st.text_input(
+                "🔍 Search symbol", placeholder="e.g. TATASTEEL", key="exit_sym_search",
+                label_visibility="collapsed",
+            )
+            if _exit_sym_q:
+                _se = _se[_se["tradingsymbol"].str.contains(_exit_sym_q.strip().upper(), na=False)]
             _se_rows = []
             for _, r in _se.iterrows():
                 ltp_v  = r.get("ltp")    or 0
@@ -3918,6 +3962,12 @@ def _signals_main():
                 "Add the final **30%** on a new 52W high with volume. "
                 "Trailing stop: close below EMA50 on any day."
             )
+            _scale_sym_q = st.text_input(
+                "🔍 Search symbol", placeholder="e.g. WIPRO", key="scaling_sym_search",
+                label_visibility="collapsed",
+            )
+            if _scale_sym_q:
+                _ssc = _ssc[_ssc["tradingsymbol"].str.contains(_scale_sym_q.strip().upper(), na=False)]
             _ssc_rows = []
             for _, r in _ssc.iterrows():
                 _ssc_rows.append([
