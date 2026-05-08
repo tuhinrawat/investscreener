@@ -17,7 +17,15 @@ Tables:
 import duckdb
 import pandas as pd
 from pathlib import Path
+from datetime import datetime as _dt_cls, timezone as _tz, timedelta as _td
 import config
+
+_IST = _tz(_td(hours=5, minutes=30))
+
+
+def _now_ist() -> _dt_cls:
+    """Current datetime in IST, timezone-naive (safe for DuckDB TIMESTAMP columns)."""
+    return _dt_cls.now(_IST).replace(tzinfo=None)
 
 
 def get_conn():
@@ -257,6 +265,28 @@ def init_schema():
             PRIMARY KEY (config_key, kite_user_id)
         );
     """)
+    # _db_meta — tracks one-time data migrations
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS _db_meta (
+            key   VARCHAR PRIMARY KEY,
+            value VARCHAR
+        );
+    """)
+    # One-time migration: shift any logged_at values stored in UTC to IST.
+    # Prior to this fix, CURRENT_TIMESTAMP (UTC on cloud) was used. Now we
+    # explicitly pass IST datetimes. We shift every row once using the +5:30
+    # offset and mark the migration complete so it never runs again.
+    already_done = con.execute(
+        "SELECT value FROM _db_meta WHERE key = 'logged_at_utc_to_ist_done'"
+    ).fetchone()
+    if not already_done:
+        con.execute("""
+            UPDATE trade_log
+            SET logged_at = logged_at + INTERVAL '5 hours 30 minutes'
+        """)
+        con.execute("""
+            INSERT INTO _db_meta (key, value) VALUES ('logged_at_utc_to_ist_done', '1')
+        """)
     con.close()
 
 
@@ -508,8 +538,8 @@ def log_trade(trade: dict) -> int:
             kite_user_id, kite_order_id, kite_sl_order_id, kite_status,
             quantity, actual_entry, actual_exit, status, notes,
             pnl_amount, pnl_pct, slippage_entry_pct, rr_realised,
-            is_paper_trade
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            is_paper_trade, logged_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, [
         trade.get("trade_date"),
         trade.get("tradingsymbol"),
@@ -538,6 +568,7 @@ def log_trade(trade: dict) -> int:
         outcomes["slippage_entry_pct"],
         outcomes["rr_realised"],
         bool(trade.get("is_paper_trade", False)),
+        trade.get("logged_at") or _now_ist(),
     ])
     row_id = con.execute("SELECT max(id) FROM trade_log").fetchone()[0]
     con.close()
