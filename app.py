@@ -3737,6 +3737,8 @@ def _activity_log_live():
         )
         return
 
+    _cap = config.PAPER_CAPITAL  # reference capital for both paper and real
+
     def _stat_banner(label: str, icon: str, s: dict, accent: str, extra_html: str = "") -> str:
         """Build a compact dark banner for one category of trades."""
         if not s or s.get("total", 0) == 0:
@@ -3748,11 +3750,12 @@ def _activity_log_live():
                 f'<span style="color:#475569;font-size:0.8rem;margin-left:16px">No trades yet</span>'
                 f'</div>'
             )
-        _pnl     = s["total_pnl"]
-        _pnl_c   = "#22c55e" if _pnl >= 0 else "#ef4444"
-        _wr      = f"{s['win_rate']:.1f}%" if s["closed"] > 0 else "—"
-        _rr      = f"{s['avg_rr']:.2f}×" if s.get("avg_rr") else "—"
-        _best    = f"₹{s['best_trade']:+,.0f}" if s.get("best_trade") else "—"
+        _pnl      = s["total_pnl"]
+        _pnl_c    = "#22c55e" if _pnl >= 0 else "#ef4444"
+        _pnl_pct  = (_pnl / _cap * 100) if _cap else 0.0
+        _wr       = f"{s['win_rate']:.1f}%" if s["closed"] > 0 else "—"
+        _rr       = f"{s['avg_rr']:.2f}×" if s.get("avg_rr") else "—"
+        _best     = f"₹{s['best_trade']:+,.0f}" if s.get("best_trade") else "—"
         return (
             f'<div style="background:#0f172a;border:1px solid #334155;border-radius:8px;'
             f'padding:10px 18px;flex:1;min-width:280px;display:flex;flex-wrap:wrap;gap:16px;align-items:center">'
@@ -3765,7 +3768,9 @@ def _activity_log_live():
             f'<span style="font-size:0.8rem;color:#94a3b8">Win rate '
             f'<b style="color:#f8fafc">{_wr}</b></span>'
             f'<span style="font-size:0.8rem;color:#94a3b8">Total P&amp;L '
-            f'<b style="color:{_pnl_c}">₹{_pnl:+,.0f}</b></span>'
+            f'<b style="color:{_pnl_c}">₹{_pnl:+,.0f}</b> '
+            f'<span style="font-size:0.75rem;color:{_pnl_c}">({_pnl_pct:+.2f}% of ₹{_cap//100_000}L)</span>'
+            f'</span>'
             f'<span style="font-size:0.8rem;color:#94a3b8">Best '
             f'<b style="color:#f8fafc">{_best}</b></span>'
             f'<span style="font-size:0.8rem;color:#94a3b8">Avg R/R '
@@ -3774,36 +3779,51 @@ def _activity_log_live():
             f'</div>'
         )
 
-    # Extra info on the paper banner: today's gate status
+    # Extra info on the paper banner: today's realised return + gate status
     _p_today_pnl = 0.0
     try:
         _p_today_pnl = db.get_today_closed_pnl(user_id=_uid, is_paper=True)
     except Exception:
         pass
-    _p_today_ret   = (_p_today_pnl / config.PAPER_CAPITAL * 100) if config.PAPER_CAPITAL else 0.0
+    _p_today_ret   = (_p_today_pnl / _cap * 100) if _cap else 0.0
     _p_hwm         = st.session_state.get("paper_day_hwm_pct", 0.0)
     _p_cutoff      = (_p_hwm - config.DAILY_TRAIL_PCT) if _p_hwm >= config.DAILY_TARGET_LOW_PCT else None
     _p_blocked_now = st.session_state.get("paper_day_blocked", False)
+
+    # Real: today's realised return
+    _r_today_pnl = 0.0
+    try:
+        _r_today_pnl = db.get_today_closed_pnl(user_id=_uid, is_paper=False)
+    except Exception:
+        pass
+    _r_today_ret = (_r_today_pnl / _cap * 100) if _cap else 0.0
+
     if _p_blocked_now:
         _paper_extra = (
             f'<span style="font-size:0.73rem;color:#ef4444;font-weight:600">'
-            f'🚫 Gate closed · Today: {_p_today_ret:+.2f}%</span>'
+            f'🚫 Gate closed &nbsp;·&nbsp; Today: <b>{_p_today_ret:+.2f}%</b> of ₹{_cap//100_000}L</span>'
         )
     elif _p_cutoff is not None:
         _paper_extra = (
             f'<span style="font-size:0.73rem;color:#f59e0b">'
-            f'⚡ Today: {_p_today_ret:+.2f}% · Cutoff: {_p_cutoff:.2f}%</span>'
+            f'⚡ Today: <b>{_p_today_ret:+.2f}%</b> &nbsp;·&nbsp; Cutoff: {_p_cutoff:.2f}%</span>'
         )
     else:
         _paper_extra = (
             f'<span style="font-size:0.73rem;color:#64748b">'
-            f'Today: {_p_today_ret:+.2f}% · Target ≥{config.DAILY_TARGET_LOW_PCT:.0f}%</span>'
+            f'Today: <b style="color:#f8fafc">{_p_today_ret:+.2f}%</b> of ₹{_cap//100_000}L '
+            f'&nbsp;·&nbsp; Target ≥{config.DAILY_TARGET_LOW_PCT:.0f}%</span>'
         )
+
+    _real_extra = (
+        f'<span style="font-size:0.73rem;color:#64748b">'
+        f'Today: <b style="color:#f8fafc">{_r_today_ret:+.2f}%</b> of ₹{_cap//100_000}L</span>'
+    ) if _stats_real.get("total", 0) > 0 else ""
 
     st.markdown(
         f'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:6px">'
         + _stat_banner("Paper Trades", "📄", _stats_paper, "#94a3b8", _paper_extra)
-        + _stat_banner("Real Trades",  "💸", _stats_real,  "#22c55e")
+        + _stat_banner("Real Trades",  "💸", _stats_real,  "#22c55e", _real_extra)
         + f'</div>',
         unsafe_allow_html=True,
     )
