@@ -945,17 +945,30 @@ tab_screener, tab_signals, tab_activity = st.tabs([
 ])
 
 # ─── helper used by both tabs ───────────────────────────────
+def _isna(v) -> bool:
+    """True for Python None, float nan, pd.NA, np.nan — anything falsy-for-numbers."""
+    if v is None:
+        return True
+    try:
+        return bool(pd.isna(v))
+    except (TypeError, ValueError):
+        return False
+
+
 def _stars(q) -> str:
     """Convert integer 1-5 to filled/empty star string."""
-    if q is None or (isinstance(q, float) and pd.isna(q)):
+    if _isna(q):
         return "—"
-    q = int(q)
+    try:
+        q = int(q)
+    except (TypeError, ValueError):
+        return "—"
     return "★" * q + "☆" * (5 - q)
 
 
 def _fmt(v, fmt="₹{:,.2f}", fallback="—"):
-    """Format a number safely, return fallback on None/NaN."""
-    if v is None or (isinstance(v, float) and pd.isna(v)):
+    """Format a number safely, return fallback on None/NaN/pd.NA."""
+    if _isna(v):
         return fallback
     try:
         return fmt.format(float(v))
@@ -3306,7 +3319,8 @@ def _intraday_long_live():
         r1_val     = r.get("intraday_r1") or 0
         entry_val  = r.get("intraday_entry") or 0
         s1_val     = float(r.get("intraday_s1") or 0)
-        confidence = int(r.get("intraday_confidence") or 0)
+        _conf_raw  = r.get("intraday_confidence")
+        confidence = int(_conf_raw) if not _isna(_conf_raw) else 0
         if r1_val and ltp_now:
             if ltp_now >= entry_val:
                 live_status = "TRIGGERED"
@@ -3637,7 +3651,8 @@ def _intraday_short_live():
         s1_val     = r.get("intraday_s1") or 0
         entry_val  = r.get("intraday_entry") or 0
         piv_val    = float(r.get("intraday_pivot") or 0)
-        confidence = int(r.get("intraday_confidence") or 0)
+        _conf_raw  = r.get("intraday_confidence")
+        confidence = int(_conf_raw) if not _isna(_conf_raw) else 0
         if s1_val and ltp_now:
             if ltp_now <= entry_val:
                 short_status = "TRIGGERED"
@@ -4451,10 +4466,10 @@ def _activity_log_live():
     )
     _open_mask = _log_df["status"] == "OPEN"
     for _idx, _row in _log_df[_open_mask].iterrows():
-        _ltp_v = _live_ltp_now.get(_row.get("tradingsymbol", ""), 0)
-        if _ltp_v and _row.get("actual_entry"):
+        _ltp_v = _live_ltp_now.get(str(_row.get("tradingsymbol") or ""), 0)
+        if _ltp_v and not _isna(_row.get("actual_entry")) and _row.get("actual_entry"):
             _entry_p = float(_row["actual_entry"])
-            _qty_p   = float(_row.get("quantity", 0) or 0)
+            _qty_p   = float(_row.get("quantity", 0) or 0) if not _isna(_row.get("quantity")) else 0
             _is_short = _row.get("signal_type", "") == "SELL_BELOW"
             _mult    = -1 if _is_short else 1
             _log_df.at[_idx, "pnl_amount"] = (_ltp_v - _entry_p) * _qty_p * _mult
@@ -4463,14 +4478,14 @@ def _activity_log_live():
 
     # ── Compute statutory charges + net P&L for each trade ─────────────────
     def _row_charges(row):
-        entry     = float(row.get("actual_entry") or 0)
-        exit_p    = float(row.get("actual_exit")  or 0)
-        qty       = int(row.get("quantity")        or 0)
-        stype     = str(row.get("setup_type")      or "INTRADAY")
-        status    = str(row.get("status")          or "")
+        entry  = 0.0 if _isna(row.get("actual_entry")) else float(row.get("actual_entry") or 0)
+        exit_p = 0.0 if _isna(row.get("actual_exit"))  else float(row.get("actual_exit")  or 0)
+        qty    = 0   if _isna(row.get("quantity"))      else int(row.get("quantity")        or 0)
+        stype  = str(row.get("setup_type") or "INTRADAY")
+        status = str(row.get("status")     or "")
         # For OPEN trades use LTP as provisional exit to get indicative charges
         if status == "OPEN" and not exit_p:
-            exit_p = float(_live_ltp_now.get(row.get("tradingsymbol",""), 0) or 0)
+            exit_p = float(_live_ltp_now.get(str(row.get("tradingsymbol") or ""), 0) or 0)
         if entry and exit_p and qty:
             return db.compute_trade_charges(entry, exit_p, qty, stype).get("total", 0.0)
         return 0.0
@@ -4481,7 +4496,8 @@ def _activity_log_live():
     _log_df["net_pnl_pct"] = _log_df.apply(
         lambda r: (
             float(r["net_pnl"]) / (float(r.get("actual_entry") or 0) * float(r.get("quantity") or 1)) * 100
-            if r.get("actual_entry") and r.get("quantity") else None
+            if not _isna(r.get("actual_entry")) and not _isna(r.get("quantity"))
+               and r.get("actual_entry") and r.get("quantity") else None
         ), axis=1
     )
     # Null out charges/net cols for rows with no P&L data at all
