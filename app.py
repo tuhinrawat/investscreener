@@ -449,6 +449,13 @@ if "paper_triggered" not in st.session_state:
 if "paper_open" not in st.session_state:
     st.session_state["paper_open"] = {}
 
+# trading_mode: "paper" | "real" | "off"
+# real_triggered: {(date_str, sym): trade_id} — prevents re-entering same signal for real
+if "trading_mode" not in st.session_state:
+    st.session_state["trading_mode"] = "paper"
+if "real_triggered" not in st.session_state:
+    st.session_state["real_triggered"] = {}
+
 # ── Daily gain gate — reset every new trading day ─────────────────────────────
 # paper_day_hwm_pct : high-water mark of today's realised return % (paper trades)
 # paper_day_blocked : True once the trailing cutoff is triggered
@@ -2893,6 +2900,139 @@ def _live_signals_header():
                 pass
 
 
+# ── FRAGMENT 2c: trading mode control strip + kill switch ────────────────────
+@st.fragment
+def _trading_mode_control():
+    """
+    Control panel shown at the top of the Intraday Plan tab.
+    Lets the user choose Paper / Real / Off and fire the kill switch.
+    """
+    _kc_ctrl  = st.session_state.get("kite_client")
+    _kite_ok  = _kc_ctrl is not None and getattr(_kc_ctrl, "authenticated", False)
+    _mode     = st.session_state.get("trading_mode", "paper")
+
+    # ── Mode strip ────────────────────────────────────────────────────────────
+    _mode_labels = {
+        "paper": ("📄 Paper Auto",  "#3b82f6", "Auto-creates paper trades when a signal triggers"),
+        "real":  ("💸 Real Auto",   "#22c55e", "Auto-places real Kite orders when a signal triggers"),
+        "off":   ("⏸ Off",         "#64748b", "No auto-trading — manual orders only"),
+    }
+    _ml, _mm, _mr = st.columns([3, 3, 3])
+    for _col, (_mkey, _mlabel) in zip([_ml, _mm, _mr], [
+        ("paper", "📄 Paper Auto"), ("real", "💸 Real Auto"), ("off", "⏸ Off")
+    ]):
+        _active = (_mode == _mkey)
+        _border = "3px solid " + _mode_labels[_mkey][1] if _active else "1px solid #334155"
+        _bg     = "#0f172a" if _active else "#0a0f1a"
+        _opacity = "" if _active else "opacity:0.55;"
+        _col.markdown(
+            f'<div style="background:{_bg};border:{_border};border-radius:8px;'
+            f'padding:8px 14px;text-align:center;{_opacity}">'
+            f'<span style="font-size:0.85rem;font-weight:700;color:{_mode_labels[_mkey][1]}">'
+            f'{_mlabel}</span><br>'
+            f'<span style="font-size:0.7rem;color:#64748b">{_mode_labels[_mkey][2]}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        if _col.button(
+            "✓ Active" if _active else "Switch",
+            key=f"mode_btn_{_mkey}",
+            type="primary" if _active else "secondary",
+            use_container_width=True,
+            disabled=_active or (_mkey == "real" and not _kite_ok),
+            help=None if _kite_ok else "Connect Kite in the sidebar to enable Real Auto mode",
+        ):
+            if _mkey == "real" and not _kite_ok:
+                st.warning("Connect Kite (sidebar) before enabling Real Auto mode.")
+            else:
+                st.session_state["trading_mode"] = _mkey
+                st.rerun()
+
+    # Real mode warning
+    if _mode == "real":
+        st.warning(
+            "⚠️ **Real Auto mode active.** "
+            "Orders will be placed on the exchange automatically when a signal triggers. "
+            "Make sure your Kite account has sufficient margin.",
+            icon="⚠️",
+        )
+    elif _mode == "off":
+        st.info("Auto-trading is **Off** — signals are shown but no trades are created automatically.", icon="⏸")
+
+    # ── Kill Switch ───────────────────────────────────────────────────────────
+    st.markdown("---")
+    _ks_col, _ks_info = st.columns([2, 5])
+    with _ks_col:
+        _ks_pressed = st.button(
+            "🔴 Kill Switch — Close All & Stop",
+            type="primary",
+            use_container_width=True,
+            help="Immediately closes all open paper trades at LTP, cancels open Kite orders, and switches mode to Off",
+        )
+
+    _n_paper_open = len(st.session_state.get("paper_open", {}))
+    _live_ltp_now = st.session_state.get("_live_ltp", {})
+    _uid_ks       = st.session_state.get("kite_user_id", "")
+    with _ks_info:
+        st.markdown(
+            f'<div style="padding-top:6px;font-size:0.8rem;color:#94a3b8">'
+            f'Will close <b style="color:#f59e0b">{_n_paper_open} open paper trade(s)</b> at live LTP '
+            f'+ cancel any open real Kite orders → then switches to <b>Off</b> mode.</div>',
+            unsafe_allow_html=True,
+        )
+
+    if _ks_pressed:
+        _closed_paper = 0
+        _cancelled_real = 0
+        _errors = []
+
+        # 1. Close all open paper trades at LTP
+        for _pid, _pt in list(st.session_state.get("paper_open", {}).items()):
+            _exit_p = _live_ltp_now.get(_pt.get("sym", ""), _pt.get("entry", 0))
+            if not _exit_p:
+                _exit_p = _pt.get("entry", 0)
+            try:
+                db.close_trade(_pid, float(_exit_p), "CLOSED", "🔴 Kill switch — closed at LTP")
+                st.session_state["paper_open"].pop(_pid, None)
+                _closed_paper += 1
+            except Exception as _e:
+                _errors.append(f"Paper {_pt.get('sym')}: {_e}")
+
+        # 2. Cancel open REAL Kite orders
+        if _kite_ok:
+            try:
+                _open_real = db.load_trade_log(status_filter=["OPEN"], user_id=_uid_ks)
+                _real_open_rows = _open_real[
+                    (_open_real.get("is_paper_trade", False) != True) &
+                    (_open_real["kite_order_id"].notna())
+                ] if not _open_real.empty and "kite_order_id" in _open_real.columns else pd.DataFrame()
+                for _, _rrow in _real_open_rows.iterrows():
+                    _oid = _rrow.get("kite_order_id")
+                    try:
+                        _kc_ctrl.cancel_order(_oid)
+                        db.close_trade(
+                            int(_rrow["id"]), 0.0, "CANCELLED",
+                            "🔴 Kill switch — Kite order cancelled"
+                        )
+                        _cancelled_real += 1
+                    except Exception as _e:
+                        _errors.append(f"Real order {_oid}: {_e}")
+            except Exception as _e:
+                _errors.append(f"Real order query failed: {_e}")
+
+        # 3. Switch to Off mode + clear triggered dicts
+        st.session_state["trading_mode"]   = "off"
+        st.session_state["paper_triggered"] = {}
+        st.session_state["real_triggered"]  = {}
+
+        _msg = f"🔴 Kill switch fired: {_closed_paper} paper trade(s) closed, {_cancelled_real} Kite order(s) cancelled."
+        if _errors:
+            st.warning(_msg + f"\n\nErrors: {'; '.join(_errors)}")
+        else:
+            st.success(_msg)
+        st.rerun()
+
+
 # ── FRAGMENT 2b: paper-trade banner (auto-refresh, daily gate logic) ─────────
 @st.fragment(run_every=2)
 def _intraday_paper_banner():
@@ -3066,45 +3206,108 @@ def _intraday_long_live():
         else:
             live_status = "—"
 
-        # ── Auto paper trade when TRIGGERED and within position limit ────────
-        _paper_key = (_today_str, sym)
-        if (live_status == "TRIGGERED"
-                and not st.session_state.get("paper_day_blocked", False)
-                and _paper_key not in st.session_state.get("paper_triggered", {})
-                and len([p for p in st.session_state.get("paper_open", {}).values()
-                         if p.get("signal_type") == "BUY_ABOVE"]) < config.PAPER_MAX_POSITIONS // 2 + 1):
-            _pqty = max(1, int(_paper_cap_per_trade / (entry_val or 1)))
-            try:
-                _pid  = db.log_trade({
-                    "trade_date":          _dt.date.today(),
-                    "tradingsymbol":       sym,
-                    "instrument_token":    int(r.get("instrument_token") or 0),
-                    "setup_type":          "INTRADAY",
-                    "signal_type":         "BUY_ABOVE",
-                    "rec_entry":           entry_val,
-                    "rec_stop":            float(r.get("intraday_stop") or 0),
-                    "rec_t1":              float(r.get("intraday_t1") or 0),
-                    "rec_rr":              None,
-                    "rec_reason":          str(r.get("intraday_reason") or "")[:200],
-                    "rec_composite_score": r.get("composite_score"),
-                    "kite_user_id":        _cur_user_id,
-                    "quantity":            _pqty,
-                    "actual_entry":        entry_val,
-                    "status":              "OPEN",
-                    "notes":               f"📄 Paper trade — auto at TRIGGERED (₹{_paper_cap_per_trade:,} virtual capital)",
-                    "is_paper_trade":      True,
-                })
-                st.session_state["paper_triggered"][_paper_key] = _pid
-                st.session_state["paper_open"][_pid] = {
-                    "sym":         sym,
-                    "stop":        float(r.get("intraday_stop") or 0),
-                    "t1":          float(r.get("intraday_t1") or 0),
-                    "signal_type": "BUY_ABOVE",
-                    "entry":       entry_val,
-                }
-                st.toast(f"📄 Paper BUY created: {sym} @ ₹{entry_val:.2f} × {_pqty} shares", icon="📄")
-            except Exception:
-                pass
+        # ── Auto-trade when TRIGGERED (paper or real, based on trading_mode) ──
+        _trade_mode   = st.session_state.get("trading_mode", "paper")
+        _paper_key    = (_today_str, sym)
+        _real_key     = (_today_str, sym)
+        _long_open_ct = len([p for p in st.session_state.get("paper_open", {}).values()
+                              if p.get("signal_type") == "BUY_ABOVE"])
+        _within_limit = _long_open_ct < config.PAPER_MAX_POSITIONS // 2 + 1
+        _pqty = max(1, int(_paper_cap_per_trade / (entry_val or 1)))
+
+        if live_status == "TRIGGERED" and _within_limit:
+
+            # ── PAPER mode ────────────────────────────────────────────────────
+            if (_trade_mode == "paper"
+                    and not st.session_state.get("paper_day_blocked", False)
+                    and _paper_key not in st.session_state.get("paper_triggered", {})):
+                try:
+                    _pid = db.log_trade({
+                        "trade_date":          _dt.date.today(),
+                        "tradingsymbol":       sym,
+                        "instrument_token":    int(r.get("instrument_token") or 0),
+                        "setup_type":          "INTRADAY",
+                        "signal_type":         "BUY_ABOVE",
+                        "rec_entry":           entry_val,
+                        "rec_stop":            float(r.get("intraday_stop") or 0),
+                        "rec_t1":              float(r.get("intraday_t1") or 0),
+                        "rec_rr":              None,
+                        "rec_reason":          str(r.get("intraday_reason") or "")[:200],
+                        "rec_composite_score": r.get("composite_score"),
+                        "kite_user_id":        _cur_user_id,
+                        "quantity":            _pqty,
+                        "actual_entry":        entry_val,
+                        "status":              "OPEN",
+                        "notes":               f"📄 Paper — auto TRIGGERED (₹{_paper_cap_per_trade:,})",
+                        "is_paper_trade":      True,
+                    })
+                    st.session_state["paper_triggered"][_paper_key] = _pid
+                    st.session_state["paper_open"][_pid] = {
+                        "sym": sym, "stop": float(r.get("intraday_stop") or 0),
+                        "t1": float(r.get("intraday_t1") or 0),
+                        "signal_type": "BUY_ABOVE", "entry": entry_val,
+                    }
+                    st.toast(f"📄 Paper BUY: {sym} @ ₹{entry_val:.2f} × {_pqty}", icon="📄")
+                except Exception:
+                    pass
+
+            # ── REAL mode ─────────────────────────────────────────────────────
+            elif (_trade_mode == "real"
+                    and not st.session_state.get("real_day_blocked", False)
+                    and _real_key not in st.session_state.get("real_triggered", {})):
+                _kc_rt = st.session_state.get("kite_client")
+                if _kc_rt and getattr(_kc_rt, "authenticated", False):
+                    try:
+                        _stop_val = float(r.get("intraday_stop") or 0)
+                        _oid = _kc_rt.place_order(
+                            tradingsymbol    = sym,
+                            qty              = _pqty,
+                            transaction_type = "BUY",
+                            order_type       = "SL-M",
+                            product          = "MIS",
+                            trigger_price    = entry_val,
+                            tag              = "scr_intra",
+                        )
+                        _sl_oid = None
+                        if _stop_val:
+                            try:
+                                _sl_oid = _kc_rt.place_order(
+                                    tradingsymbol    = sym,
+                                    qty              = _pqty,
+                                    transaction_type = "SELL",
+                                    order_type       = "SL-M",
+                                    product          = "MIS",
+                                    trigger_price    = _stop_val,
+                                    tag              = "scr_sl",
+                                )
+                            except Exception:
+                                pass
+                        _rid = db.log_trade({
+                            "trade_date":          _dt.date.today(),
+                            "tradingsymbol":       sym,
+                            "instrument_token":    int(r.get("instrument_token") or 0),
+                            "setup_type":          "INTRADAY",
+                            "signal_type":         "BUY_ABOVE",
+                            "rec_entry":           entry_val,
+                            "rec_stop":            _stop_val,
+                            "rec_t1":              float(r.get("intraday_t1") or 0),
+                            "rec_rr":              None,
+                            "rec_reason":          str(r.get("intraday_reason") or "")[:200],
+                            "rec_composite_score": r.get("composite_score"),
+                            "kite_user_id":        _cur_user_id,
+                            "kite_order_id":       _oid,
+                            "kite_sl_order_id":    _sl_oid,
+                            "kite_status":         "OPEN",
+                            "quantity":            _pqty,
+                            "actual_entry":        entry_val,
+                            "status":              "OPEN",
+                            "notes":               f"💸 Real — auto TRIGGERED (₹{_paper_cap_per_trade:,})",
+                            "is_paper_trade":      False,
+                        })
+                        st.session_state["real_triggered"][_real_key] = _rid
+                        st.toast(f"💸 Real BUY placed: {sym} @ ₹{entry_val:.2f} × {_pqty} | Kite {_oid}", icon="💸")
+                    except Exception as _re:
+                        st.toast(f"⚠ Real order failed for {sym}: {_re}", icon="⚠️")
 
         # Compute R/R for display
         try:
@@ -3285,45 +3488,108 @@ def _intraday_short_live():
         else:
             short_status = "—"
 
-        # ── Auto paper trade when TRIGGERED and within position limit ────────
-        _paper_key = (_today_str, sym)
-        if (short_status == "TRIGGERED"
-                and not st.session_state.get("paper_day_blocked", False)
-                and _paper_key not in st.session_state.get("paper_triggered", {})
-                and len([p for p in st.session_state.get("paper_open", {}).values()
-                         if p.get("signal_type") == "SELL_BELOW"]) < config.PAPER_MAX_POSITIONS // 2 + 1):
-            _pqty = max(1, int(_paper_cap_per_trade / (entry_val or 1)))
-            try:
-                _pid  = db.log_trade({
-                    "trade_date":          _dt.date.today(),
-                    "tradingsymbol":       sym,
-                    "instrument_token":    int(r.get("instrument_token") or 0),
-                    "setup_type":          "INTRADAY",
-                    "signal_type":         "SELL_BELOW",
-                    "rec_entry":           entry_val,
-                    "rec_stop":            float(r.get("intraday_stop") or 0),
-                    "rec_t1":              float(r.get("intraday_t1") or 0),
-                    "rec_rr":              None,
-                    "rec_reason":          str(r.get("intraday_reason") or "")[:200],
-                    "rec_composite_score": r.get("composite_score"),
-                    "kite_user_id":        _cur_user_id,
-                    "quantity":            _pqty,
-                    "actual_entry":        entry_val,
-                    "status":              "OPEN",
-                    "notes":               f"📄 Paper trade — auto at TRIGGERED (₹{_paper_cap_per_trade:,} virtual capital)",
-                    "is_paper_trade":      True,
-                })
-                st.session_state["paper_triggered"][_paper_key] = _pid
-                st.session_state["paper_open"][_pid] = {
-                    "sym":         sym,
-                    "stop":        float(r.get("intraday_stop") or 0),
-                    "t1":          float(r.get("intraday_t1") or 0),
-                    "signal_type": "SELL_BELOW",
-                    "entry":       entry_val,
-                }
-                st.toast(f"📄 Paper SHORT created: {sym} @ ₹{entry_val:.2f} × {_pqty} shares", icon="📄")
-            except Exception:
-                pass
+        # ── Auto-trade when TRIGGERED (paper or real, based on trading_mode) ──
+        _trade_mode    = st.session_state.get("trading_mode", "paper")
+        _paper_key     = (_today_str, sym)
+        _real_key      = (_today_str, sym)
+        _short_open_ct = len([p for p in st.session_state.get("paper_open", {}).values()
+                               if p.get("signal_type") == "SELL_BELOW"])
+        _within_limit  = _short_open_ct < config.PAPER_MAX_POSITIONS // 2 + 1
+        _pqty = max(1, int(_paper_cap_per_trade / (entry_val or 1)))
+
+        if short_status == "TRIGGERED" and _within_limit:
+
+            # ── PAPER mode ────────────────────────────────────────────────────
+            if (_trade_mode == "paper"
+                    and not st.session_state.get("paper_day_blocked", False)
+                    and _paper_key not in st.session_state.get("paper_triggered", {})):
+                try:
+                    _pid = db.log_trade({
+                        "trade_date":          _dt.date.today(),
+                        "tradingsymbol":       sym,
+                        "instrument_token":    int(r.get("instrument_token") or 0),
+                        "setup_type":          "INTRADAY",
+                        "signal_type":         "SELL_BELOW",
+                        "rec_entry":           entry_val,
+                        "rec_stop":            float(r.get("intraday_stop") or 0),
+                        "rec_t1":              float(r.get("intraday_t1") or 0),
+                        "rec_rr":              None,
+                        "rec_reason":          str(r.get("intraday_reason") or "")[:200],
+                        "rec_composite_score": r.get("composite_score"),
+                        "kite_user_id":        _cur_user_id,
+                        "quantity":            _pqty,
+                        "actual_entry":        entry_val,
+                        "status":              "OPEN",
+                        "notes":               f"📄 Paper — auto TRIGGERED (₹{_paper_cap_per_trade:,})",
+                        "is_paper_trade":      True,
+                    })
+                    st.session_state["paper_triggered"][_paper_key] = _pid
+                    st.session_state["paper_open"][_pid] = {
+                        "sym": sym, "stop": float(r.get("intraday_stop") or 0),
+                        "t1": float(r.get("intraday_t1") or 0),
+                        "signal_type": "SELL_BELOW", "entry": entry_val,
+                    }
+                    st.toast(f"📄 Paper SHORT: {sym} @ ₹{entry_val:.2f} × {_pqty}", icon="📄")
+                except Exception:
+                    pass
+
+            # ── REAL mode ─────────────────────────────────────────────────────
+            elif (_trade_mode == "real"
+                    and not st.session_state.get("real_day_blocked", False)
+                    and _real_key not in st.session_state.get("real_triggered", {})):
+                _kc_rt = st.session_state.get("kite_client")
+                if _kc_rt and getattr(_kc_rt, "authenticated", False):
+                    try:
+                        _stop_val = float(r.get("intraday_stop") or 0)
+                        _oid = _kc_rt.place_order(
+                            tradingsymbol    = sym,
+                            qty              = _pqty,
+                            transaction_type = "SELL",
+                            order_type       = "SL-M",
+                            product          = "MIS",
+                            trigger_price    = entry_val,
+                            tag              = "scr_intra",
+                        )
+                        _sl_oid = None
+                        if _stop_val:
+                            try:
+                                _sl_oid = _kc_rt.place_order(
+                                    tradingsymbol    = sym,
+                                    qty              = _pqty,
+                                    transaction_type = "BUY",
+                                    order_type       = "SL-M",
+                                    product          = "MIS",
+                                    trigger_price    = _stop_val,
+                                    tag              = "scr_sl",
+                                )
+                            except Exception:
+                                pass
+                        _rid = db.log_trade({
+                            "trade_date":          _dt.date.today(),
+                            "tradingsymbol":       sym,
+                            "instrument_token":    int(r.get("instrument_token") or 0),
+                            "setup_type":          "INTRADAY",
+                            "signal_type":         "SELL_BELOW",
+                            "rec_entry":           entry_val,
+                            "rec_stop":            _stop_val,
+                            "rec_t1":              float(r.get("intraday_t1") or 0),
+                            "rec_rr":              None,
+                            "rec_reason":          str(r.get("intraday_reason") or "")[:200],
+                            "rec_composite_score": r.get("composite_score"),
+                            "kite_user_id":        _cur_user_id,
+                            "kite_order_id":       _oid,
+                            "kite_sl_order_id":    _sl_oid,
+                            "kite_status":         "OPEN",
+                            "quantity":            _pqty,
+                            "actual_entry":        entry_val,
+                            "status":              "OPEN",
+                            "notes":               f"💸 Real — auto TRIGGERED (₹{_paper_cap_per_trade:,})",
+                            "is_paper_trade":      False,
+                        })
+                        st.session_state["real_triggered"][_real_key] = _rid
+                        st.toast(f"💸 Real SHORT placed: {sym} @ ₹{entry_val:.2f} × {_pqty} | Kite {_oid}", icon="💸")
+                    except Exception as _re:
+                        st.toast(f"⚠ Real short order failed for {sym}: {_re}", icon="⚠️")
 
         # For shorts: gain = entry → T1 (price drops), risk = entry → stop (price rises)
         try:
@@ -3618,6 +3884,9 @@ def _signals_main():
             "**Hard rule: close ALL intraday positions by 3:10 PM regardless of P&L.** "
             "LTP and Status update automatically every 2 s during market hours."
         )
+
+        # ── Trading mode control + kill switch ────────────────────────────────
+        _trading_mode_control()
 
         # ── Paper trade live dashboard (auto-refresh fragment) ────────────────
         _intraday_paper_banner()
