@@ -258,6 +258,77 @@ def init_schema():
     con.close()
 
 
+def compute_trade_charges(
+    entry: float,
+    exit_price: float,
+    qty: int,
+    setup_type: str = "INTRADAY",
+    exchange: str = "NSE",
+) -> dict:
+    """
+    Compute all Zerodha/exchange statutory charges for one completed equity trade.
+
+    Rates sourced from https://zerodha.com/charges/ (as of May 2026):
+
+    Intraday (MIS/BO/CO) on NSE Equity:
+      Brokerage     : min(₹20, 0.03%) per executed order — 2 orders (buy + sell)
+      STT           : 0.025% on sell-side only
+      NSE txn       : 0.00307% on total turnover (buy+sell)
+      SEBI turnover : ₹10/crore  = 0.000001 per ₹
+      GST           : 18% on (brokerage + txn + SEBI)
+      Stamp         : 0.003% on buy value
+
+    Swing / Delivery on NSE Equity:
+      Brokerage     : ₹0 (Zerodha free delivery)
+      STT           : 0.1% on both buy and sell sides
+      NSE txn       : 0.00307% on total turnover
+      SEBI turnover : ₹10/crore
+      GST           : 18% on (brokerage + txn + SEBI)
+      Stamp         : 0.015% on buy value
+      DP charge     : ₹15.34 per scrip on sell (CDSL + Zerodha + GST)
+
+    Returns dict: {brokerage, stt, txn_charges, sebi, gst, stamp, dp, total}
+    """
+    zero = {k: 0.0 for k in ["brokerage", "stt", "txn_charges", "sebi", "gst", "stamp", "dp", "total"]}
+    if not (entry > 0 and exit_price > 0 and qty > 0):
+        return zero
+
+    buy_val  = float(entry)      * int(qty)
+    sell_val = float(exit_price) * int(qty)
+    turnover = buy_val + sell_val
+
+    is_intraday = str(setup_type).upper() in ("INTRADAY",)
+
+    if is_intraday:
+        brokerage = min(20.0, 0.0003 * buy_val) + min(20.0, 0.0003 * sell_val)
+        stt       = 0.00025  * sell_val   # 0.025% sell side only
+        stamp     = 0.00003  * buy_val    # 0.003% buy side
+        dp        = 0.0                   # no DP charge for intraday (no demat debit)
+    else:
+        brokerage = 0.0                   # free delivery at Zerodha
+        stt       = 0.001    * turnover   # 0.1% both sides
+        stamp     = 0.00015  * buy_val    # 0.015% buy side
+        dp        = 15.34                 # ₹15.34 per scrip per sell demat debit
+
+    txn_rate    = 0.0000307 if exchange.upper() == "NSE" else 0.0000375
+    txn_charges = txn_rate  * turnover
+    sebi        = 0.000001  * turnover   # ₹10/crore
+
+    gst   = 0.18 * (brokerage + txn_charges + sebi)
+    total = brokerage + stt + txn_charges + sebi + gst + stamp + dp
+
+    return {
+        "brokerage":   round(brokerage,   2),
+        "stt":         round(stt,         2),
+        "txn_charges": round(txn_charges, 2),
+        "sebi":        round(sebi,        4),
+        "gst":         round(gst,         2),
+        "stamp":       round(stamp,       2),
+        "dp":          round(dp,          2),
+        "total":       round(total,       2),
+    }
+
+
 def _compute_outcomes(quantity: int, actual_entry: float, actual_exit: float,
                       rec_entry: float, rec_stop: float, signal_type: str) -> dict:
     """Compute pnl_amount, pnl_pct, slippage_entry_pct, rr_realised from trade data."""
@@ -637,6 +708,39 @@ def get_trade_stats(user_id: str = "", is_paper: bool | None = None) -> dict:
         "best_trade": best,
         "worst_trade": worst,
     }
+
+
+def get_total_charges(user_id: str = "", is_paper: bool | None = None) -> float:
+    """
+    Return the sum of Zerodha statutory charges for all CLOSED trades
+    matching the given user / paper filter.  Open trades are excluded because
+    their exit price (and therefore sell-side charges) is not yet known.
+    """
+    con = get_conn()
+    clauses = ["status != 'OPEN'", "actual_entry IS NOT NULL", "actual_exit IS NOT NULL", "quantity IS NOT NULL"]
+    params: list = []
+    if user_id:
+        clauses.append("kite_user_id = ?")
+        params.append(user_id)
+    if is_paper is True:
+        clauses.append("is_paper_trade = TRUE")
+    elif is_paper is False:
+        clauses.append("(is_paper_trade = FALSE OR is_paper_trade IS NULL)")
+    where = "WHERE " + " AND ".join(clauses)
+    rows = con.execute(
+        f"SELECT actual_entry, actual_exit, quantity, setup_type FROM trade_log {where}",
+        params,
+    ).fetchall()
+    con.close()
+    total = 0.0
+    for entry, exit_p, qty, stype in rows:
+        try:
+            total += compute_trade_charges(
+                float(entry), float(exit_p), int(qty), str(stype or "INTRADAY")
+            ).get("total", 0.0)
+        except Exception:
+            pass
+    return round(total, 2)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -2848,7 +2848,23 @@ def _live_signals_header():
             unsafe_allow_html=True,
         )
     if _ltp_err:
-        st.caption(f"⚠ LTP fetch error: {_ltp_err}")
+        _is_token_err = any(k in _ltp_err.lower() for k in
+                            ("invalid", "token", "access", "403", "unauthori", "expired"))
+        if _is_token_err:
+            _reauth_kc = KiteClient(
+                api_key=st.session_state.get("kite_api_key", ""),
+                api_secret=st.session_state.get("kite_api_secret", ""),
+            )
+            _reauth_url2 = _reauth_kc.get_login_url()
+            _tc1, _tc2 = st.columns([5, 2])
+            _tc1.error(
+                "🔑 **Kite access token expired.** Live prices & auto-trade paused. "
+                "Re-authenticate to resume — all open paper trades are safe in the database."
+            )
+            if _reauth_url2:
+                _tc2.link_button("🔑 Re-authenticate Kite", _reauth_url2, use_container_width=True, type="primary")
+        else:
+            st.caption(f"⚠ LTP fetch error: {_ltp_err}")
 
     # Show when signals were last computed (from DB timestamp)
     _sig_age = ""
@@ -4054,7 +4070,8 @@ def _activity_log_live():
 
     _cap = config.PAPER_CAPITAL  # reference capital for both paper and real
 
-    def _stat_banner(label: str, icon: str, s: dict, accent: str, extra_html: str = "") -> str:
+    def _stat_banner(label: str, icon: str, s: dict, accent: str,
+                     charges: float = 0.0, extra_html: str = "") -> str:
         """Build a compact dark banner for one category of trades."""
         if not s or s.get("total", 0) == 0:
             return (
@@ -4065,9 +4082,11 @@ def _activity_log_live():
                 f'<span style="color:#475569;font-size:0.8rem;margin-left:16px">No trades yet</span>'
                 f'</div>'
             )
-        _pnl      = s["total_pnl"]
-        _pnl_c    = "#22c55e" if _pnl >= 0 else "#ef4444"
-        _pnl_pct  = (_pnl / _cap * 100) if _cap else 0.0
+        _gross    = s["total_pnl"]
+        _net      = _gross - charges
+        _net_c    = "#22c55e" if _net >= 0 else "#ef4444"
+        _gross_c  = "#22c55e" if _gross >= 0 else "#ef4444"
+        _net_pct  = (_net / _cap * 100) if _cap else 0.0
         _wr       = f"{s['win_rate']:.1f}%" if s["closed"] > 0 else "—"
         _rr       = f"{s['avg_rr']:.2f}×" if s.get("avg_rr") else "—"
         _best     = f"₹{s['best_trade']:+,.0f}" if s.get("best_trade") else "—"
@@ -4082,9 +4101,13 @@ def _activity_log_live():
             f'<b style="color:#f59e0b">{s["open"]}</b></span>'
             f'<span style="font-size:0.8rem;color:#94a3b8">Win rate '
             f'<b style="color:#f8fafc">{_wr}</b></span>'
-            f'<span style="font-size:0.8rem;color:#94a3b8">Total P&amp;L '
-            f'<b style="color:{_pnl_c}">₹{_pnl:+,.0f}</b> '
-            f'<span style="font-size:0.75rem;color:{_pnl_c}">({_pnl_pct:+.2f}% of ₹{_cap//100_000}L)</span>'
+            f'<span style="font-size:0.8rem;color:#94a3b8">Gross P&amp;L '
+            f'<b style="color:{_gross_c}">₹{_gross:+,.0f}</b></span>'
+            f'<span style="font-size:0.8rem;color:#64748b" title="Brokerage + STT + NSE txn + GST + Stamp">'
+            f'Charges <b style="color:#f59e0b">₹{charges:,.0f}</b></span>'
+            f'<span style="font-size:0.8rem;color:#94a3b8">Net P&amp;L '
+            f'<b style="color:{_net_c}">₹{_net:+,.0f}</b> '
+            f'<span style="font-size:0.75rem;color:{_net_c}">({_net_pct:+.2f}% of ₹{_cap//100_000}L)</span>'
             f'</span>'
             f'<span style="font-size:0.8rem;color:#94a3b8">Best '
             f'<b style="color:#f8fafc">{_best}</b></span>'
@@ -4093,6 +4116,15 @@ def _activity_log_live():
             f'{extra_html}'
             f'</div>'
         )
+
+    # ── Charges and net P&L for banners ─────────────────────────────────────
+    _paper_charges = 0.0
+    _real_charges  = 0.0
+    try:
+        _paper_charges = db.get_total_charges(user_id=_uid, is_paper=True)
+        _real_charges  = db.get_total_charges(user_id=_uid, is_paper=False)
+    except Exception:
+        pass
 
     # Extra info on the paper banner: today's realised return + gate status
     _p_today_pnl = 0.0
@@ -4137,8 +4169,8 @@ def _activity_log_live():
 
     st.markdown(
         f'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:6px">'
-        + _stat_banner("Paper Trades", "📄", _stats_paper, "#94a3b8", _paper_extra)
-        + _stat_banner("Real Trades",  "💸", _stats_real,  "#22c55e", _real_extra)
+        + _stat_banner("Paper Trades", "📄", _stats_paper, "#94a3b8", _paper_charges, _paper_extra)
+        + _stat_banner("Real Trades",  "💸", _stats_real,  "#22c55e", _real_charges,  _real_extra)
         + f'</div>',
         unsafe_allow_html=True,
     )
@@ -4215,10 +4247,39 @@ def _activity_log_live():
             if _entry_p:
                 _log_df.at[_idx, "pnl_pct"] = (_ltp_v - _entry_p) / _entry_p * 100 * _mult
 
-    # Status first, then symbol, LTP, P&L immediately after, then the rest
+    # ── Compute statutory charges + net P&L for each trade ─────────────────
+    def _row_charges(row):
+        entry     = float(row.get("actual_entry") or 0)
+        exit_p    = float(row.get("actual_exit")  or 0)
+        qty       = int(row.get("quantity")        or 0)
+        stype     = str(row.get("setup_type")      or "INTRADAY")
+        status    = str(row.get("status")          or "")
+        # For OPEN trades use LTP as provisional exit to get indicative charges
+        if status == "OPEN" and not exit_p:
+            exit_p = float(_live_ltp_now.get(row.get("tradingsymbol",""), 0) or 0)
+        if entry and exit_p and qty:
+            return db.compute_trade_charges(entry, exit_p, qty, stype).get("total", 0.0)
+        return 0.0
+
+    _log_df["charges"]     = _log_df.apply(_row_charges, axis=1)
+    _log_df["net_pnl"]     = _log_df["pnl_amount"].fillna(0) - _log_df["charges"]
+    # net_pnl_pct = net_pnl / invested_capital * 100
+    _log_df["net_pnl_pct"] = _log_df.apply(
+        lambda r: (
+            float(r["net_pnl"]) / (float(r.get("actual_entry") or 0) * float(r.get("quantity") or 1)) * 100
+            if r.get("actual_entry") and r.get("quantity") else None
+        ), axis=1
+    )
+    # Null out charges/net cols for rows with no P&L data at all
+    _no_pnl = _log_df["pnl_amount"].isna() & (_log_df["status"] != "OPEN")
+    _log_df.loc[_no_pnl, ["charges", "net_pnl", "net_pnl_pct"]] = None
+
+    # Status first, then symbol, LTP, gross P&L, charges, net P&L, then the rest
     _disp_cols = [
         "status",
-        "id", "trade_date", "tradingsymbol", "ltp", "pnl_amount", "pnl_pct",
+        "id", "trade_date", "tradingsymbol", "ltp",
+        "pnl_amount", "pnl_pct",
+        "charges", "net_pnl", "net_pnl_pct",
         "trade_type", "setup_type", "signal_type",
         "quantity",
         "rec_entry", "actual_entry",
@@ -4250,19 +4311,22 @@ def _activity_log_live():
         }
         return colors.get(str(val).upper(), "")
 
-    _pnl_sub  = [c for c in ["pnl_amount", "pnl_pct", "rr_realised"] if c in _log_show.columns]
+    _pnl_sub  = [c for c in ["pnl_amount", "pnl_pct", "net_pnl", "net_pnl_pct", "rr_realised"] if c in _log_show.columns]
     _stat_sub = [c for c in ["status"] if c in _log_show.columns]
 
     _fmt_map = {
-        "ltp":         "₹{:,.2f}",
-        "rec_entry":   "₹{:,.2f}",
-        "actual_entry":"₹{:,.2f}",
-        "rec_stop":    "₹{:,.2f}",
-        "rec_t1":      "₹{:,.2f}",
-        "actual_exit": "₹{:,.2f}",
-        "pnl_amount":  "₹{:+,.2f}",
-        "pnl_pct":     "{:+.2f}%",
-        "rr_realised": "{:.2f}×",
+        "ltp":              "₹{:,.2f}",
+        "rec_entry":        "₹{:,.2f}",
+        "actual_entry":     "₹{:,.2f}",
+        "rec_stop":         "₹{:,.2f}",
+        "rec_t1":           "₹{:,.2f}",
+        "actual_exit":      "₹{:,.2f}",
+        "pnl_amount":       "₹{:+,.2f}",
+        "pnl_pct":          "{:+.2f}%",
+        "charges":          "₹{:,.2f}",
+        "net_pnl":          "₹{:+,.2f}",
+        "net_pnl_pct":      "{:+.2f}%",
+        "rr_realised":      "{:.2f}×",
         "slippage_entry_pct": "{:+.2f}%",
     }
     _fmt_active = {k: v for k, v in _fmt_map.items() if k in _log_show.columns}
@@ -4304,8 +4368,20 @@ def _activity_log_live():
             "rec_stop":            st.column_config.TextColumn("Rec Stop",      help="Recommended stop-loss"),
             "rec_t1":              st.column_config.TextColumn("Rec T1",        help="Recommended first target"),
             "actual_exit":         st.column_config.TextColumn("Actual Exit",   help="Your actual exit price"),
-            "pnl_amount":          st.column_config.TextColumn("P&L ₹",         help="(Exit − Entry) × Qty — live MTM for open trades"),
-            "pnl_pct":             st.column_config.TextColumn("P&L %",         help="(Exit − Entry) / Entry × 100"),
+            "pnl_amount":          st.column_config.TextColumn("Gross P&L ₹",   help="(Exit − Entry) × Qty before charges — live MTM for open trades"),
+            "pnl_pct":             st.column_config.TextColumn("Gross P&L %",   help="(Exit − Entry) / Entry × 100, before charges"),
+            "charges":             st.column_config.TextColumn("Charges ₹",     help=(
+                "Zerodha statutory charges per round-trip (intraday):\n"
+                "• Brokerage: min(₹20, 0.03%) × 2 orders\n"
+                "• STT: 0.025% on sell value\n"
+                "• NSE txn: 0.00307% on total turnover\n"
+                "• SEBI: ₹10/crore\n"
+                "• GST: 18% on (brokerage + txn + SEBI)\n"
+                "• Stamp: 0.003% on buy value\n"
+                "For open trades, provisional charges based on LTP."
+            )),
+            "net_pnl":             st.column_config.TextColumn("Net P&L ₹",     help="Gross P&L minus all statutory charges — your actual take-home profit/loss"),
+            "net_pnl_pct":         st.column_config.TextColumn("Net P&L %",     help="Net P&L as % of capital deployed (entry × qty)"),
             "rr_realised":         st.column_config.TextColumn("R/R actual",    help="Actual gain ÷ actual risk"),
             "slippage_entry_pct":  st.column_config.TextColumn("Entry slip %",  help="How far your entry was from the recommended entry"),
             "kite_order_id":       st.column_config.TextColumn("Kite Order ID", help="Order ID from Zerodha Kite"),
