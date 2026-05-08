@@ -2817,6 +2817,39 @@ def _live_signals_header():
     _pc4.metric("Intraday Short",  _n_is,  help="SELL_BELOW S1 setups — short sell opportunities")
     _pc5.metric("Scaling entries", _n_sc,  help="Stocks in full EMA stack at EMA50 pullback — position build")
 
+    # ── Global paper trade exit monitor ──────────────────────────────────────
+    # Runs here (in the header fragment) so exits are detected regardless of
+    # which tab the user is viewing — not just when the Intraday Plan tab is open.
+    if _market_open and st.session_state.get("paper_open"):
+        _live_ltp_now = st.session_state.get("_live_ltp", {})
+        _exits = []
+        for _pid, _pt in list(st.session_state["paper_open"].items()):
+            _pt_ltp = _live_ltp_now.get(_pt.get("sym", ""), 0)
+            if not _pt_ltp:
+                continue
+            _sig = _pt.get("signal_type", "")
+            _t1   = _pt.get("t1", 0)
+            _stop = _pt.get("stop", 0)
+            if _sig == "BUY_ABOVE":
+                if _t1 and _pt_ltp >= _t1:
+                    _exits.append((_pid, _pt["sym"], "TARGET_HIT", _t1))
+                elif _stop and _pt_ltp <= _stop:
+                    _exits.append((_pid, _pt["sym"], "STOPPED_OUT", _pt_ltp))
+            elif _sig == "SELL_BELOW":
+                if _t1 and _pt_ltp <= _t1:
+                    _exits.append((_pid, _pt["sym"], "TARGET_HIT", _t1))
+                elif _stop and _pt_ltp >= _stop:
+                    _exits.append((_pid, _pt["sym"], "STOPPED_OUT", _pt_ltp))
+        for _pid, _sym_e, _outcome, _ep in _exits:
+            try:
+                _note = f"📄 Paper trade auto-{'closed at T1' if _outcome == 'TARGET_HIT' else 'stopped'}"
+                db.close_trade(_pid, _ep, _outcome, _note)
+                st.session_state["paper_open"].pop(_pid, None)
+                _icon = "✅" if _outcome == "TARGET_HIT" else "🛑"
+                st.toast(f"{_icon} Paper {_sym_e}: {_outcome} at ₹{_ep:.2f}", icon=_icon)
+            except Exception:
+                pass
+
 
 # ── FRAGMENT 2a: intraday LONG table (live status column) ────────────────────
 # Runs every 2 s inside the Long sub-tab. No st.tabs() here — the sub-tabs
@@ -2843,27 +2876,6 @@ def _intraday_long_live():
         return
 
     st.caption("Watch for price to trade **above R1**. Enter with stop just below Pivot.")
-
-    # ── Exit monitoring: check open long paper trades for T1 / stop hits ─────
-    _long_to_close = []
-    for _pid, _pt in list(st.session_state.get("paper_open", {}).items()):
-        if _pt.get("signal_type") != "BUY_ABOVE":
-            continue
-        _pt_ltp = st.session_state.get("_live_ltp", {}).get(_pt["sym"], 0)
-        if not _pt_ltp:
-            continue
-        if _pt.get("t1") and _pt_ltp >= _pt["t1"]:
-            db.close_trade(_pid, _pt["t1"], "TARGET_HIT",
-                           "📄 Paper trade auto-closed at T1 target")
-            _long_to_close.append((_pid, _pt["sym"], "TARGET_HIT", _pt["t1"]))
-        elif _pt.get("stop") and _pt_ltp <= _pt["stop"]:
-            db.close_trade(_pid, _pt_ltp, "STOPPED_OUT",
-                           "📄 Paper trade auto-stopped below stop-loss")
-            _long_to_close.append((_pid, _pt["sym"], "STOPPED_OUT", _pt_ltp))
-    for _pid, _sym_c, _outcome, _ep in _long_to_close:
-        st.session_state["paper_open"].pop(_pid, None)
-        _icon = "✅" if _outcome == "TARGET_HIT" else "🛑"
-        st.toast(f"{_icon} Paper {_sym_c}: {_outcome} at ₹{_ep:.2f}", icon=_icon)
 
     _si_rows = []
     _paper_cap_per_trade = config.PAPER_CAPITAL // config.PAPER_MAX_POSITIONS
@@ -3082,28 +3094,6 @@ def _intraday_short_live():
         "Short with cover-stop just above Pivot. "
         "**Only for stocks eligible for intraday short selling (check Kite margin).**"
     )
-
-    # ── Exit monitoring: check open short paper trades for T1 / stop hits ────
-    _short_to_close = []
-    for _pid, _pt in list(st.session_state.get("paper_open", {}).items()):
-        if _pt.get("signal_type") != "SELL_BELOW":
-            continue
-        _pt_ltp = st.session_state.get("_live_ltp", {}).get(_pt["sym"], 0)
-        if not _pt_ltp:
-            continue
-        # For shorts: T1 is below entry, stop is above entry
-        if _pt.get("t1") and _pt_ltp <= _pt["t1"]:
-            db.close_trade(_pid, _pt["t1"], "TARGET_HIT",
-                           "📄 Paper short auto-closed at T1 target")
-            _short_to_close.append((_pid, _pt["sym"], "TARGET_HIT", _pt["t1"]))
-        elif _pt.get("stop") and _pt_ltp >= _pt["stop"]:
-            db.close_trade(_pid, _pt_ltp, "STOPPED_OUT",
-                           "📄 Paper short auto-stopped above stop-loss")
-            _short_to_close.append((_pid, _pt["sym"], "STOPPED_OUT", _pt_ltp))
-    for _pid, _sym_c, _outcome, _ep in _short_to_close:
-        st.session_state["paper_open"].pop(_pid, None)
-        _icon = "✅" if _outcome == "TARGET_HIT" else "🛑"
-        st.toast(f"{_icon} Paper SHORT {_sym_c}: {_outcome} at ₹{_ep:.2f}", icon=_icon)
 
     _ss_rows = []
     _paper_cap_per_trade = config.PAPER_CAPITAL // config.PAPER_MAX_POSITIONS
