@@ -1207,6 +1207,40 @@ def get_latest_market_intel(user_id: str = "") -> dict:
     }
 
 
+def get_open_real_trades(user_id: str = "") -> list:
+    """
+    Return all real (non-paper) trades that are still OPEN for today.
+    Used by the 3:20 PM Kite position sync to close out auto-squared positions.
+    """
+    import datetime as _dt_mod
+    today = str(_dt_mod.date.today())
+    con = get_conn()
+    uid = user_id or ""
+    _uid_clause = "AND kite_user_id = ?" if uid else ""
+    _params = [today] + ([uid] if uid else [])
+    rows = con.execute(
+        f"""SELECT id, tradingsymbol, signal_type, actual_entry, rec_stop
+            FROM trade_log
+            WHERE is_paper_trade = FALSE
+              AND status = 'OPEN'
+              AND trade_date = ?
+              {_uid_clause}
+            ORDER BY id""",
+        _params,
+    ).fetchall()
+    con.close()
+    return [
+        {
+            "id":            r[0],
+            "tradingsymbol": r[1],
+            "signal_type":   r[2],
+            "actual_entry":  r[3],
+            "rec_stop":      r[4],
+        }
+        for r in rows
+    ]
+
+
 def get_market_intel_stocks(user_id: str = "") -> list:
     """
     Return all stock rows from the latest market intel run for this user.

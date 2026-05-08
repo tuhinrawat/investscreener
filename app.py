@@ -1290,6 +1290,168 @@ def _render_order_panel(signal_df: pd.DataFrame, setup_type: str, form_key: str)
                     st.error(f"Failed to save: {_e}")
 
 
+# ============================================================
+# MARKET INTEL DIALOG — defined here (before any tab) so it
+# is available from both the Screener tab AND the auto-trigger.
+# ============================================================
+@st.dialog("🧠 India Market Intelligence Brief", width="large")
+def _show_market_intel_dialog(uid: str) -> None:
+    """Display the market intel brief, parsed stock tables, and Apply button."""
+    result = st.session_state.get("_intel_result", {})
+    if not result:
+        st.warning("No Market Intel results in session. Re-run from the Screener tab.")
+        return
+
+    raw    = result.get("raw", "")
+    stocks = result.get("stocks", [])
+    bias_d = result.get("bias", {})
+
+    bias       = bias_d.get("bias", "NEUTRAL")
+    confidence = bias_d.get("confidence", "MEDIUM")
+
+    _bias_colors = {
+        "BULLISH":         "#22c55e",
+        "MILDLY BULLISH":  "#86efac",
+        "NEUTRAL":         "#f59e0b",
+        "MILDLY BEARISH":  "#f87171",
+        "BEARISH":         "#ef4444",
+    }
+    _bias_color = _bias_colors.get(bias, "#f59e0b")
+
+    st.markdown(
+        f'<div style="background:#0f172a;border:1px solid #334155;border-radius:8px;'
+        f'padding:10px 20px;margin-bottom:10px;display:flex;gap:20px;align-items:center">'
+        f'<span style="font-size:0.78rem;color:#64748b;font-weight:600;text-transform:uppercase">🧠 Market Intel</span>'
+        f'<span style="font-size:1rem;color:{_bias_color};font-weight:700">{bias}</span>'
+        f'<span style="font-size:0.8rem;color:#94a3b8">Confidence: <b>{confidence}</b></span>'
+        f'<span style="font-size:0.75rem;color:#64748b">'
+        f'{len([s for s in stocks if s["stance"]=="BUY"])} BUY · '
+        f'{len([s for s in stocks if s["stance"]=="SHORT"])} SHORT · '
+        f'{len([s for s in stocks if s["stance"]=="AVOID"])} AVOID · '
+        f'{len([s for s in stocks if s["stance"]=="BUY_ON_COND"])} BUY ON COND'
+        f'</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    _base_df = st.session_state.get("_signals_base_df", None)
+    stocks   = _mi.compute_overlap(stocks, _base_df)
+
+    _buy_stk  = [s for s in stocks if s["stance"] == _mi.BUY]
+    _shrt_stk = [s for s in stocks if s["stance"] == _mi.SHORT]
+    _avd_stk  = [s for s in stocks if s["stance"] == _mi.AVOID]
+    _cnd_stk  = [s for s in stocks if s["stance"] == _mi.BUY_ON_COND]
+
+    if _buy_stk:
+        st.markdown("#### 📗 BUY — Enter Now")
+        _buy_rows = []
+        for s in _buy_stk:
+            _ovlp = s.get("overlap_type")
+            _badge = (
+                "🔥 Both++" if _ovlp == "SAME_DIR"    else
+                "⚠️ Conflict" if _ovlp == "OPPOSITE_DIR" else
+                "🧠 Intel only"
+            )
+            _buy_rows.append({
+                "Symbol":         s["tradingsymbol"],
+                "Sector":         s["sector"][:30],
+                "Source":         _badge,
+                "Why Buy":        s["fundamental_reason"][:120],
+                "Entry Trigger":  s["entry_trigger"][:100],
+                "Stop Loss":      s["stop_loss"][:50],
+                "Conviction":     s["conviction"],
+            })
+        st.dataframe(pd.DataFrame(_buy_rows), hide_index=True, use_container_width=True)
+
+    if _shrt_stk:
+        st.markdown("#### 📕 SHORT — Active Short Setup")
+        _short_rows = []
+        for s in _shrt_stk:
+            _ovlp = s.get("overlap_type")
+            _badge = (
+                "🔥 Both++" if _ovlp == "SAME_DIR" else
+                "⚠️ Conflict" if _ovlp == "OPPOSITE_DIR" else
+                "🧠 Intel only"
+            )
+            _short_rows.append({
+                "Symbol":            s["tradingsymbol"],
+                "Sector":            s["sector"][:30],
+                "Source":            _badge,
+                "Why Short":         s["fundamental_reason"][:120],
+                "Breakdown Trigger": s["entry_trigger"][:100],
+                "Stop Loss":         s["stop_loss"][:50],
+                "Conviction":        s["conviction"],
+            })
+        st.dataframe(pd.DataFrame(_short_rows), hide_index=True, use_container_width=True)
+
+    if _avd_stk:
+        st.markdown("#### 📙 AVOID — Stay Out")
+        _avd_rows = []
+        for s in _avd_stk:
+            _ovlp  = s.get("overlap_type")
+            _badge = "⚠️ In Signals!" if _ovlp == "AVOID_WARNING" else "—"
+            _avd_rows.append({
+                "Symbol":             s["tradingsymbol"],
+                "Sector":             s["sector"][:30],
+                "In Signals":         _badge,
+                "Why Avoid":          s["fundamental_reason"][:150],
+                "What Changes This":  s["condition_required"][:100],
+            })
+        st.dataframe(pd.DataFrame(_avd_rows), hide_index=True, use_container_width=True)
+
+    if _cnd_stk:
+        st.markdown("#### 📘 BUY ON CONDITION — Set Alert")
+        _cnd_rows = []
+        for s in _cnd_stk:
+            _cnd_rows.append({
+                "Symbol":        s["tradingsymbol"],
+                "Sector":        s["sector"][:30],
+                "Setup":         s["fundamental_reason"][:100],
+                "Condition":     s["condition_required"][:120],
+                "Alert Level":   s["alert_level"][:50],
+                "Expected Move": s["expected_move"][:50],
+            })
+        st.dataframe(pd.DataFrame(_cnd_rows), hide_index=True, use_container_width=True)
+
+    if not stocks:
+        st.info(
+            "No stocks were parsed from the brief. The AI may have used a different table format. "
+            "Check the full brief below.",
+            icon="ℹ️",
+        )
+
+    with st.expander("📄 View Full Market Intelligence Brief", expanded=False):
+        st.markdown(raw or "_No raw output available._")
+
+    st.markdown("---")
+    _ap1, _ap2 = st.columns([2, 1])
+
+    if stocks:
+        if _ap1.button(
+            "✅ Apply to Intraday Signals",
+            type="primary",
+            use_container_width=True,
+            help="Saves Market Intel stocks to DB and shows them in the Intraday Plan tab",
+        ):
+            db.save_market_intel(
+                user_id=uid,
+                raw_output=raw,
+                bias=bias,
+                confidence=confidence,
+                stocks=stocks,
+            )
+            st.session_state["_intel_applied"]      = True
+            st.session_state["_intel_stocks_cache"] = stocks
+            st.success(
+                f"✅ Applied {len(stocks)} Market Intel signals! "
+                "Switch to **🎯 Trade Signals → Intraday Plan** to see them.",
+                icon="🧠",
+            )
+
+    if _ap2.button("❌ Close", use_container_width=True, key="intel_dialog_close"):
+        st.rerun()
+
+
 # ── Market Intel background poller ───────────────────────────────────────────
 # Defined here (before tab_screener renders) so both tabs can call it.
 # Runs every 5 s ONLY while a job is in flight; instant no-op when idle.
@@ -1305,10 +1467,20 @@ def _intel_poller():
             st.session_state["_intel_job_status"] = f"error: {result['error']}"
             st.toast(f"❌ Market Intel failed: {result['error'][:80]}", icon="❌")
         else:
-            st.session_state["_intel_job_status"] = "done"
-            st.session_state["_intel_result"]     = result
+            st.session_state["_intel_job_status"]  = "done"
+            st.session_state["_intel_result"]      = result
+            st.session_state["_intel_open_dialog"] = True   # triggers auto-show
             n = len(result.get("stocks", []))
             st.toast(f"🧠 Market Intel complete — {n} stocks identified!", icon="✅")
+        # Full-page rerun so the dialog auto-trigger fires regardless of active tab
+        st.rerun(scope="app")
+
+
+# ── Auto-open Market Intel dialog when job completes (any tab) ────────────────
+# Runs on every full-page rerun. When _intel_poller sets _intel_open_dialog,
+# this pops the flag and opens the dialog before tabs are rendered.
+if st.session_state.pop("_intel_open_dialog", False):
+    _show_market_intel_dialog(uid=st.session_state.get("kite_user_id", ""))
 
 
 # ─── SCREENER TAB ───────────────────────────────────────────
@@ -3239,6 +3411,96 @@ def _live_signals_header():
                         except Exception:
                             pass
 
+        # ── Pass 3: Hard exit at 3:10 PM — close ALL remaining paper positions ─
+        # Kite auto-squares MIS at 3:20 PM; we enforce 3:10 PM ourselves.
+        # The flag is day-scoped so it only fires once per calendar day.
+        _now_p3  = datetime.now(_IST)
+        _past_310 = _now_p3.hour > 15 or (_now_p3.hour == 15 and _now_p3.minute >= 10)
+        _hard_exit_key = f"_paper_hard_exit_{_dt.date.today()}"
+        if _past_310 and st.session_state.get("paper_open") and not st.session_state.get(_hard_exit_key):
+            for _hpid, _hpt in list(st.session_state["paper_open"].items()):
+                _h_ltp = _live_ltp_now.get(_hpt.get("sym", ""), 0) or _hpt.get("entry", 0)
+                try:
+                    db.close_trade(
+                        _hpid, _h_ltp, "CLOSED",
+                        f"⏰ Hard exit 3:10 PM — intraday close rule (LTP ₹{_h_ltp:.2f})"
+                    )
+                    st.session_state["paper_open"].pop(_hpid, None)
+                    st.toast(
+                        f"⏰ Hard exit: {_hpt.get('sym', '')} @ ₹{_h_ltp:.2f}",
+                        icon="⏰",
+                    )
+                except Exception:
+                    pass
+            st.session_state[_hard_exit_key] = True
+
+    # ── Pass 4 (real trades): Kite position sync at 3:20 PM ──────────────────
+    # After 3:20 PM, Kite has finished auto-squaring MIS positions.
+    # Fetch day positions and update any DB open real trades that were squared.
+    _now_p4   = datetime.now(_IST)
+    _past_320 = _now_p4.hour > 15 or (_now_p4.hour == 15 and _now_p4.minute >= 20)
+    _kite_sync_key = f"_real_kite_sync_{_dt.date.today()}"
+    _kc_sync  = st.session_state.get("kite_client")
+    if (
+        _past_320
+        and not st.session_state.get(_kite_sync_key)
+        and _kc_sync is not None
+        and getattr(_kc_sync, "authenticated", False)
+    ):
+        try:
+            _uid_sync  = st.session_state.get("kite_user_id", "")
+            _day_pos   = {}
+            try:
+                _positions = _kc_sync.get_positions()
+                for _p in _positions.get("day", []):
+                    _day_pos[_p.get("tradingsymbol", "")] = _p
+            except Exception:
+                pass
+
+            # Fetch all OPEN real trades for today
+            _open_real = db.get_open_real_trades(user_id=_uid_sync)
+            for _rt in _open_real:
+                _rt_sym  = _rt.get("tradingsymbol", "")
+                _rt_id   = _rt.get("id")
+                _rt_sig  = _rt.get("signal_type", "BUY_ABOVE")
+                _kpos    = _day_pos.get(_rt_sym)
+                if not _kpos:
+                    # Not found in Kite positions — may have been fully squared silently.
+                    # Close at last known LTP to avoid leaving DB in OPEN state.
+                    _fallback_ltp = _live_ltp_now.get(_rt_sym, 0)
+                    if _fallback_ltp:
+                        try:
+                            db.close_trade(
+                                _rt_id, _fallback_ltp, "CLOSED",
+                                "🤖 Kite sync 3:20 PM — position not found (auto-squared)"
+                            )
+                        except Exception:
+                            pass
+                    continue
+                # Position quantity = 0 means fully squared off
+                _net_qty = int(_kpos.get("quantity", 1) or 1)
+                if _net_qty == 0:
+                    # Derive exit price from Kite position data
+                    if _rt_sig in ("BUY", "BUY_ABOVE"):
+                        _exit_px = float(_kpos.get("sell_price") or _kpos.get("last_price") or 0)
+                    else:
+                        _exit_px = float(_kpos.get("buy_price") or _kpos.get("last_price") or 0)
+                    if not _exit_px:
+                        _exit_px = float(_kpos.get("last_price") or 0)
+                    if _exit_px:
+                        try:
+                            _kpnl = float(_kpos.get("realised") or _kpos.get("pnl") or 0)
+                            db.close_trade(
+                                _rt_id, _exit_px, "CLOSED",
+                                f"🤖 Kite auto-squared 3:20 PM @ ₹{_exit_px:.2f} "
+                                f"(Kite P&L ₹{_kpnl:.2f})"
+                            )
+                        except Exception:
+                            pass
+            st.session_state[_kite_sync_key] = True
+        except Exception:
+            pass
+
 
 # ── FRAGMENT 2c: trading mode control strip + kill switch ────────────────────
 @st.fragment
@@ -4886,186 +5148,6 @@ def _show_algo_readjust_dialog(uid: str) -> None:
     else:
         _dc1.info("No changes to apply.", icon="ℹ️")
     if _dc2.button("❌ Cancel", use_container_width=True):
-        st.rerun()
-
-
-# ============================================================
-# MARKET INTEL DIALOG  — results popup + apply
-# ============================================================
-@st.dialog("🧠 India Market Intelligence Brief", width="large")
-def _show_market_intel_dialog(uid: str) -> None:
-    """Display the market intel brief, parsed stock tables, and Apply button."""
-    result = st.session_state.get("_intel_result", {})
-    if not result:
-        st.warning("No Market Intel results in session. Re-run from the Screener tab.")
-        return
-
-    raw    = result.get("raw", "")
-    stocks = result.get("stocks", [])
-    bias_d = result.get("bias", {})
-
-    bias       = bias_d.get("bias", "NEUTRAL")
-    confidence = bias_d.get("confidence", "MEDIUM")
-
-    _bias_colors = {
-        "BULLISH":         "#22c55e",
-        "MILDLY BULLISH":  "#86efac",
-        "NEUTRAL":         "#f59e0b",
-        "MILDLY BEARISH":  "#f87171",
-        "BEARISH":         "#ef4444",
-    }
-    _bias_color = _bias_colors.get(bias, "#f59e0b")
-
-    # ── Bias banner ─────────────────────────────────────────────────────────
-    st.markdown(
-        f'<div style="background:#0f172a;border:1px solid #334155;border-radius:8px;'
-        f'padding:10px 20px;margin-bottom:10px;display:flex;gap:20px;align-items:center">'
-        f'<span style="font-size:0.78rem;color:#64748b;font-weight:600;text-transform:uppercase">🧠 Market Intel</span>'
-        f'<span style="font-size:1rem;color:{_bias_color};font-weight:700">{bias}</span>'
-        f'<span style="font-size:0.8rem;color:#94a3b8">Confidence: <b>{confidence}</b></span>'
-        f'<span style="font-size:0.75rem;color:#64748b">'
-        f'{len([s for s in stocks if s["stance"]=="BUY"])} BUY · '
-        f'{len([s for s in stocks if s["stance"]=="SHORT"])} SHORT · '
-        f'{len([s for s in stocks if s["stance"]=="AVOID"])} AVOID · '
-        f'{len([s for s in stocks if s["stance"]=="BUY_ON_COND"])} BUY ON COND'
-        f'</span>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-
-    # ── Overlap detection against current screener signals ──────────────────
-    _base_df = st.session_state.get("_signals_base_df", None)
-    stocks   = _mi.compute_overlap(stocks, _base_df)
-
-    # Group stocks by stance for display
-    _buy_stk  = [s for s in stocks if s["stance"] == _mi.BUY]
-    _shrt_stk = [s for s in stocks if s["stance"] == _mi.SHORT]
-    _avd_stk  = [s for s in stocks if s["stance"] == _mi.AVOID]
-    _cnd_stk  = [s for s in stocks if s["stance"] == _mi.BUY_ON_COND]
-
-    # ── BUY table ──────────────────────────────────────────────────────────
-    if _buy_stk:
-        st.markdown("#### 📗 BUY — Enter Now")
-        _buy_rows = []
-        for s in _buy_stk:
-            _ovlp = s.get("overlap_type")
-            _badge = (
-                "🔥 Both++" if _ovlp == "SAME_DIR"    else
-                "⚠️ Conflict" if _ovlp == "OPPOSITE_DIR" else
-                "🧠 Intel only"
-            )
-            _buy_rows.append({
-                "Symbol":          s["tradingsymbol"],
-                "Sector":          s["sector"][:30],
-                "Source":          _badge,
-                "Why Buy":         s["fundamental_reason"][:120],
-                "Entry Trigger":   s["entry_trigger"][:100],
-                "Stop Loss":       s["stop_loss"][:50],
-                "Conviction":      s["conviction"],
-            })
-        st.dataframe(pd.DataFrame(_buy_rows), hide_index=True, use_container_width=True)
-
-    # ── SHORT table ────────────────────────────────────────────────────────
-    if _shrt_stk:
-        st.markdown("#### 📕 SHORT — Active Short Setup")
-        _short_rows = []
-        for s in _shrt_stk:
-            _ovlp = s.get("overlap_type")
-            _badge = (
-                "🔥 Both++" if _ovlp == "SAME_DIR" else
-                "⚠️ Conflict" if _ovlp == "OPPOSITE_DIR" else
-                "🧠 Intel only"
-            )
-            _short_rows.append({
-                "Symbol":          s["tradingsymbol"],
-                "Sector":          s["sector"][:30],
-                "Source":          _badge,
-                "Why Short":       s["fundamental_reason"][:120],
-                "Breakdown Trigger": s["entry_trigger"][:100],
-                "Stop Loss":       s["stop_loss"][:50],
-                "Conviction":      s["conviction"],
-            })
-        st.dataframe(pd.DataFrame(_short_rows), hide_index=True, use_container_width=True)
-
-    # ── AVOID table ────────────────────────────────────────────────────────
-    if _avd_stk:
-        st.markdown("#### 📙 AVOID — Stay Out")
-        _avd_rows = []
-        for s in _avd_stk:
-            _ovlp = s.get("overlap_type")
-            _badge = "⚠️ In Signals!" if _ovlp == "AVOID_WARNING" else "—"
-            _avd_rows.append({
-                "Symbol":      s["tradingsymbol"],
-                "Sector":      s["sector"][:30],
-                "In Signals":  _badge,
-                "Why Avoid":   s["fundamental_reason"][:150],
-                "What Changes This": s["condition_required"][:100],
-            })
-        st.dataframe(pd.DataFrame(_avd_rows), hide_index=True, use_container_width=True)
-
-    # ── BUY ON CONDITION table ─────────────────────────────────────────────
-    if _cnd_stk:
-        st.markdown("#### 📘 BUY ON CONDITION — Set Alert")
-        _cnd_rows = []
-        for s in _cnd_stk:
-            _cnd_rows.append({
-                "Symbol":        s["tradingsymbol"],
-                "Sector":        s["sector"][:30],
-                "Setup":         s["fundamental_reason"][:100],
-                "Condition":     s["condition_required"][:120],
-                "Alert Level":   s["alert_level"][:50],
-                "Expected Move": s["expected_move"][:50],
-            })
-        st.dataframe(pd.DataFrame(_cnd_rows), hide_index=True, use_container_width=True)
-
-    if not (stocks):
-        st.info(
-            "No stocks were parsed from the brief. The AI may have used a different table format. "
-            "Check the full brief below.",
-            icon="ℹ️",
-        )
-
-    # ── Full brief expandable ──────────────────────────────────────────────
-    with st.expander("📄 View Full Market Intelligence Brief", expanded=False):
-        st.markdown(raw or "_No raw output available._")
-
-    # ── Apply / Close ──────────────────────────────────────────────────────
-    st.markdown("---")
-    _ap1, _ap2 = st.columns([2, 1])
-
-    if stocks:
-        if _ap1.button(
-            "✅ Apply to Intraday Signals",
-            type="primary",
-            use_container_width=True,
-            help="Saves Market Intel stocks to DB and shows them in the Intraday Plan tab",
-        ):
-            latest = db.get_latest_market_intel(user_id=uid)
-            if latest:
-                db.save_market_intel(
-                    user_id=uid,
-                    raw_output=raw,
-                    bias=bias,
-                    confidence=confidence,
-                    stocks=stocks,
-                )
-            else:
-                db.save_market_intel(
-                    user_id=uid,
-                    raw_output=raw,
-                    bias=bias,
-                    confidence=confidence,
-                    stocks=stocks,
-                )
-            st.session_state["_intel_applied"] = True
-            st.session_state["_intel_stocks_cache"] = stocks
-            st.success(
-                f"✅ Applied {len(stocks)} Market Intel signals! "
-                "Switch to **🎯 Trade Signals → Intraday Plan** to see them.",
-                icon="🧠",
-            )
-
-    if _ap2.button("❌ Close", use_container_width=True, key="intel_dialog_close"):
         st.rerun()
 
 
