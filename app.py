@@ -4563,9 +4563,10 @@ def _activity_log_live():
     _log_df.loc[_no_pnl, ["charges", "net_pnl", "net_pnl_pct"]] = None
 
     # Status first, then symbol, LTP, gross P&L, charges, net P&L, then the rest
+    # Use logged_at (TIMESTAMP) instead of trade_date (DATE-only) for accurate open time
     _disp_cols = [
         "status",
-        "id", "trade_date", "tradingsymbol", "ltp",
+        "id", "logged_at", "tradingsymbol", "ltp",
         "pnl_amount", "pnl_pct",
         "charges", "net_pnl", "net_pnl_pct",
         "trade_type", "setup_type", "signal_type",
@@ -4642,7 +4643,11 @@ def _activity_log_live():
         column_config={
             "status":              st.column_config.TextColumn("Status",        width="small"),
             "id":                  st.column_config.NumberColumn("ID",          width="small"),
-            "trade_date":          st.column_config.DateColumn("Date"),
+            "logged_at":           st.column_config.DatetimeColumn(
+                                       "Opened At",
+                                       format="DD/MM/YY HH:mm:ss",
+                                       help="Exact timestamp when the trade was triggered and logged",
+                                   ),
             "tradingsymbol":       st.column_config.TextColumn("Symbol"),
             "ltp":                 st.column_config.TextColumn("LTP",
                 help="Last traded price — live from market during trading hours"),
