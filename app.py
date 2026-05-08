@@ -451,18 +451,27 @@ if "paper_open" not in st.session_state:
 
 # On first load (or after page refresh), re-sync paper_triggered + paper_open
 # from the DB so we never double-create paper trades.
+# Run init_schema() first to ensure is_paper_trade column + signal_config table
+# exist on databases that pre-date this feature (idempotent — safe every run).
 if st.session_state.get("_paper_sync_date") != _today_str:
-    _existing = db.get_open_paper_trades(user_id=_cur_user_id)
-    for _pt in _existing:
-        _k = (_today_str, _pt["tradingsymbol"])
-        st.session_state["paper_triggered"][_k] = _pt["id"]
-        st.session_state["paper_open"][_pt["id"]] = {
-            "sym":         _pt["tradingsymbol"],
-            "stop":        float(_pt["rec_stop"] or 0),
-            "t1":          float(_pt["rec_t1"] or 0),
-            "signal_type": _pt["signal_type"],
-            "entry":       float(_pt["actual_entry"] or 0),
-        }
+    try:
+        db.init_schema()
+    except Exception:
+        pass
+    try:
+        _existing = db.get_open_paper_trades(user_id=_cur_user_id)
+        for _pt in _existing:
+            _k = (_today_str, _pt["tradingsymbol"])
+            st.session_state["paper_triggered"][_k] = _pt["id"]
+            st.session_state["paper_open"][_pt["id"]] = {
+                "sym":         _pt["tradingsymbol"],
+                "stop":        float(_pt["rec_stop"] or 0),
+                "t1":          float(_pt["rec_t1"] or 0),
+                "signal_type": _pt["signal_type"],
+                "entry":       float(_pt["actual_entry"] or 0),
+            }
+    except Exception:
+        pass
     st.session_state["_paper_sync_date"] = _today_str
 
 
