@@ -155,3 +155,14 @@ NIFTY_50_TOKEN = 256265
 PAPER_CAPITAL       = 900_000   # ₹9,00,000 virtual capital
 PAPER_MAX_POSITIONS = 6         # max concurrent paper trades (mix of long + short)
 # Per-trade allocation: PAPER_CAPITAL / PAPER_MAX_POSITIONS = ₹1,50,000 each
+
+# Daily gain target / trailing cutoff (applies to both paper & real trading)
+# Rule:
+#   • Below DAILY_TARGET_LOW_PCT  (2%) → always accept new entries
+#   • 2% – 5%                         → trailing cutoff = peak_return – DAILY_TRAIL_PCT
+#   • At or above DAILY_TARGET_HIGH_PCT (5%) → hard ceiling, block all new entries
+# The "peak_return" is the high-water mark of today's realised return.
+# Once the live return drops back to (peak – 0.3%) trading is halted for the day.
+DAILY_TARGET_LOW_PCT  = 2.0     # activate trailing stop only after this gain
+DAILY_TARGET_HIGH_PCT = 5.0     # hard ceiling — never trade past this
+DAILY_TRAIL_PCT       = 0.3     # stop trading if return falls this far from peak

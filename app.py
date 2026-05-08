@@ -449,6 +449,18 @@ if "paper_triggered" not in st.session_state:
 if "paper_open" not in st.session_state:
     st.session_state["paper_open"] = {}
 
+# ── Daily gain gate — reset every new trading day ─────────────────────────────
+# paper_day_hwm_pct : high-water mark of today's realised return % (paper trades)
+# paper_day_blocked : True once the trailing cutoff is triggered
+# real_day_hwm_pct  : same but for real trades
+# real_day_blocked  : True once real-trade trailing cutoff is triggered
+if st.session_state.get("_day_gate_date") != _today_str:
+    st.session_state["paper_day_hwm_pct"]  = 0.0
+    st.session_state["paper_day_blocked"]  = False
+    st.session_state["real_day_hwm_pct"]   = 0.0
+    st.session_state["real_day_blocked"]   = False
+    st.session_state["_day_gate_date"]     = _today_str
+
 # On first load (or after page refresh), re-sync paper_triggered + paper_open
 # from the DB so we never double-create paper trades.
 # Run init_schema() first to ensure is_paper_trade column + signal_config table
@@ -940,11 +952,45 @@ def _render_order_panel(signal_df: pd.DataFrame, setup_type: str, form_key: str)
     _kc = st.session_state.get("kite_client")
     kite_connected = _kc is not None and getattr(_kc, "authenticated", False)
 
+    # ── Real-trade daily gate ─────────────────────────────────────────────────
+    # Mirrors the paper-trade trailing-stop logic using today's realised real P&L.
+    _uid_op = st.session_state.get("kite_user_id", "")
+    try:
+        _real_pnl_today = db.get_today_closed_pnl(user_id=_uid_op, is_paper=False)
+    except Exception:
+        _real_pnl_today = 0.0
+    _rcap  = config.PAPER_CAPITAL   # use same base; user can adjust in config
+    _r_ret = (_real_pnl_today / _rcap * 100) if _rcap else 0.0
+    _r_hwm = max(st.session_state.get("real_day_hwm_pct", 0.0), _r_ret)
+    st.session_state["real_day_hwm_pct"] = _r_hwm
+    _r_low   = config.DAILY_TARGET_LOW_PCT
+    _r_high  = config.DAILY_TARGET_HIGH_PCT
+    _r_trail = config.DAILY_TRAIL_PCT
+    _r_cutoff = (_r_hwm - _r_trail) if _r_hwm >= _r_low else None
+    _real_blocked = (
+        (_r_cutoff is not None and _r_ret <= _r_cutoff) or _r_ret >= _r_high
+    )
+    st.session_state["real_day_blocked"] = _real_blocked
+
     expander_label = (
         "🚀 Place Order via Kite" if kite_connected else "📝 Log a trade from this list"
     )
+    if _real_blocked:
+        expander_label += "  🚫 Daily gate closed"
 
     with st.expander(expander_label, expanded=False):
+        if _real_blocked:
+            _r_reason = (
+                f"Realised gain **{_r_ret:.2f}%** hit ceiling **{_r_high:.0f}%**"
+                if _r_ret >= _r_high
+                else f"Realised gain **{_r_ret:.2f}%** dropped to cutoff **{_r_cutoff:.2f}%** "
+                     f"(peak **{_r_hwm:.2f}%** − {_r_trail:.1f}% trail)"
+            )
+            st.warning(
+                f"**Daily trading gate closed.** No new real orders for the rest of today.  \n{_r_reason}",
+                icon="🚫",
+            )
+            return
         sym_col, _ = st.columns([2, 5])
         sym_options = sorted(signal_df["tradingsymbol"].dropna().unique().tolist())
         selected_sym = sym_col.selectbox(
@@ -2851,6 +2897,133 @@ def _live_signals_header():
                 pass
 
 
+# ── FRAGMENT 2b: paper-trade banner (auto-refresh, daily gate logic) ─────────
+@st.fragment(run_every=2)
+def _intraday_paper_banner():
+    """
+    Renders the 'Paper Trades Today' dashboard strip and enforces the
+    daily trailing-stop gate:
+
+      • Below 2%  realised return  → keep allocating to new signals
+      • 2% – 5%                   → trailing cutoff = peak_return − 0.3%
+                                    (cutoff only ratchets UP with gains)
+      • ≥ 5%                      → hard ceiling, no new entries
+      • Return drops to cutoff    → block new entries for the rest of day
+    """
+    _uid = st.session_state.get("kite_user_id", "")
+
+    # ── Fetch today's realised paper P&L ─────────────────────────────────────
+    try:
+        _today_paper_pnl = db.get_today_closed_pnl(user_id=_uid, is_paper=True)
+    except Exception:
+        _today_paper_pnl = 0.0
+
+    _cap = config.PAPER_CAPITAL
+    _ret_pct = (_today_paper_pnl / _cap * 100) if _cap else 0.0
+
+    # ── Update high-water mark ────────────────────────────────────────────────
+    _hwm = max(st.session_state.get("paper_day_hwm_pct", 0.0), _ret_pct)
+    st.session_state["paper_day_hwm_pct"] = _hwm
+
+    _LOW   = config.DAILY_TARGET_LOW_PCT    # 2.0
+    _HIGH  = config.DAILY_TARGET_HIGH_PCT   # 5.0
+    _TRAIL = config.DAILY_TRAIL_PCT         # 0.3
+
+    # Cutoff = hwm − TRAIL (but only active once hwm ≥ LOW)
+    _cutoff_pct: float | None = (_hwm - _TRAIL) if _hwm >= _LOW else None
+
+    _blocked = (
+        (_cutoff_pct is not None and _ret_pct <= _cutoff_pct)
+        or _ret_pct >= _HIGH
+    )
+    # Persist so auto-trigger code can read it without re-computing
+    st.session_state["paper_day_blocked"] = _blocked
+
+    # ── Live MTM on open positions ────────────────────────────────────────────
+    _open_pt       = st.session_state.get("paper_open", {})
+    _n_open        = len(_open_pt)
+    _n_today       = len(st.session_state.get("paper_triggered", {}))
+    _live_ltp_now  = st.session_state.get("_live_ltp", {})
+    _open_mtm      = 0.0
+    for _ppid, _pp in _open_pt.items():
+        _p_ltp = _live_ltp_now.get(_pp["sym"], _pp.get("entry", 0))
+        _dir   = -1 if _pp["signal_type"] == "SELL_BELOW" else 1
+        _p_qty = max(1, int((_cap // config.PAPER_MAX_POSITIONS) / (_pp.get("entry") or 1)))
+        _open_mtm += _dir * (_p_ltp - _pp["entry"]) * _p_qty
+
+    _total_pnl   = _today_paper_pnl + _open_mtm   # realised + unrealised
+    _total_ret   = (_total_pnl / _cap * 100) if _cap else 0.0
+    _pnl_color   = "#22c55e" if _total_pnl >= 0 else "#ef4444"
+    _capital_deployed = min(_n_open, config.PAPER_MAX_POSITIONS) * (_cap // config.PAPER_MAX_POSITIONS)
+
+    # ── Gate status label ─────────────────────────────────────────────────────
+    if _blocked:
+        if _ret_pct >= _HIGH:
+            _gate_html = (
+                f'<span style="color:#ef4444;font-weight:700;font-size:0.75rem">'
+                f'🚫 CEILING HIT ({_HIGH:.0f}%) — no new entries today</span>'
+            )
+        else:
+            _gate_html = (
+                f'<span style="color:#ef4444;font-weight:700;font-size:0.75rem">'
+                f'🚫 CUTOFF HIT — return dropped to {_ret_pct:.2f}% '
+                f'(peak {_hwm:.2f}% − {_TRAIL:.1f}% trail = {_cutoff_pct:.2f}%)</span>'
+            )
+    elif _cutoff_pct is not None:
+        _gate_html = (
+            f'<span style="color:#f59e0b;font-weight:600;font-size:0.75rem">'
+            f'⚡ Trailing active — stop if return drops to '
+            f'<b>{_cutoff_pct:.2f}%</b> '
+            f'(peak {_hwm:.2f}% − {_TRAIL:.1f}%)</span>'
+        )
+    elif _hwm > 0:
+        _gate_html = (
+            f'<span style="color:#22c55e;font-size:0.75rem">'
+            f'✅ {_ret_pct:.2f}% gained — trailing activates at {_LOW:.0f}%</span>'
+        )
+    else:
+        _target_amt = _cap * _LOW / 100
+        _gate_html = (
+            f'<span style="color:#94a3b8;font-size:0.75rem">'
+            f'🎯 Daily target: {_LOW:.0f}%–{_HIGH:.0f}% '
+            f'(₹{_target_amt:,.0f}–₹{_cap * _HIGH / 100:,.0f})</span>'
+        )
+
+    if _n_today > 0 or _n_open > 0 or True:   # always show banner
+        st.markdown(
+            f'<div style="background:#0f172a;border:1px solid #334155;border-radius:8px;'
+            f'padding:10px 18px;margin-bottom:10px;display:flex;flex-wrap:wrap;'
+            f'gap:20px;align-items:center">'
+            f'<span style="font-size:0.8rem;color:#94a3b8;white-space:nowrap">'
+            f'📄 <b>Paper Trades Today</b></span>'
+            f'<span style="color:#f8fafc;font-weight:700">{_n_today} created</span>'
+            f'<span style="color:#f59e0b;font-weight:600">{_n_open} open</span>'
+            f'<span style="color:{_pnl_color};font-weight:700">'
+            f'Live P&amp;L: ₹{_total_pnl:+,.0f} '
+            f'(<span style="font-size:0.8em">{_total_ret:+.2f}%</span>)'
+            f'</span>'
+            f'<span style="font-size:0.75rem;color:#64748b;white-space:nowrap">'
+            f'Capital: ₹{_cap:,} · ₹{_cap // config.PAPER_MAX_POSITIONS:,}/trade · '
+            f'Deployed: ₹{_capital_deployed:,}</span>'
+            f'<span>{_gate_html}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ── Block banner ──────────────────────────────────────────────────────────
+    if _blocked:
+        st.warning(
+            f"**Daily trading gate closed** — paper trades will NOT be created for new signals today.  \n"
+            f"Realised gain: **{_ret_pct:.2f}%** · Peak: **{_hwm:.2f}%** · "
+            + (
+                f"Cutoff: **{_cutoff_pct:.2f}%** (trail {_TRAIL:.1f}% from peak)"
+                if _cutoff_pct is not None
+                else f"Hard ceiling: **{_HIGH:.0f}%** reached"
+            ),
+            icon="🚫",
+        )
+
+
 # ── FRAGMENT 2a: intraday LONG table (live status column) ────────────────────
 # Runs every 2 s inside the Long sub-tab. No st.tabs() here — the sub-tabs
 # that contain this fragment are created OUTSIDE in _signals_main().
@@ -2900,6 +3073,7 @@ def _intraday_long_live():
         # ── Auto paper trade when TRIGGERED and within position limit ────────
         _paper_key = (_today_str, sym)
         if (live_status == "TRIGGERED"
+                and not st.session_state.get("paper_day_blocked", False)
                 and _paper_key not in st.session_state.get("paper_triggered", {})
                 and len([p for p in st.session_state.get("paper_open", {}).values()
                          if p.get("signal_type") == "BUY_ABOVE"]) < config.PAPER_MAX_POSITIONS // 2 + 1):
@@ -3118,6 +3292,7 @@ def _intraday_short_live():
         # ── Auto paper trade when TRIGGERED and within position limit ────────
         _paper_key = (_today_str, sym)
         if (short_status == "TRIGGERED"
+                and not st.session_state.get("paper_day_blocked", False)
                 and _paper_key not in st.session_state.get("paper_triggered", {})
                 and len([p for p in st.session_state.get("paper_open", {}).values()
                          if p.get("signal_type") == "SELL_BELOW"]) < config.PAPER_MAX_POSITIONS // 2 + 1):
@@ -3448,31 +3623,8 @@ def _signals_main():
             "LTP and Status update automatically every 2 s during market hours."
         )
 
-        # ── Paper trade live dashboard ─────────────────────────────────────
-        _open_pt  = st.session_state.get("paper_open", {})
-        _n_open   = len(_open_pt)
-        _n_today  = len(st.session_state.get("paper_triggered", {}))
-        if _n_today > 0 or _n_open > 0:
-            _live_ltp_now = st.session_state.get("_live_ltp", {})
-            _paper_pnl = 0.0
-            for _ppid, _pp in _open_pt.items():
-                _p_ltp = _live_ltp_now.get(_pp["sym"], _pp.get("entry", 0))
-                _dir   = -1 if _pp["signal_type"] == "SELL_BELOW" else 1
-                _p_qty = max(1, int((config.PAPER_CAPITAL // config.PAPER_MAX_POSITIONS) / (_pp.get("entry") or 1)))
-                _paper_pnl += _dir * (_p_ltp - _pp["entry"]) * _p_qty
-            _pnl_color = "#22c55e" if _paper_pnl >= 0 else "#ef4444"
-            st.markdown(
-                f'<div style="background:#0f172a;border:1px solid #334155;border-radius:8px;'
-                f'padding:10px 16px;margin-bottom:10px;display:flex;gap:24px;align-items:center">'
-                f'<span style="font-size:0.8rem;color:#94a3b8">📄 <b>Paper Trades Today</b></span>'
-                f'<span style="color:#f8fafc;font-weight:700">{_n_today} created</span>'
-                f'<span style="color:#f59e0b;font-weight:600">{_n_open} open</span>'
-                f'<span style="color:{_pnl_color};font-weight:700">Live P&amp;L: ₹{_paper_pnl:+,.2f}</span>'
-                f'<span style="font-size:0.75rem;color:#64748b">Capital ₹{config.PAPER_CAPITAL:,} · '
-                f'₹{config.PAPER_CAPITAL//config.PAPER_MAX_POSITIONS:,}/trade</span>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
+        # ── Paper trade live dashboard (auto-refresh fragment) ────────────────
+        _intraday_paper_banner()
 
         _n_il = st.session_state.get("_n_intra_long",  0)
         _n_is = st.session_state.get("_n_intra_short", 0)

@@ -660,6 +660,42 @@ def get_open_paper_trades(user_id: str = "", trade_date=None) -> list:
     ]
 
 
+def get_today_closed_pnl(user_id: str = "", is_paper: bool | None = None) -> float:
+    """
+    Returns the total realised P&L (sum of pnl_amount) for TODAY's closed trades.
+
+    Parameters
+    ----------
+    user_id  : Kite user ID filter ('' = all users).
+    is_paper : True → paper trades only | False → real trades only | None → both.
+    """
+    _ensure_connection()
+    import datetime as _dt
+    _today = _dt.date.today().isoformat()
+    clauses: list[str] = [
+        "trade_date = ?",
+        "status IN ('CLOSED', 'TARGET_HIT', 'STOPPED_OUT')",
+        "pnl_amount IS NOT NULL",
+    ]
+    params: list = [_today]
+    if user_id:
+        clauses.append("kite_user_id = ?")
+        params.append(user_id)
+    if is_paper is True:
+        clauses.append("is_paper_trade = TRUE")
+    elif is_paper is False:
+        clauses.append("(is_paper_trade = FALSE OR is_paper_trade IS NULL)")
+    where = " AND ".join(clauses)
+    try:
+        row = _conn.execute(
+            f"SELECT COALESCE(SUM(pnl_amount), 0.0) FROM trade_log WHERE {where}",
+            params,
+        ).fetchone()
+        return float(row[0]) if row else 0.0
+    except Exception:
+        return 0.0
+
+
 def get_paper_trade_perf(user_id: str = "", days: int = 30) -> dict:
     """
     Aggregate paper trade performance over the last `days` calendar days,
