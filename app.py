@@ -146,6 +146,37 @@ if "request_token" in st.query_params:
     st.query_params.clear()          # clean the URL immediately
 
 # ── Step 0b: seed / refresh session-state keys ────────────────────────
+def _persist_local_keys(api_key: str, api_secret: str) -> None:
+    """
+    Save Kite credentials to both screener_keys.json and .env so they
+    survive page refreshes AND process restarts without the user re-entering them.
+    """
+    _ai.save_kite_keys(api_key, api_secret)
+    # Also patch .env in-place so os.getenv() picks them up on the next process start
+    try:
+        from pathlib import Path as _PL
+        _env_path = _PL(__file__).parent / ".env"
+        _lines = _env_path.read_text().splitlines() if _env_path.exists() else []
+        _new_lines = []
+        _wrote_k = _wrote_s = False
+        for _ln in _lines:
+            if _ln.startswith("KITE_API_KEY="):
+                _new_lines.append(f"KITE_API_KEY={api_key}")
+                _wrote_k = True
+            elif _ln.startswith("KITE_API_SECRET="):
+                _new_lines.append(f"KITE_API_SECRET={api_secret}")
+                _wrote_s = True
+            else:
+                _new_lines.append(_ln)
+        if not _wrote_k:
+            _new_lines.append(f"KITE_API_KEY={api_key}")
+        if not _wrote_s:
+            _new_lines.append(f"KITE_API_SECRET={api_secret}")
+        _env_path.write_text("\n".join(_new_lines) + "\n")
+    except Exception:
+        pass  # .env write failure is non-fatal; screener_keys.json is the primary fallback
+
+
 def _init_session_kite_state():
     """
     Merge localStorage values into session_state.
@@ -157,11 +188,25 @@ def _init_session_kite_state():
     On local dev it runs only once (env-var seeding is deterministic).
     """
     if not _ON_CLOUD:
-        # Local dev: seed once from .env, never re-run.
+        # Local dev: seed once per session. Read .env first, then fall back
+        # to screener_keys.json so keys saved via the UI survive page refreshes.
         if "kite_ss_initialized" in st.session_state:
             return
-        st.session_state.setdefault("kite_api_key",       _os.getenv("KITE_API_KEY", ""))
-        st.session_state.setdefault("kite_api_secret",    _os.getenv("KITE_API_SECRET", ""))
+        _k_local = _os.getenv("KITE_API_KEY", "")
+        _s_local = _os.getenv("KITE_API_SECRET", "")
+        if not _k_local or not _s_local:
+            try:
+                import json as _json_loc
+                from pathlib import Path as _Path_loc
+                _kf = _Path_loc(__file__).parent / "screener_keys.json"
+                if _kf.exists():
+                    _stored = _json_loc.loads(_kf.read_text())
+                    _k_local = _k_local or _stored.get("kite_api_key", "")
+                    _s_local = _s_local or _stored.get("kite_api_secret", "")
+            except Exception:
+                pass
+        st.session_state.setdefault("kite_api_key",       _k_local)
+        st.session_state.setdefault("kite_api_secret",    _s_local)
         st.session_state.setdefault("kite_access_token",  "")
         st.session_state.setdefault("kite_access_date",   "")
         st.session_state.setdefault("kite_user_id",       "")
@@ -266,7 +311,7 @@ if not (_ss_api_key and _ss_api_secret):
                 _ls_set("kite_api_key",    _setup_k.strip(), expires_days=365)
                 _ls_set("kite_api_secret", _setup_s.strip(), expires_days=365)
             else:
-                _ai.save_kite_keys(_setup_k.strip(), _setup_s.strip())
+                _persist_local_keys(_setup_k.strip(), _setup_s.strip())
             st.rerun()
         else:
             st.sidebar.error("Both API Key and Secret are required.")
@@ -728,7 +773,7 @@ with st.sidebar.expander("🔄 Update API Keys", expanded=False):
                 _ls_set("kite_api_key",    _upd_k.strip(), expires_days=365)
                 _ls_set("kite_api_secret", _upd_s.strip(), expires_days=365)
             else:
-                _ai.save_kite_keys(_upd_k.strip(), _upd_s.strip())
+                _persist_local_keys(_upd_k.strip(), _upd_s.strip())
             # Clear auth so new keys take effect on next Zerodha login
             for _k in ("kite_authenticated", "kite_client", "kite_access_token",
                        "kite_access_date", "kite_user_id", "kite_user_name"):
