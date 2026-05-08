@@ -886,16 +886,6 @@ if require_all_positive:
 
 
 # ============================================================
-# HEADER
-# ============================================================
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Universe", len(df))
-col2.metric("Filtered", len(filtered))
-col3.metric("Pct retained", f"{len(filtered)/max(len(df),1)*100:.1f}%")
-col4.metric("Last update", last_update.split()[1] if last_update != "never" else "-")
-
-
-# ============================================================
 # TAB LAYOUT — Screener | Trade Signals | Activity Log
 # ============================================================
 tab_screener, tab_signals, tab_activity = st.tabs([
@@ -1206,6 +1196,12 @@ def _render_order_panel(signal_df: pd.DataFrame, setup_type: str, form_key: str)
 
 # ─── SCREENER TAB ───────────────────────────────────────────
 with tab_screener:
+    _hc1, _hc2, _hc3, _hc4 = st.columns(4)
+    _hc1.metric("Universe",    len(df))
+    _hc2.metric("Filtered",    len(filtered))
+    _hc3.metric("Pct retained", f"{len(filtered)/max(len(df),1)*100:.1f}%")
+    _hc4.metric("Last update", last_update.split()[1] if last_update != "never" else "-")
+
     st.subheader(f"Screener Results — {len(filtered)} candidates")
 
     # ── AI status line (no bulk-run button — analysis is per-stock or auto on signals) ──
