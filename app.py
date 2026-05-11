@@ -1333,42 +1333,33 @@ def _market_pulse_header():
 
     if _force or (_now_ts - st.session_state.get("_global_idx_ts", 0) > 300):
         _g_data: dict = {}
-        try:
-            import urllib.parse as _ulp
-            # Encode each symbol so ^ → %5E; keep commas as separator
-            _syms_csv = ",".join(_ulp.quote(v[0], safe="") for v in _GLOBAL_META.values())
-            _YF_HDR = {
-                "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                               "AppleWebKit/537.36 (KHTML, like Gecko) "
-                               "Chrome/124.0.0.0 Safari/537.36"),
-                "Accept": "application/json",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": "https://finance.yahoo.com",
-            }
-            _qr = _rqm.get(
-                f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={_syms_csv}",
-                headers=_YF_HDR, timeout=8,
-            )
-            _quotes = (_qr.json().get("quoteResponse", {}).get("result") or [])
-            for _q in _quotes:
-                _qsym  = _q.get("symbol", "")
-                _qltp  = _q.get("regularMarketPrice")
-                _qpct  = _q.get("regularMarketChangePercent")
-                # Use time-based open check as primary; fall back to Yahoo's field
-                _ystate = _q.get("marketState", "CLOSED")
-                if _qsym in _sym_to_meta and _qltp is not None:
-                    _gname, _greg, _gflag = _sym_to_meta[_qsym]
-                    _computed_open = _region_open(_greg)
+        import urllib.parse as _ulp
+
+        # ── Source A: Yahoo Finance v8/chart per symbol ───────────────────
+        # Same endpoint as VIX/crude — no crumb/cookie auth needed.
+        # interval=1m gives real-time regularMarketPrice in meta.
+        _v8_hdr = {"User-Agent": "Mozilla/5.0 (compatible; screener/1.0)"}
+        for _yfsym, (_gname, _greg, _gflag) in _GLOBAL_META.items():
+            try:
+                _enc = _ulp.quote(_yfsym, safe="")
+                _gr  = _rqm.get(
+                    f"https://query1.finance.yahoo.com/v8/finance/chart/{_enc}"
+                    "?interval=1m&range=1d",
+                    headers=_v8_hdr, timeout=4,
+                )
+                _gm  = (_gr.json().get("chart", {}).get("result") or [{}])[0].get("meta", {})
+                _gltp  = _gm.get("regularMarketPrice")
+                _gprev = _gm.get("chartPreviousClose") or _gm.get("previousClose")
+                if _gltp is not None and _gprev:
                     _g_data[_gname] = {
-                        "ltp":       float(_qltp),
-                        "pct":       round(float(_qpct), 2) if _qpct is not None else None,
-                        "region":    _greg,
-                        "flag":      _gflag,
-                        # REGULAR if our clock says open; else use Yahoo's state
-                        "mkt_state": "REGULAR" if _computed_open else _ystate,
+                        "ltp":      float(_gltp),
+                        "pct":      round((float(_gltp) - float(_gprev)) / float(_gprev) * 100, 2),
+                        "region":   _greg, "flag": _gflag,
+                        "mkt_state": "REGULAR" if _region_open(_greg) else "CLOSED",
+                        "src":      "yahoo",
                     }
-        except Exception:
-            pass
+            except Exception:
+                pass
 
         # ── Stooq fallback — for any symbol Yahoo missed ───────────────────
         # Stooq returns real-time/delayed quotes as plain CSV, no key needed.
