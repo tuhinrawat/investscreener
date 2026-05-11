@@ -47,6 +47,11 @@ import market_intel as _mi
 from kite_client import KiteClient
 import kite_client as _kc_module
 
+# IST timezone constant — defined once here so every fragment and helper can use
+# it without depending on execution order (fragments run before the body reaches
+# the original _IST = ... at line ~3593).
+_IST = timezone(timedelta(hours=5, minutes=30))
+
 # Background-tab-safe autorefresh: uses a Web Worker (background thread) that
 # browsers cannot throttle, unlike plain setInterval used by fragment run_every.
 try:
