@@ -8164,20 +8164,22 @@ def _ticker_banner():
             _banner_msg = ("⏸&nbsp;Market closed — connect Kite to see last prices"
                            if not _kite_ok else
                            "⏸&nbsp;Market closed — last prices unavailable")
-            st.markdown(f"""
-<style>
-#__tb{{position:fixed;bottom:0;left:0;right:0;height:34px;background:#060d18;
-border-top:1px solid #1e3a5f;z-index:9999;display:flex;align-items:center;padding:0 12px}}
-section.main .block-container{{padding-bottom:44px!important}}
-</style>
+            import streamlit.components.v1 as _stc
+            _stc.html(f"""
 <script>
 (function(){{
-    var el=document.getElementById('__tb');
-    if(!el){{el=document.createElement('div');el.id='__tb';document.body.appendChild(el);}}
-    el.innerHTML='<span style="color:#475569;font-size:12px;font-family:monospace">{_banner_msg}</span>';
+  var p=window.parent.document;
+  if(!p.getElementById('__tb_style')){{
+    var s=p.createElement('style');s.id='__tb_style';
+    s.textContent='#__tb{{position:fixed;bottom:0;left:0;right:0;height:34px;background:#060d18;border-top:1px solid #1e3a5f;z-index:9999;display:flex;align-items:center;padding:0 12px}}section.main .block-container{{padding-bottom:44px!important}}';
+    p.head.appendChild(s);
+  }}
+  var el=p.getElementById('__tb');
+  if(!el){{el=p.createElement('div');el.id='__tb';p.body.appendChild(el);}}
+  el.innerHTML='<span style="color:#475569;font-size:12px;font-family:monospace">{_banner_msg}</span>';
 }})();
 </script>
-""", unsafe_allow_html=True)
+""", height=0, scrolling=False)
             return
 
     _prev = st.session_state.get("_prev_ltp", {})
@@ -8301,71 +8303,53 @@ section.main .block-container{{padding-bottom:44px!important}}
         f'{_ws_badge_txt}</div>'
     )
 
-    # Render the banner by injecting/updating a <div id="__tb"> that lives
-    # directly on document.body — outside Streamlit's fragment container.
-    # This means Streamlit never removes it on re-render, eliminating the
-    # 1-second flicker that happens when position:fixed elements are inside
-    # a fragment that re-mounts its DOM on every tick.
     import json as _json
+    import streamlit.components.v1 as _stc
+
     _inner_html = (
         f'{_ws_badge}{_mkt_badge}'
-        f'<div class="_tb_scroll_area">'
-        f'<div class="_tb_inner" style="animation-duration:{_duration}s">'
+        f'<div style="flex:1;overflow:hidden;height:100%;display:flex;align-items:center">'
+        f'<div style="display:inline-flex;white-space:nowrap;align-items:center;height:100%;'
+        f'animation:_tbsc {_duration}s linear infinite;will-change:transform">'
         f'{_content_full}</div></div>'
     )
-    st.markdown(f"""
-<style>
-@keyframes _tb_scroll {{
-    0%   {{ transform: translateX(0); }}
-    100% {{ transform: translateX(-50%); }}
-}}
-#__tb {{
-    position: fixed;
-    bottom: 0; left: 0; right: 0;
-    height: 34px;
-    background: #060d18;
-    border-top: 1px solid #1e3a5f;
-    overflow: hidden;
-    z-index: 9999;
-    display: flex;
-    align-items: center;
-    gap: 0;
-}}
-._tb_scroll_area {{
-    flex: 1;
-    overflow: hidden;
-    height: 100%;
-    display: flex;
-    align-items: center;
-}}
-._tb_inner {{
-    display: inline-flex;
-    white-space: nowrap;
-    align-items: center;
-    height: 100%;
-    animation: _tb_scroll linear infinite;
-    will-change: transform;
-}}
-#__tb .tb-idx  {{ font-size:13px;padding:0 8px;color:#e2e8f0;font-weight:600;font-family:'SF Mono','Fira Code',monospace; }}
-#__tb .tb-stk  {{ font-size:12px;padding:0 7px;color:#94a3b8;font-family:'SF Mono','Fira Code',monospace; }}
-#__tb .tb-fx   {{ font-size:12px;padding:0 7px;color:#fbbf24;font-family:'SF Mono','Fira Code',monospace; }}
-#__tb .tb-cx   {{ font-size:12px;padding:0 7px;color:#fb923c;font-family:'SF Mono','Fira Code',monospace; }}
-#__tb .tb-pcr  {{ font-size:12px;padding:0 7px;color:#a78bfa;font-family:'SF Mono','Fira Code',monospace; }}
-section.main .block-container {{ padding-bottom: 44px !important; }}
-</style>
+
+    # st.markdown strips <script> tags, so we use components.html (0-height iframe)
+    # which executes JS and can reach window.parent.document to inject/update a
+    # persistent <div id="__tb"> on the parent page body — never removed by Streamlit.
+    _stc.html(f"""
 <script>
 (function() {{
-    var html = {_json.dumps(_inner_html)};
-    var el = document.getElementById('__tb');
-    if (!el) {{
-        el = document.createElement('div');
-        el.id = '__tb';
-        document.body.appendChild(el);
-    }}
-    el.innerHTML = html;
+  var p = window.parent.document;
+  // Inject keyframe + banner styles once
+  if (!p.getElementById('__tb_style')) {{
+    var s = p.createElement('style');
+    s.id = '__tb_style';
+    s.textContent = [
+      '@keyframes _tbsc{{0%{{transform:translateX(0)}}100%{{transform:translateX(-50%)}}}}',
+      '#__tb{{position:fixed;bottom:0;left:0;right:0;height:34px;background:#060d18;',
+      'border-top:1px solid #1e3a5f;overflow:hidden;z-index:9999;display:flex;',
+      'align-items:center;gap:0;font-family:\\'SF Mono\\',\\'Fira Code\\',monospace}}',
+      '#__tb .tb-idx{{font-size:13px;padding:0 8px;color:#e2e8f0;font-weight:600}}',
+      '#__tb .tb-stk{{font-size:12px;padding:0 7px;color:#94a3b8}}',
+      '#__tb .tb-fx {{font-size:12px;padding:0 7px;color:#fbbf24}}',
+      '#__tb .tb-cx {{font-size:12px;padding:0 7px;color:#fb923c}}',
+      '#__tb .tb-pcr{{font-size:12px;padding:0 7px;color:#a78bfa}}',
+      'section.main .block-container{{padding-bottom:44px!important}}'
+    ].join('');
+    p.head.appendChild(s);
+  }}
+  // Create banner element once, update innerHTML on every tick
+  var el = p.getElementById('__tb');
+  if (!el) {{
+    el = p.createElement('div');
+    el.id = '__tb';
+    p.body.appendChild(el);
+  }}
+  el.innerHTML = {_json.dumps(_inner_html)};
 }})();
 </script>
-""", unsafe_allow_html=True)
+""", height=0, scrolling=False)
 
 
 _ticker_banner()
