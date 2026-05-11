@@ -1169,6 +1169,270 @@ if require_all_positive:
 
 
 # ============================================================
+# MARKET PULSE HEADER — always-visible strip above all tabs
+# Groups:  1. Live market (NIFTY 50, NIFTY BANK, VIX)
+#          2. Macro     (USD/INR, Crude WTI, Nifty PCR)
+#          3. AI Intel  (last run bias, sector leaders, FII)
+# ============================================================
+import time as _time_mod   # needed for TTL calculations here and in fragment
+
+@st.fragment(run_every=2)
+def _market_pulse_header():
+    """
+    Compact always-visible metric row above the three main tabs.
+    Runs every 2 s to keep the live index metrics fresh.
+    Heavy fetches (VIX, BANK NIFTY open, AI intel) are cached in session
+    state and only re-fetched when the TTL expires or ⟳ is pressed.
+    """
+    import requests as _rqm
+
+    _HDRS = {"User-Agent": "Mozilla/5.0 (compatible; screener-app/1.0)"}
+    _now_ts  = _time_mod.time()
+    _kc_mph  = st.session_state.get("kite_client")
+    _kite_ok = _kc_mph is not None and getattr(_kc_mph, "authenticated", False)
+    _force   = st.session_state.pop("_mph_force_refresh", False)
+
+    # ── Fetch India VIX (60 s TTL) ───────────────────────────────────────
+    if _force or (_now_ts - st.session_state.get("_vix_ts", 0) > 60):
+        try:
+            _yf_vix = _rqm.get(
+                "https://query1.finance.yahoo.com/v8/finance/chart/%5EINDIAVIX"
+                "?interval=1d&range=1d",
+                headers=_HDRS, timeout=4,
+            )
+            _vix_meta = (_yf_vix.json().get("chart", {}).get("result") or [{}])[0].get("meta", {})
+            _vix_v    = _vix_meta.get("regularMarketPrice")
+            if _vix_v:
+                st.session_state["_vix_ltp"] = float(_vix_v)
+                st.session_state["_vix_ts"]  = _now_ts
+        except Exception:
+            pass
+
+    # ── Fetch NIFTY BANK open price for % change (once per day) ─────────
+    _today_str_mph = datetime.now(_IST).strftime("%Y-%m-%d")
+    if (_force or st.session_state.get("_nbank_open_date") != _today_str_mph) and _kite_ok:
+        try:
+            _nb_ohlc = _kc_mph.kite.ohlc(["NSE:NIFTY BANK"])
+            _nb_open = (_nb_ohlc.get("NSE:NIFTY BANK") or {}).get("ohlc", {}).get("open")
+            if _nb_open:
+                st.session_state["_nifty_bank_open"] = float(_nb_open)
+                st.session_state["_nbank_open_date"] = _today_str_mph
+        except Exception:
+            pass
+
+    # ── Reload AI Intel from DB (5-min TTL) ─────────────────────────────
+    if _force or (_now_ts - st.session_state.get("_mph_intel_ts", 0) > 300):
+        try:
+            _uid_mph = st.session_state.get("kite_user_id", "")
+            _intel_row = db.get_latest_market_intel(_uid_mph)
+            st.session_state["_mph_intel"] = _intel_row
+            st.session_state["_mph_intel_ts"] = _now_ts
+            # Also load sector stats from last intel stocks
+            if _intel_row:
+                _istocks = db.get_market_intel_stocks(_uid_mph)
+                _sector_tally: dict = {}
+                for _is in _istocks:
+                    _sec = (_is.get("sector") or "Other").strip()
+                    _st  = _is.get("stance", "")
+                    if _sec not in _sector_tally:
+                        _sector_tally[_sec] = {"bull": 0, "bear": 0}
+                    if _st in ("BUY", "BUY_ON_COND"):
+                        _sector_tally[_sec]["bull"] += 1
+                    elif _st == "SHORT":
+                        _sector_tally[_sec]["bear"] += 1
+                st.session_state["_mph_sectors"] = _sector_tally
+        except Exception:
+            pass
+
+    # If force-refresh, also bust FX/commodity cache so banner picks up fresh data
+    if _force:
+        for _k in ("_usdinr_ltp", "_crude_usd", "_crude_ltp", "_nifty_pcr"):
+            st.session_state.pop(_k, None)
+
+    # ── Read all values from session state ───────────────────────────────
+    _nifty_ltp  = st.session_state.get("_nifty_live_ltp")
+    _nifty_pct  = st.session_state.get("_nifty_intraday_pct")
+    _nbank_ltp  = _kc_module.get_ticker_ltp("NIFTY BANK") or st.session_state.get("_live_ltp", {}).get("NIFTY BANK")
+    _nbank_open = st.session_state.get("_nifty_bank_open")
+    _nbank_pct  = ((_nbank_ltp - _nbank_open) / _nbank_open * 100) if (_nbank_ltp and _nbank_open) else None
+    _vix        = st.session_state.get("_vix_ltp")
+    _usd_inr    = st.session_state.get("_usdinr_ltp")
+    _crude_usd  = st.session_state.get("_crude_usd")
+    _pcr        = st.session_state.get("_nifty_pcr")
+    _intel      = st.session_state.get("_mph_intel", {})
+    _sectors    = st.session_state.get("_mph_sectors", {})
+
+    # ── VIX label ─────────────────────────────────────────────────────────
+    def _vix_label(v):
+        if v is None: return "—", "#64748b"
+        if v < 12:    return "Very Low",  "#22c55e"
+        if v < 15:    return "Low",       "#22c55e"
+        if v < 20:    return "Normal",    "#f59e0b"
+        if v < 25:    return "Elevated",  "#fb923c"
+        return "High", "#ef4444"
+
+    def _pct_color(p):
+        if p is None: return "#64748b"
+        return "#22c55e" if p >= 0 else "#ef4444"
+
+    def _pct_str(p):
+        if p is None: return "—"
+        return f"{'▲' if p >= 0 else '▼'}{abs(p):.2f}%"
+
+    _vix_lbl, _vix_col  = _vix_label(_vix)
+    _nifty_col  = _pct_color(_nifty_pct)
+    _nbank_col  = _pct_color(_nbank_pct)
+
+    # ── PCR label ─────────────────────────────────────────────────────────
+    def _pcr_label(p):
+        if p is None: return "—", "#64748b"
+        if p > 1.2:   return "Bullish", "#22c55e"
+        if p > 0.8:   return "Neutral", "#f59e0b"
+        return "Bearish", "#ef4444"
+
+    _pcr_lbl, _pcr_col = _pcr_label(_pcr)
+
+    # ── AI Bias card ──────────────────────────────────────────────────────
+    _bias     = _intel.get("bias", "") if _intel else ""
+    _conf     = _intel.get("confidence", "") if _intel else ""
+    _intel_ts = _intel.get("created_at") if _intel else None
+    _intel_age_str = ""
+    if _intel_ts:
+        try:
+            _ia = _intel_ts if hasattr(_intel_ts, "strftime") else datetime.fromisoformat(str(_intel_ts))
+            _ia_ist = _ia.replace(tzinfo=None)
+            _diff_h = (datetime.now() - _ia_ist).total_seconds() / 3600
+            _intel_age_str = f"Today {_ia_ist.strftime('%H:%M')}" if _diff_h < 24 else f"{int(_diff_h//24)}d ago"
+        except Exception:
+            pass
+
+    _bias_color = {"BULLISH": "#22c55e", "BEARISH": "#ef4444", "NEUTRAL": "#f59e0b"}.get(
+        (_bias or "").upper().split()[0], "#64748b"
+    )
+    _conf_color = {"HIGH": "#22c55e", "MEDIUM": "#f59e0b", "LOW": "#ef4444"}.get(
+        (_conf or "").upper(), "#64748b"
+    )
+
+    # ── Sector leaders (top 3 — ranked by bull count) ────────────────────
+    _sector_html = ""
+    if _sectors:
+        _ranked = sorted(_sectors.items(), key=lambda x: x[1]["bull"] - x[1]["bear"], reverse=True)
+        _parts  = []
+        for _sn, _sc in _ranked[:4]:
+            _net = _sc["bull"] - _sc["bear"]
+            _sc_col = "#22c55e" if _net > 0 else ("#ef4444" if _net < 0 else "#94a3b8")
+            _icon   = "▲" if _net > 0 else ("▼" if _net < 0 else "—")
+            _parts.append(
+                f'<span style="color:{_sc_col};font-size:10px">'
+                f'{_icon}&nbsp;{_sn[:6]}</span>'
+            )
+        _sector_html = "&nbsp;&nbsp;".join(_parts)
+
+    # ── Build metric card HTML helper ─────────────────────────────────────
+    def _card(label: str, val: str, sub: str = "", sub_col: str = "#94a3b8",
+              val_col: str = "#e2e8f0", badge: str = "", badge_col: str = "#64748b") -> str:
+        _badge_html = (
+            f'&nbsp;<span style="font-size:9px;padding:1px 5px;border-radius:3px;'
+            f'background:{badge_col}22;color:{badge_col};font-weight:600">{badge}</span>'
+            if badge else ""
+        )
+        _sub_html = (
+            f'<div style="font-size:10px;color:{sub_col};margin-top:1px">{sub}</div>'
+            if sub else ""
+        )
+        return f"""
+        <div style="display:flex;flex-direction:column;padding:4px 14px;
+                    border-left:1px solid #1e293b;min-width:70px;flex-shrink:0">
+            <div style="font-size:9px;color:#475569;text-transform:uppercase;
+                        letter-spacing:0.07em;margin-bottom:2px">{label}</div>
+            <div style="font-size:13px;font-weight:600;font-family:'SF Mono','Fira Code',monospace;
+                        color:{val_col};white-space:nowrap">{val}{_badge_html}</div>
+            {_sub_html}
+        </div>"""
+
+    def _divider() -> str:
+        return '<div style="width:1px;background:#1e293b;margin:2px 4px;align-self:stretch"></div>'
+
+    def _group_label(txt: str) -> str:
+        return (
+            f'<div style="font-size:9px;color:#334155;text-transform:uppercase;'
+            f'letter-spacing:0.09em;padding:0 10px 0 4px;writing-mode:vertical-lr;'
+            f'transform:rotate(180deg);align-self:center;flex-shrink:0">{txt}</div>'
+        )
+
+    # ── Assemble row ──────────────────────────────────────────────────────
+    _nifty_val = f"{_nifty_ltp:,.0f}" if _nifty_ltp else "—"
+    _nbank_val = f"{_nbank_ltp:,.0f}" if _nbank_ltp else "—"
+
+    _cards_g1  = (
+        _group_label("MARKET")
+        + _card("NIFTY 50",   _nifty_val, _pct_str(_nifty_pct), _nifty_col, "#e2e8f0")
+        + _card("NIFTY BANK", _nbank_val, _pct_str(_nbank_pct), _nbank_col, "#e2e8f0")
+        + _card("INDIA VIX",  f"{_vix:.1f}" if _vix else "—",
+                badge=_vix_lbl, badge_col=_vix_col)
+    )
+    _cards_g2 = (
+        _group_label("MACRO")
+        + _card("USD / INR", f"₹{_usd_inr:.2f}" if _usd_inr else "—",
+                val_col="#f59e0b")
+        + _card("CRUDE WTI", f"${_crude_usd:.2f}" if _crude_usd else "—",
+                val_col="#fb923c")
+        + _card("NIFTY PCR", f"{_pcr:.2f}" if _pcr else "—",
+                badge=_pcr_lbl, badge_col=_pcr_col)
+    )
+    _cards_g3 = (
+        _group_label("AI INTEL")
+        + _card("BIAS", _bias or "—",
+                sub=f"Confidence: {_conf}" if _conf else "",
+                sub_col=_conf_color,
+                val_col=_bias_color)
+        + (
+            f'<div style="display:flex;flex-direction:column;padding:4px 14px;'
+            f'border-left:1px solid #1e293b;min-width:120px;flex-shrink:0">'
+            f'<div style="font-size:9px;color:#475569;text-transform:uppercase;'
+            f'letter-spacing:0.07em;margin-bottom:4px">SECTOR LEADERS</div>'
+            f'<div style="display:flex;gap:6px;flex-wrap:wrap">{_sector_html or "<span style=\\'color:#334155;font-size:10px\\'>Run Market Intel →</span>"}</div>'
+            f'</div>'
+            if _sectors or not _bias else ""
+        )
+        + (
+            f'<div style="padding:4px 10px;align-self:center;flex-shrink:0">'
+            f'<span style="font-size:9px;color:#334155">⏱ {_intel_age_str}</span></div>'
+            if _intel_age_str else ""
+        )
+    )
+
+    _row_html = f"""
+<div style="background:#080e1c;border:1px solid #1a2744;border-radius:8px;
+            padding:6px 4px;display:flex;align-items:stretch;gap:0;
+            overflow-x:auto;margin-bottom:6px;scrollbar-width:none">
+    {_cards_g1}
+    {_divider()}
+    {_cards_g2}
+    {_divider()}
+    {_cards_g3}
+</div>
+<style>
+/* hide horizontal scrollbar on market pulse row */
+div[data-testid="stMarkdownContainer"] div[style*="080e1c"]::-webkit-scrollbar {{
+    display: none;
+}}
+</style>"""
+
+    # ── Layout: metrics row + refresh button ──────────────────────────────
+    _mc, _bc = st.columns([22, 1])
+    with _mc:
+        st.markdown(_row_html, unsafe_allow_html=True)
+    with _bc:
+        if st.button("⟳", key="_mph_refresh_btn",
+                     help="Refresh VIX, BANK NIFTY open, USD/INR, Crude Oil, and AI Intel now"):
+            st.session_state["_mph_force_refresh"] = True
+            st.rerun(scope="fragment")
+
+
+_market_pulse_header()
+
+# ============================================================
 # TAB LAYOUT — Screener | Trade Signals | Activity Log
 # ============================================================
 tab_screener, tab_signals, tab_activity = st.tabs([
