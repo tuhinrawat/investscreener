@@ -4735,12 +4735,6 @@ def _intraday_long_live():
     if base_df.empty:
         return
 
-    # ── Skip re-render if LTP hasn't changed since we last built the table ───
-    _cur_ltp_ts = st.session_state.get("_live_ltp_ts")
-    if _cur_ltp_ts is not None and _cur_ltp_ts == st.session_state.get("_long_last_ltp_ts"):
-        return  # prices unchanged — no point rebuilding the full table
-    st.session_state["_long_last_ltp_ts"] = _cur_ltp_ts
-
     df_l = base_df.copy()
     for _sym, _price in st.session_state.get("_live_ltp", {}).items():
         df_l.loc[df_l["tradingsymbol"] == _sym, "ltp"] = _price
@@ -5243,12 +5237,6 @@ def _intraday_short_live():
     base_df = st.session_state.get("_signals_base_df", pd.DataFrame())
     if base_df.empty:
         return
-
-    # ── Skip re-render if LTP hasn't changed since we last built the table ───
-    _cur_ltp_ts_s = st.session_state.get("_live_ltp_ts")
-    if _cur_ltp_ts_s is not None and _cur_ltp_ts_s == st.session_state.get("_short_last_ltp_ts"):
-        return
-    st.session_state["_short_last_ltp_ts"] = _cur_ltp_ts_s
 
     df_s = base_df.copy()
     for _sym, _price in st.session_state.get("_live_ltp", {}).items():
