@@ -8134,25 +8134,49 @@ def _ticker_banner():
     _mkt_open = _is_market_open()
 
     if not _prices:
-        # No prices at all — ticker started but zero ticks received yet.
+        # No WebSocket ticks yet — try fetching last-close prices from Kite REST API
+        # so the banner always shows something useful (works after hours too).
         _kc_chk  = st.session_state.get("kite_client")
         _kite_ok = _kc_chk is not None and getattr(_kc_chk, "authenticated", False)
-        if _kite_ok and not _mkt_open:
-            _banner_msg = "⏸&nbsp;Market closed — last prices will appear here once market opens (9:15 AM IST)"
-        elif _kite_ok:
-            _banner_msg = "⏳&nbsp;Ticker initialising — prices will stream here shortly"
-        else:
-            _banner_msg = "⏳&nbsp;Connect Kite to see live prices"
-        st.markdown(
-            f"<div style='position:fixed;bottom:0;left:0;right:0;height:26px;"
-            "background:#060d18;border-top:1px solid #1e3a5f;z-index:9999;"
-            "display:flex;align-items:center;padding:0 12px'>"
-            f"<span style='color:#475569;font-size:10px;font-family:monospace'>"
-            f"{_banner_msg}</span></div>"
-            "<style>section.main .block-container{padding-bottom:36px!important}</style>",
-            unsafe_allow_html=True,
-        )
-        return
+        if _kite_ok:
+            _cached = st.session_state.get("_banner_rest_ltp", {})
+            _cache_age = _time_mod.time() - st.session_state.get("_banner_rest_ts", 0)
+            if not _cached or _cache_age > 120:
+                try:
+                    # Fetch index + subscribed signal stocks from Kite ltp()
+                    _tok_map  = {config.NIFTY_50_TOKEN: "NIFTY 50",
+                                 config.NIFTY_BANK_TOKEN: "NIFTY BANK"}
+                    _sbase = st.session_state.get("_signals_base_df")
+                    if _sbase is not None and not _sbase.empty and "instrument_token" in _sbase.columns:
+                        for _tr in _sbase[["instrument_token", "tradingsymbol"]].dropna().itertuples(index=False):
+                            _tok_map[int(_tr.instrument_token)] = str(_tr.tradingsymbol)
+                    _ltp_r = _kc_chk.kite.ltp(list(_tok_map.keys()))
+                    _fetched = {}
+                    for _tok, _sym in _tok_map.items():
+                        _v = (_ltp_r.get(_tok) or _ltp_r.get(f"NSE:{_sym}") or {}).get("last_price")
+                        if _v:
+                            _fetched[_sym] = float(_v)
+                    if _fetched:
+                        st.session_state["_banner_rest_ltp"] = _fetched
+                        st.session_state["_banner_rest_ts"]  = _time_mod.time()
+                        _prices = _fetched
+                except Exception:
+                    pass
+
+        if not _prices:
+            _banner_msg = ("⏸&nbsp;Market closed — connect Kite to see last prices"
+                           if not _kite_ok else
+                           "⏳&nbsp;Fetching last prices…")
+            st.markdown(
+                f"<div style='position:fixed;bottom:0;left:0;right:0;height:26px;"
+                "background:#060d18;border-top:1px solid #1e3a5f;z-index:9999;"
+                "display:flex;align-items:center;padding:0 12px'>"
+                f"<span style='color:#475569;font-size:10px;font-family:monospace'>"
+                f"{_banner_msg}</span></div>"
+                "<style>section.main .block-container{padding-bottom:36px!important}</style>",
+                unsafe_allow_html=True,
+            )
+            return
 
     _prev = st.session_state.get("_prev_ltp", {})
     # _mkt_open already computed above (before the early-return block)
