@@ -1403,8 +1403,15 @@ def _market_pulse_header():
     # ── Sparkline SVG helper ───────────────────────────────────────────────
     _spark_data: dict = st.session_state.get("_spark_data", {})
 
-    def _sparkline(values: list, color: str = "#22c55e", uid: str = "s") -> str:
-        """Return a tiny inline SVG trend line (80×26 px)."""
+    def _sparkline(values: list, color: str = "#22c55e", uid: str = "s",
+                   invert: bool = False) -> str:
+        """Return a tiny inline SVG trend line (80×26 px).
+
+        invert=True  → rising = red (bad), falling = green (good).
+                       Used for USD/INR, crude, VIX (up hurts India).
+        invert=False → rising = color (good), falling = red.
+                       Used for indices (Nifty 50, Nifty Bank).
+        """
         if not values or len(values) < 2:
             return ""
         W, H, PAD = 80, 26, 2
@@ -1418,7 +1425,11 @@ def _market_pulse_header():
         area  = (f"M{pts[0][0]},{H} "
                  + " ".join(f"L{x},{y}" for x, y in pts)
                  + f" L{pts[-1][0]},{H} Z")
-        c     = color if values[-1] >= values[0] else "#ef4444"
+        _up   = values[-1] >= values[0]
+        if invert:
+            c = "#ef4444" if _up else "#22c55e"
+        else:
+            c = color if _up else "#ef4444"
         gid   = f"sg{uid}"
         return (
             f'<svg width="{W}" height="{H}" viewBox="0 0 {W} {H}" '
@@ -1452,13 +1463,23 @@ def _market_pulse_header():
         return f'<div style="font-size:9px;color:#334155;text-transform:uppercase;letter-spacing:0.09em;padding:0 10px 0 4px;writing-mode:vertical-lr;transform:rotate(180deg);align-self:center;flex-shrink:0">{txt}</div>'
 
     # ── Sparklines (pre-generated so card calls are clean) ────────────────
+    # Indices: up = good (green), down = red  →  invert=False (default)
     _sp_n50    = _sparkline(_spark_data.get("n50",    []), "#60a5fa", "n50")
     _sp_nbank  = _sparkline(_spark_data.get("nbank",  []), "#818cf8", "nbank")
-    _sp_vix    = _sparkline(_spark_data.get("vix",    []), "#f59e0b", "vix")
-    _sp_usdinr = _sparkline(_spark_data.get("usdinr", []), "#f59e0b", "usdinr")
-    _sp_wti    = _sparkline(_spark_data.get("wti",    []), "#fb923c", "wti")
-    _sp_brent  = _sparkline(_spark_data.get("brent",  []), "#f97316", "brent")
-    _sp_natgas = _sparkline(_spark_data.get("natgas", []), "#a78bfa", "natgas")
+    # VIX: rising = fear / bad for market → invert=True.
+    # Extra check: current VIX in extreme zone (< 11 complacency, > 25 panic) → always red.
+    _vix_vals  = _spark_data.get("vix", [])
+    _vix_last  = _vix_vals[-1] if _vix_vals else None
+    _vix_extreme = _vix_last is not None and (_vix_last < 11 or _vix_last > 25)
+    if _vix_extreme and _vix_vals:
+        _sp_vix = _sparkline(_vix_vals, "#ef4444", "vix", invert=False)  # force red line
+    else:
+        _sp_vix = _sparkline(_vix_vals, "#f59e0b", "vix", invert=True)
+    # Macro: up = bad for India (INR weakens, oil costs more) → invert=True
+    _sp_usdinr = _sparkline(_spark_data.get("usdinr", []), "#f59e0b", "usdinr", invert=True)
+    _sp_wti    = _sparkline(_spark_data.get("wti",    []), "#fb923c", "wti",    invert=True)
+    _sp_brent  = _sparkline(_spark_data.get("brent",  []), "#f97316", "brent",  invert=True)
+    _sp_natgas = _sparkline(_spark_data.get("natgas", []), "#a78bfa", "natgas", invert=True)
 
     # ── Assemble row ──────────────────────────────────────────────────────
     _nifty_val = f"{_nifty_ltp:,.0f}" if _nifty_ltp else "—"
@@ -1487,22 +1508,31 @@ def _market_pulse_header():
                 sub_col=_conf_color,
                 val_col=_bias_color)
         + (
-            '<div style="display:flex;flex-direction:column;padding:4px 14px;border-left:1px solid #1e293b;min-width:120px;flex-shrink:0">'
-            '<div style="font-size:9px;color:#475569;text-transform:uppercase;letter-spacing:0.07em;margin-bottom:4px">SECTOR LEADERS</div>'
-            f'<div style="display:flex;gap:6px;flex-wrap:wrap">{_sector_html or "<span style=\'color:#475569;font-size:10px\'>Run Market Intel</span>"}</div>'
-            '</div>'
-            if _sectors or not _bias else ""
-        )
-        + (
             f'<div style="padding:4px 10px;align-self:center;flex-shrink:0"><span style="font-size:9px;color:#334155">⏱ {_intel_age_str}</span></div>'
             if _intel_age_str else ""
         )
     )
 
+    # ── Sector leaders — slim single-line row below metrics ───────────────
+    if _sector_html:
+        _sector_row_html = (
+            '<div style="background:#080e1c;border:1px solid #1a2744;border-radius:6px;'
+            'padding:3px 10px;display:flex;align-items:center;gap:10px;margin-bottom:4px;'
+            'overflow-x:auto;scrollbar-width:none">'
+            '<span style="font-size:9px;color:#334155;text-transform:uppercase;'
+            'letter-spacing:0.09em;white-space:nowrap;flex-shrink:0">SECTOR LEADERS</span>'
+            '<span style="color:#1e293b;flex-shrink:0">│</span>'
+            + _sector_html
+            + '</div>'
+        )
+    else:
+        _sector_row_html = ""
+
     _row_html = (
-        '<div style="background:#080e1c;border:1px solid #1a2744;border-radius:8px;padding:6px 4px;display:flex;align-items:stretch;gap:0;overflow-x:auto;margin-bottom:6px;scrollbar-width:none">'
+        '<div style="background:#080e1c;border:1px solid #1a2744;border-radius:8px;padding:6px 4px;display:flex;align-items:stretch;gap:0;overflow-x:auto;margin-bottom:4px;scrollbar-width:none">'
         + _cards_g1 + _divider() + _cards_g2 + _divider() + _cards_g3
         + '</div>'
+        + _sector_row_html
         + '<style>div[data-testid="stMarkdownContainer"] div[style*="080e1c"]::-webkit-scrollbar{display:none}</style>'
     )
 
