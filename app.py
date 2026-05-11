@@ -211,38 +211,20 @@ def _load_kite_from_user(user: dict) -> None:
 
 
 # ── Step 1: try auto-login from localStorage session token ────────────
-# ls_get returns:
-#   None  — first render (JS component hasn't responded yet)
-#   ""    — localStorage was checked: no token stored / expired
-#   str   — a valid session token to look up
+# _ls_get returns None on the very first render (JS hasn't fired yet),
+# "" when localStorage is empty, or the stored token string.
+# We always render the component so its JS can fire on the next cycle.
 _ls_session_token = _ls_get("screener_session")
 
-if "app_user" not in st.session_state:
-    if _ls_session_token is None:
-        # JS hasn't fired yet.  Show a minimal loading screen and call
-        # st.stop() — this halts the current render without discarding
-        # any pending widget state (unlike st.rerun()).  The localStorage
-        # component will trigger a new render automatically when its JS
-        # sends back the stored value.
-        st.markdown(
-            "<div style='display:flex;align-items:center;justify-content:center;"
-            "height:80vh;flex-direction:column;gap:16px'>"
-            "<div style='color:#64748b;font-size:1rem'>Restoring your session…</div>"
-            "</div>",
-            unsafe_allow_html=True,
-        )
-        st.stop()
-    elif _ls_session_token:
-        # Token returned — validate against DB
-        _restored_user = db.get_user_by_session(_ls_session_token)
-        if _restored_user:
-            st.session_state["app_user"]       = _restored_user
-            st.session_state["_session_token"] = _ls_session_token
-            _load_kite_from_user(_restored_user)
-        else:
-            # Stale / revoked token — clear it so login page shows cleanly
-            _ls_del("screener_session")
-    # _ls_session_token == "" → no session stored → fall through to login page
+if "app_user" not in st.session_state and _ls_session_token:
+    _restored_user = db.get_user_by_session(_ls_session_token)
+    if _restored_user:
+        st.session_state["app_user"]       = _restored_user
+        st.session_state["_session_token"] = _ls_session_token
+        _load_kite_from_user(_restored_user)
+    else:
+        # Token stale/revoked — clear so login page shows cleanly
+        _ls_del("screener_session")
 def _show_auth_page() -> None:
     """Full-screen login / signup. Calls st.stop() so the main app doesn't render."""
     st.markdown(
