@@ -1280,17 +1280,67 @@ def _market_pulse_header():
         except Exception:
             pass
 
-    # ── Fetch 1-year sparkline data (24-hour TTL, fire once per session day) ──
+    # ── Fetch global index live prices (5-min TTL, Yahoo Finance) ────────
+    # Covers US, Europe, Asia. Uses regularMarketPrice + chartPreviousClose
+    # so % change is correct even when the foreign market is currently closed.
+    _GLOBAL_META: dict = {
+        # label         yf_symbol     region   flag
+        "S&P 500":  ("^GSPC",    "US",     "🇺🇸"),
+        "NASDAQ":   ("^IXIC",    "US",     "🇺🇸"),
+        "DOW":      ("^DJI",     "US",     "🇺🇸"),
+        "FTSE":     ("^FTSE",    "EU",     "🇬🇧"),
+        "DAX":      ("^GDAXI",   "EU",     "🇩🇪"),
+        "CAC 40":   ("^FCHI",    "EU",     "🇫🇷"),
+        "NIKKEI":   ("^N225",    "ASIA",   "🇯🇵"),
+        "HANG SENG":("^HSI",     "ASIA",   "🇭🇰"),
+        "SHANGHAI": ("000001.SS","ASIA",   "🇨🇳"),
+        "KOSPI":    ("^KS11",    "ASIA",   "🇰🇷"),
+        "ASX 200":  ("^AXJO",    "ASIA",   "🇦🇺"),
+        "SGX":      ("^STI",     "ASIA",   "🇸🇬"),
+    }
+    if _force or (_now_ts - st.session_state.get("_global_idx_ts", 0) > 300):
+        _g_data: dict = {}
+        for _gname, (_gsym, _greg, _gflag) in _GLOBAL_META.items():
+            try:
+                _gr = _rqm.get(
+                    f"https://query1.finance.yahoo.com/v8/finance/chart/{_gsym}"
+                    "?interval=1d&range=1d",
+                    headers=_HDRS, timeout=5,
+                )
+                _gm = (_gr.json().get("chart", {}).get("result") or [{}])[0].get("meta", {})
+                _gltp  = _gm.get("regularMarketPrice")
+                _gprev = _gm.get("chartPreviousClose") or _gm.get("previousClose")
+                if _gltp and _gprev and _gprev > 0:
+                    _gpct = (_gltp - _gprev) / _gprev * 100
+                    _g_data[_gname] = {
+                        "ltp": float(_gltp), "pct": round(float(_gpct), 2),
+                        "region": _greg, "flag": _gflag,
+                        "mkt_state": _gm.get("marketState", "CLOSED"),
+                    }
+            except Exception:
+                pass
+        if _g_data:
+            st.session_state["_global_idx"]    = _g_data
+            st.session_state["_global_idx_ts"] = _now_ts
+
+    # ── Fetch 1-year sparkline data (24-hour TTL, includes global indices) ─
     _SPARK_TTL = 86400
     if _force or (_now_ts - st.session_state.get("_spark_ts", 0) > _SPARK_TTL):
         _SPARK_SYMS = {
-            "n50":    "^NSEI",
-            "nbank":  "^NSEBANK",
+            # India
+            "n50":    "%5ENSEI",    "nbank":  "%5ENSEBANK",
             "vix":    "%5EINDIAVIX",
-            "usdinr": "USDINR%3DX",
-            "wti":    "CL%3DF",
-            "brent":  "BZ%3DF",
-            "natgas": "NG%3DF",
+            # FX / commodities
+            "usdinr": "USDINR%3DX", "wti":    "CL%3DF",
+            "brent":  "BZ%3DF",     "natgas": "NG%3DF",
+            # US
+            "sp500":  "%5EGSPC",    "nasdaq": "%5EIXIC",    "dow": "%5EDJI",
+            # Europe
+            "ftse":   "%5EFTSE",    "dax":    "%5EGDAXI",   "cac": "%5EFCHI",
+            # Asia
+            "nikkei": "%5EN225",    "hsi":    "%5EHSI",
+            "sse":    "000001.SS",  "kospi":  "%5EKS11",
+            "asx":    "%5EAXJO",
         }
         _new_spark: dict = {}
         for _sk, _sym in _SPARK_SYMS.items():
@@ -1335,10 +1385,11 @@ def _market_pulse_header():
         except Exception:
             pass
 
-    # If force-refresh, also bust FX/commodity + sparkline + sector cache
+    # If force-refresh, bust FX/commodity + sparkline + sector + global cache
     if _force:
         for _k in ("_usdinr_ltp", "_crude_usd", "_crude_ltp", "_brent_usd", "_natgas_usd", "_nifty_pcr",
-                   "_spark_data", "_spark_ts", "_sect_perf", "_sect_ts"):
+                   "_spark_data", "_spark_ts", "_sect_perf", "_sect_ts",
+                   "_global_idx", "_global_idx_ts"):
             st.session_state.pop(_k, None)
 
     # ── Read all values from session state ───────────────────────────────
@@ -1507,7 +1558,7 @@ def _market_pulse_header():
     _vix_last  = _vix_vals[-1] if _vix_vals else None
     _vix_extreme = _vix_last is not None and (_vix_last < 11 or _vix_last > 25)
     if _vix_extreme and _vix_vals:
-        _sp_vix = _sparkline(_vix_vals, "#ef4444", "vix", invert=False)  # force red line
+        _sp_vix = _sparkline(_vix_vals, "#ef4444", "vix", invert=False)
     else:
         _sp_vix = _sparkline(_vix_vals, "#f59e0b", "vix", invert=True)
     # Macro: up = bad for India (INR weakens, oil costs more) → invert=True
@@ -1515,6 +1566,18 @@ def _market_pulse_header():
     _sp_wti    = _sparkline(_spark_data.get("wti",    []), "#fb923c", "wti",    invert=True)
     _sp_brent  = _sparkline(_spark_data.get("brent",  []), "#f97316", "brent",  invert=True)
     _sp_natgas = _sparkline(_spark_data.get("natgas", []), "#a78bfa", "natgas", invert=True)
+    # Global indices sparklines (up = good)
+    _sp_sp500  = _sparkline(_spark_data.get("sp500",  []), "#34d399", "sp500")
+    _sp_nasdaq = _sparkline(_spark_data.get("nasdaq", []), "#22d3ee", "nasdaq")
+    _sp_dow    = _sparkline(_spark_data.get("dow",    []), "#a3e635", "dow")
+    _sp_ftse   = _sparkline(_spark_data.get("ftse",   []), "#fb7185", "ftse")
+    _sp_dax    = _sparkline(_spark_data.get("dax",    []), "#fbbf24", "dax")
+    _sp_cac    = _sparkline(_spark_data.get("cac",    []), "#c084fc", "cac")
+    _sp_nikkei = _sparkline(_spark_data.get("nikkei", []), "#f472b6", "nikkei")
+    _sp_hsi    = _sparkline(_spark_data.get("hsi",    []), "#f97316", "hsi")
+    _sp_sse    = _sparkline(_spark_data.get("sse",    []), "#ef4444", "sse")
+    _sp_kospi  = _sparkline(_spark_data.get("kospi",  []), "#38bdf8", "kospi")
+    _sp_asx    = _sparkline(_spark_data.get("asx",    []), "#4ade80", "asx")
 
     # ── Assemble row ──────────────────────────────────────────────────────
     _nifty_val = f"{_nifty_ltp:,.0f}" if _nifty_ltp else "—"
@@ -1649,10 +1712,69 @@ def _market_pulse_header():
     else:
         _sect_live_html = ""
 
+    # ── Global indices card group ──────────────────────────────────────────
+    _gidx: dict = st.session_state.get("_global_idx", {})
+
+    def _gcard(label: str, spark_svg: str) -> str:
+        """Slim global index card: flag+name, value, pct change, sparkline."""
+        _gd = _gidx.get(label, {})
+        _gl  = _gd.get("ltp")
+        _gp  = _gd.get("pct")
+        _gfl = _gd.get("flag", "")
+        _gmk = _gd.get("mkt_state", "CLOSED")
+        _gcl = "#22c55e" if (_gp or 0) >= 0 else "#ef4444"
+        _gvc = "#e2e8f0" if _gmk == "REGULAR" else "#64748b"
+        _gv  = (f"{_gl:,.0f}" if _gl and _gl >= 1000 else f"{_gl:,.2f}" if _gl else "—")
+        _gs  = (f'{"▲" if (_gp or 0) >= 0 else "▼"}{abs(_gp):.2f}%' if _gp is not None else "—")
+        _closed_badge = ('<span style="font-size:8px;color:#475569">&nbsp;CLOSED</span>'
+                         if _gmk not in ("REGULAR", "PRE", "POST") else "")
+        _spk = (f'<div style="opacity:0.9">{spark_svg}</div>' if spark_svg else "")
+        return (
+            f'<div style="display:flex;flex-direction:column;padding:4px 12px 6px 12px;'
+            f'border-left:1px solid #1e293b;min-width:76px;flex-shrink:0">'
+            f'<div style="font-size:9px;color:#475569;text-transform:uppercase;'
+            f'letter-spacing:0.06em;margin-bottom:2px;white-space:nowrap">'
+            f'{_gfl}&nbsp;{label}{_closed_badge}</div>'
+            f'<div style="font-size:12px;font-weight:600;font-family:\'SF Mono\',monospace;'
+            f'color:{_gvc};white-space:nowrap">{_gv}</div>'
+            f'<div style="font-size:10px;color:{_gcl};font-family:\'SF Mono\',monospace">{_gs}</div>'
+            f'{_spk}</div>'
+        )
+
+    def _region_label(txt: str) -> str:
+        return (f'<div style="font-size:8px;color:#1e3a5f;text-transform:uppercase;'
+                f'letter-spacing:0.08em;padding:0 6px 0 2px;writing-mode:vertical-lr;'
+                f'transform:rotate(180deg);align-self:center;flex-shrink:0">{txt}</div>')
+
+    _cards_us   = (_region_label("US")
+                   + _gcard("S&P 500", _sp_sp500)
+                   + _gcard("NASDAQ",  _sp_nasdaq)
+                   + _gcard("DOW",     _sp_dow))
+    _cards_eu   = (_region_label("EU")
+                   + _gcard("FTSE",   _sp_ftse)
+                   + _gcard("DAX",    _sp_dax)
+                   + _gcard("CAC 40", _sp_cac))
+    _cards_asia = (_region_label("ASIA")
+                   + _gcard("NIKKEI",    _sp_nikkei)
+                   + _gcard("HANG SENG", _sp_hsi)
+                   + _gcard("SHANGHAI",  _sp_sse)
+                   + _gcard("KOSPI",     _sp_kospi)
+                   + _gcard("ASX 200",   _sp_asx))
+
+    _cards_global_row = (
+        '<div style="background:#080e1c;border:1px solid #1a2744;border-radius:8px;'
+        'padding:6px 4px;display:flex;align-items:stretch;gap:0;overflow-x:auto;'
+        'margin-bottom:4px;scrollbar-width:none">'
+        + _group_label("GLOBAL")
+        + _cards_us + _divider() + _cards_eu + _divider() + _cards_asia
+        + '</div>'
+    ) if _gidx else ""
+
     _row_html = (
         '<div style="background:#080e1c;border:1px solid #1a2744;border-radius:8px;padding:6px 4px;display:flex;align-items:stretch;gap:0;overflow-x:auto;margin-bottom:4px;scrollbar-width:none">'
         + _cards_g1 + _divider() + _cards_g2 + _divider() + _cards_g3
         + '</div>'
+        + _cards_global_row
         + _sect_live_html
         + _sector_row_html
         + '<style>div[data-testid="stMarkdownContainer"] div[style*="080e1c"]::-webkit-scrollbar{display:none}</style>'
