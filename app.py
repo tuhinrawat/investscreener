@@ -211,30 +211,39 @@ def _load_kite_from_user(user: dict) -> None:
 
 
 # ── Step 1: try auto-login from localStorage session token ────────────
-# _ls_get returns None on the very first render (JS hasn't fired yet).
-# We call it unconditionally so its component is always rendered and
-# triggers a re-render once the JS sends back the stored value.
+# ls_get returns:
+#   None  — first render (JS component hasn't responded yet)
+#   ""    — localStorage was checked: no token stored (or expired)
+#   str   — a valid session token to look up
 _ls_session_token = _ls_get("screener_session")
 
-if "app_user" not in st.session_state and _ls_session_token:
-    _restored_user = db.get_user_by_session(_ls_session_token)
-    if _restored_user:
-        st.session_state["app_user"]       = _restored_user
-        st.session_state["_session_token"] = _ls_session_token
-        _load_kite_from_user(_restored_user)
-
-
-# ── Step 2: if still not logged in → show Login / Signup page ─────────
-# EXCEPTION: if there's a pending Kite OAuth request_token in session,
-# the user IS logged in — they just returned from Kite's redirect on a
-# fresh page load.  localStorage fires on render-2 and will restore
-# app_user.  Show a spinner instead of the login page so we don't lose
-# the pending token.
-if "app_user" not in st.session_state and st.session_state.get("_pending_rt"):
-    with st.spinner("Completing Kite authentication — restoring your session…"):
-        import time as _time
-        _time.sleep(0.5)   # give localStorage component one render cycle
-    st.rerun()
+if "app_user" not in st.session_state:
+    if _ls_session_token is None:
+        # First render — localStorage JS hasn't fired yet.
+        # Show a brief loading screen and rerun so the component gets a
+        # chance to send back the stored token.  Without this guard the
+        # login page flashes every time the user refreshes the browser.
+        _pending_rt_check = st.session_state.get("_pending_rt")
+        _spinner_msg = (
+            "Completing Kite authentication — restoring your session…"
+            if _pending_rt_check
+            else "Restoring your session…"
+        )
+        with st.spinner(_spinner_msg):
+            import time as _time
+            _time.sleep(0.4)
+        st.rerun()
+    elif _ls_session_token:
+        # Token came back from localStorage — validate it
+        _restored_user = db.get_user_by_session(_ls_session_token)
+        if _restored_user:
+            st.session_state["app_user"]       = _restored_user
+            st.session_state["_session_token"] = _ls_session_token
+            _load_kite_from_user(_restored_user)
+        else:
+            # Token is stale or revoked — wipe it so login page shows cleanly
+            _ls_del("screener_session")
+    # If _ls_session_token == "" → no session in browser → fall through to login
 def _show_auth_page() -> None:
     """Full-screen login / signup. Calls st.stop() so the main app doesn't render."""
     st.markdown(
