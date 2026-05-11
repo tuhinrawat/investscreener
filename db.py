@@ -82,13 +82,43 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
 
 
 def get_conn() -> psycopg2.extensions.connection:
-    """Borrow a connection from the pool. Caller MUST call release_conn() or close()."""
-    return _get_pool().getconn()
+    """
+    Borrow a connection from the pool, validating it is alive first.
+
+    Neon serverless scales its compute to zero after inactivity, which kills
+    existing TCP connections without notifying psycopg2's pool. The next
+    getconn() call hands out a dead socket, and the first cursor.execute()
+    raises OperationalError. We catch that here by pinging with SELECT 1;
+    if the ping fails we rebuild the entire pool and return a fresh conn.
+    """
+    global _pool
+    pool = _get_pool()
+    conn = pool.getconn()
+    try:
+        # Lightweight liveness check
+        _c = conn.cursor()
+        _c.execute("SELECT 1")
+        _c.close()
+        conn.rollback()          # leave connection in clean state
+    except Exception:
+        # Dead connection — tear down pool and start fresh
+        try:
+            pool.closeall()
+        except Exception:
+            pass
+        _pool = None
+        conn = _get_pool().getconn()
+    return conn
 
 
 def release_conn(conn) -> None:
     """Return a connection to the pool (preferred over conn.close())."""
     try:
+        # Roll back any open transaction so the connection is clean for reuse
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         _get_pool().putconn(conn)
     except Exception:
         try:
