@@ -1331,7 +1331,7 @@ def _market_pulse_header():
             pass
         return False
 
-    if _force or (_now_ts - st.session_state.get("_global_idx_ts", 0) > 300):
+    if _force or (_now_ts - st.session_state.get("_global_idx_ts", 0) > 3600):
         import urllib.parse as _ulp
         from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _asc
 
