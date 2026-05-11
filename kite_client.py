@@ -534,11 +534,20 @@ def stop_ticker() -> None:
     _TICKER_RUNNING = False
 
 
+def is_ticker_started() -> bool:
+    """
+    True if the KiteTicker socket has been started (even if market is closed
+    and no ticks have arrived yet).  Use this to avoid re-starting the socket
+    on every page render outside market hours.
+    """
+    return _TICKER_RUNNING and _TICKER_OBJ is not None
+
+
 def is_ticker_alive() -> bool:
     """
-    True if the WebSocket connection is active AND a tick arrived in the last 10 s.
-    The 10-s recency guard catches silent disconnects where the socket flag
-    stays True but the feed has stalled.
+    True if the WebSocket is running AND a tick arrived in the last 10 s.
+    The recency guard catches silent disconnects where the flag stays True but
+    the feed has stalled.  Returns False outside market hours (no ticks expected).
     """
     if not _TICKER_RUNNING:
         return False

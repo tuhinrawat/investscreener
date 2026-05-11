@@ -551,7 +551,7 @@ if "kite_client" not in st.session_state or not st.session_state["kite_client"]:
 # Token map: signal symbols + all Nifty 50 stocks + NIFTY 50 / BANK NIFTY indices.
 _kc_ticker_client = st.session_state.get("kite_client")
 if (_kc_ticker_client and getattr(_kc_ticker_client, "authenticated", False)
-        and not _kc_module.is_ticker_alive()):
+        and not _kc_module.is_ticker_started()):
     _ticker_tok_map: dict = {
         config.NIFTY_50_TOKEN:   "NIFTY 50",
         config.NIFTY_BANK_TOKEN: "NIFTY BANK",
@@ -7191,13 +7191,23 @@ def _ticker_banner():
         _prices = st.session_state.get("_live_ltp", {})
 
     if not _prices:
-        # Not authenticated or no prices yet — show minimal placeholder
+        # Kite may be connected but market is closed (no ticks outside 9:15–15:30).
+        # Show the appropriate message rather than always saying "connect Kite".
+        _kc_chk  = st.session_state.get("kite_client")
+        _kite_ok = _kc_chk is not None and getattr(_kc_chk, "authenticated", False)
+        if _kite_ok:
+            _banner_msg = "⏸&nbsp;Market closed — live ticker starts at 9:15 AM IST"
+            _banner_col = "#475569"
+        else:
+            _banner_msg = "⏳&nbsp;Connect Kite to see live prices"
+            _banner_col = "#475569"
         st.markdown(
-            "<div style='position:fixed;bottom:0;left:0;right:0;height:26px;"
-            "background:#0a0f1a;border-top:1px solid #1e2d40;z-index:9999;"
+            f"<div style='position:fixed;bottom:0;left:0;right:0;height:26px;"
+            "background:#060d18;border-top:1px solid #1e3a5f;z-index:9999;"
             "display:flex;align-items:center;padding:0 12px'>"
-            "<span style='color:#475569;font-size:10px;font-family:monospace'>"
-            "⏳ Ticker initialising — connect Kite to see live prices</span></div>",
+            f"<span style='color:{_banner_col};font-size:10px;font-family:monospace'>"
+            f"{_banner_msg}</span></div>"
+            "<style>section.main .block-container{padding-bottom:36px!important}</style>",
             unsafe_allow_html=True,
         )
         return
