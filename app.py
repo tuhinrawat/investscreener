@@ -8133,41 +8133,46 @@ def _ticker_banner():
         _kc_chk  = st.session_state.get("kite_client")
         _kite_ok = _kc_chk is not None and getattr(_kc_chk, "authenticated", False)
         if _kite_ok:
-            _cached = st.session_state.get("_banner_rest_ltp", {})
+            _cached    = st.session_state.get("_banner_rest_ltp", {})
             _cache_age = _time_mod.time() - st.session_state.get("_banner_rest_ts", 0)
             if not _cached or _cache_age > 120:
                 try:
-                    # Fetch index + subscribed signal stocks from Kite ltp()
-                    _tok_map  = {config.NIFTY_50_TOKEN: "NIFTY 50",
-                                 config.NIFTY_BANK_TOKEN: "NIFTY BANK"}
+                    # Build symbol list in "EXCHANGE:TRADINGSYMBOL" format — the only
+                    # format kite.ltp() reliably returns with matching response keys.
+                    _sym_list = ["NSE:NIFTY 50", "NSE:NIFTY BANK"]
                     _sbase = st.session_state.get("_signals_base_df")
-                    if _sbase is not None and not _sbase.empty and "instrument_token" in _sbase.columns:
-                        for _tr in _sbase[["instrument_token", "tradingsymbol"]].dropna().itertuples(index=False):
-                            _tok_map[int(_tr.instrument_token)] = str(_tr.tradingsymbol)
-                    _ltp_r = _kc_chk.kite.ltp(list(_tok_map.keys()))
+                    if _sbase is not None and not _sbase.empty and "tradingsymbol" in _sbase.columns:
+                        for _ts in _sbase["tradingsymbol"].dropna().astype(str).tolist():
+                            _sym_list.append(f"NSE:{_ts}")
+                    # Kite ltp() returns {"NSE:NIFTY 50": {"last_price": 24500.0, ...}, ...}
+                    _ltp_r   = _kc_chk.kite.ltp(_sym_list)
                     _fetched = {}
-                    for _tok, _sym in _tok_map.items():
-                        _v = (_ltp_r.get(_tok) or _ltp_r.get(f"NSE:{_sym}") or {}).get("last_price")
-                        if _v:
-                            _fetched[_sym] = float(_v)
+                    for _full_sym, _data in _ltp_r.items():
+                        _lp = (_data or {}).get("last_price")
+                        if _lp:
+                            # Strip exchange prefix for display ("NSE:RELIANCE" → "RELIANCE")
+                            _disp = _full_sym.split(":", 1)[-1]
+                            _fetched[_disp] = float(_lp)
                     if _fetched:
                         st.session_state["_banner_rest_ltp"] = _fetched
                         st.session_state["_banner_rest_ts"]  = _time_mod.time()
                         _prices = _fetched
                 except Exception:
                     pass
+            else:
+                _prices = _cached
 
         if not _prices:
             _banner_msg = ("⏸&nbsp;Market closed — connect Kite to see last prices"
                            if not _kite_ok else
-                           "⏳&nbsp;Fetching last prices…")
+                           "⏸&nbsp;Market closed — last prices unavailable")
             st.markdown(
-                f"<div style='position:fixed;bottom:0;left:0;right:0;height:26px;"
+                f"<div style='position:fixed;bottom:0;left:0;right:0;height:34px;"
                 "background:#060d18;border-top:1px solid #1e3a5f;z-index:9999;"
                 "display:flex;align-items:center;padding:0 12px'>"
-                f"<span style='color:#475569;font-size:10px;font-family:monospace'>"
+                f"<span style='color:#475569;font-size:12px;font-family:monospace'>"
                 f"{_banner_msg}</span></div>"
-                "<style>section.main .block-container{padding-bottom:36px!important}</style>",
+                "<style>section.main .block-container{padding-bottom:44px!important}</style>",
                 unsafe_allow_html=True,
             )
             return
