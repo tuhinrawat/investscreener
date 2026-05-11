@@ -3623,17 +3623,26 @@ def _live_signals_header():
         _g_trail  = config.DAILY_TRAIL_PCT          # 0.3 %
         _g_cutoff = (_g_hwm - _g_trail) if _g_hwm >= _g_low else None
 
-        if _g_cutoff is not None and st.session_state.get("paper_open"):
+        _g_has_paper = bool(st.session_state.get("paper_open"))
+        _g_kc_gate   = st.session_state.get("kite_client")
+        _g_has_real  = _g_kc_gate is not None and getattr(_g_kc_gate, "authenticated", False)
+        if _g_cutoff is not None and (_g_has_paper or _g_has_real):
             _g_uid  = st.session_state.get("kite_user_id", "")
+            # Closed P&L for both paper and real today
             try:
-                _g_real = db.get_today_closed_pnl(user_id=_g_uid, is_paper=True)
+                _g_closed_paper = db.get_today_closed_pnl(user_id=_g_uid, is_paper=True)
             except Exception:
-                _g_real = 0.0
+                _g_closed_paper = 0.0
+            try:
+                _g_closed_real = db.get_today_closed_pnl(user_id=_g_uid, is_paper=False)
+            except Exception:
+                _g_closed_real = 0.0
+            _g_real = _g_closed_paper + _g_closed_real
 
-            # Compute per-trade MTM and total
+            # Compute per-trade MTM for open paper positions
             _g_per_trade: dict[int, tuple[float, float]] = {}  # pid → (mtm_pnl, ltp)
             _g_mtm_sum = 0.0
-            for _g_pid, _g_pt in list(st.session_state["paper_open"].items()):
+            for _g_pid, _g_pt in list(st.session_state.get("paper_open", {}).items()):
                 _g_ltp = _live_ltp_now.get(_g_pt.get("sym", ""), 0)
                 if not _g_ltp:
                     continue
@@ -3644,10 +3653,25 @@ def _live_signals_header():
                 _g_per_trade[_g_pid] = (_g_trade_mtm, _g_ltp)
                 _g_mtm_sum += _g_trade_mtm
 
+            # Add open real position MTM to the total
+            try:
+                _g_real_open_mtm = db.get_open_real_trades(user_id=_g_uid)
+            except Exception:
+                _g_real_open_mtm = []
+            for _grm in _g_real_open_mtm:
+                _grm_sym   = _grm.get("tradingsymbol", "")
+                _grm_ltp   = _live_ltp_now.get(_grm_sym, 0)
+                _grm_entry = float(_grm.get("actual_entry") or 0)
+                _grm_qty   = int(_grm.get("quantity") or 0)
+                _grm_sig   = _grm.get("signal_type", "")
+                if _grm_ltp and _grm_entry and _grm_qty:
+                    _grm_dir = -1 if _grm_sig in ("SELL_BELOW", "SELL_ORB") else 1
+                    _g_mtm_sum += _grm_dir * (_grm_ltp - _grm_entry) * _grm_qty
+
             _g_total_ret = ((_g_real + _g_mtm_sum) / config.PAPER_CAPITAL * 100)
 
             if _g_total_ret <= _g_cutoff:
-                # Close only the loss-making legs; winners keep running
+                # ── Close losing paper legs ────────────────────────────────────
                 for _g_pid, (_g_trade_mtm, _g_exit_ltp) in _g_per_trade.items():
                     if _g_trade_mtm < 0 and _g_pid in st.session_state["paper_open"]:
                         _g_sym = st.session_state["paper_open"][_g_pid].get("sym", "")
@@ -3665,6 +3689,58 @@ def _live_signals_header():
                             )
                         except Exception:
                             pass
+
+                # ── Close losing REAL legs via Kite MARKET order ───────────────
+                # Gate-C applies to real money too — close any losing real
+                # position immediately with a MARKET order, then cancel the
+                # orphaned SL + target companion orders.
+                _g_kc = st.session_state.get("kite_client")
+                if _g_kc and getattr(_g_kc, "authenticated", False):
+                    try:
+                        _g_real_open = db.get_open_real_trades(user_id=_g_uid)
+                    except Exception:
+                        _g_real_open = []
+                    for _gr in _g_real_open:
+                        _gr_sym   = _gr.get("tradingsymbol", "")
+                        _gr_ltp   = _live_ltp_now.get(_gr_sym, 0)
+                        _gr_entry = float(_gr.get("actual_entry") or 0)
+                        _gr_qty   = int(_gr.get("quantity") or 0)
+                        _gr_sig   = _gr.get("signal_type", "")
+                        if not (_gr_ltp and _gr_entry and _gr_qty):
+                            continue
+                        _gr_dir   = -1 if _gr_sig in ("SELL_BELOW", "SELL_ORB") else 1
+                        _gr_mtm   = _gr_dir * (_gr_ltp - _gr_entry) * _gr_qty
+                        if _gr_mtm >= 0:
+                            continue  # winner — let it run
+                        _gr_id  = _gr.get("id")
+                        _gr_txn = "BUY" if _gr_dir == -1 else "SELL"
+                        try:
+                            _g_kc.place_order(
+                                tradingsymbol    = _gr_sym,
+                                qty              = _gr_qty,
+                                transaction_type = _gr_txn,
+                                order_type       = "MARKET",
+                                product          = "MIS",
+                                tag              = "scr_gate",
+                            )
+                            _cancel_companion_orders(
+                                _g_kc, _gr_id,
+                                sl_oid  = _gr.get("kite_sl_order_id"),
+                                tgt_oid = _gr.get("kite_target_order_id"),
+                            )
+                            db.close_trade(
+                                _gr_id, _gr_ltp, "STOPPED_OUT",
+                                f"💸 Gate-C: total return {_g_total_ret:.2f}% ≤ cutoff "
+                                f"{_g_cutoff:.2f}% — real loss position closed via MARKET order"
+                            )
+                            st.session_state["_actlog_stale"] = True
+                            st.toast(
+                                f"🛡 Gate (Real): {_gr_sym} closed @ ₹{_gr_ltp:.2f} "
+                                f"(daily return hit cutoff {_g_cutoff:.2f}%)",
+                                icon="🛡",
+                            )
+                        except Exception as _gr_err:
+                            st.toast(f"⚠ Gate-C real close failed for {_gr_sym}: {_gr_err}", icon="⚠️")
 
         # ── Pass 2b: T1 / stop exits for scalp trades (same logic, separate dict) ─
         _scalp_exits    = []

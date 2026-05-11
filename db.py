@@ -1215,14 +1215,15 @@ def get_open_real_trades(user_id: str = "") -> list:
             params.append(user_id)
         cur.execute(
             "SELECT id, tradingsymbol, signal_type, actual_entry, rec_stop, "
-            "kite_sl_order_id, kite_target_order_id "
+            "kite_sl_order_id, kite_target_order_id, quantity "
             "FROM trade_log WHERE " + " AND ".join(clauses) + " ORDER BY id",
             params,
         )
         return [
             {"id": r[0], "tradingsymbol": r[1], "signal_type": r[2],
              "actual_entry": r[3], "rec_stop": r[4],
-             "kite_sl_order_id": r[5], "kite_target_order_id": r[6]}
+             "kite_sl_order_id": r[5], "kite_target_order_id": r[6],
+             "quantity": r[7]}
             for r in cur.fetchall()
         ]
     finally:
