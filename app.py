@@ -1196,7 +1196,7 @@ if require_all_positive:
 # ============================================================
 import time as _time_mod   # needed for TTL calculations here and in fragment
 
-@st.fragment(run_every=5)
+@st.fragment(run_every=1)
 def _market_pulse_header():
     """
     Compact always-visible metric row above the three main tabs.
@@ -1517,18 +1517,37 @@ def _market_pulse_header():
             st.session_state.pop(_k, None)
 
     # ── Read all values from session state ───────────────────────────────
-    # NIFTY 50: try WebSocket ticker first (always subscribed as token 256265)
+    # NIFTY 50 + NIFTY BANK: WebSocket first (ms latency during market hours).
+    # Fallback: Kite ltp() REST API — works after hours, shows last traded price.
+    # TTL 60s so we don't hammer the REST API on every 1s fragment tick.
     _ticker_all = _kc_module.get_all_ticker_prices()
     _nifty_ltp  = (_ticker_all.get("NIFTY 50")
                    or st.session_state.get("_nifty_live_ltp"))
+    _nbank_ltp  = (_ticker_all.get("NIFTY BANK")
+                   or st.session_state.get("_nbank_live_ltp")
+                   or st.session_state.get("_live_ltp", {}).get("NIFTY BANK"))
+
+    if _kite_ok and (not _nifty_ltp or not _nbank_ltp):
+        if _force or (_now_ts - st.session_state.get("_idx_ltp_ts", 0) > 60):
+            try:
+                _ltp_resp = _kc_mph.kite.ltp(["NSE:NIFTY 50", "NSE:NIFTY BANK"])
+                _n50_ltp  = (_ltp_resp.get("NSE:NIFTY 50")  or {}).get("last_price")
+                _nbnk_ltp = (_ltp_resp.get("NSE:NIFTY BANK") or {}).get("last_price")
+                if _n50_ltp:
+                    st.session_state["_nifty_live_ltp"] = float(_n50_ltp)
+                    _nifty_ltp = float(_n50_ltp)
+                if _nbnk_ltp:
+                    st.session_state["_nbank_live_ltp"] = float(_nbnk_ltp)
+                    _nbank_ltp = float(_nbnk_ltp)
+                st.session_state["_idx_ltp_ts"] = _now_ts
+            except Exception:
+                pass
+
     _n50_prev   = st.session_state.get("_nifty50_prev_close_mph") or st.session_state.get("_nifty_prev_close")
     _nifty_pct  = ((_nifty_ltp - _n50_prev) / _n50_prev * 100) if (_nifty_ltp and _n50_prev) else st.session_state.get("_nifty_intraday_pct")
 
-    # NIFTY BANK: LTP from WebSocket, % vs previous close (not open)
-    _nbank_ltp   = (_ticker_all.get("NIFTY BANK")
-                    or st.session_state.get("_live_ltp", {}).get("NIFTY BANK"))
-    _nbank_prev  = st.session_state.get("_nifty_bank_prev_close")
-    _nbank_pct   = ((_nbank_ltp - _nbank_prev) / _nbank_prev * 100) if (_nbank_ltp and _nbank_prev) else None
+    _nbank_prev = st.session_state.get("_nifty_bank_prev_close")
+    _nbank_pct  = ((_nbank_ltp - _nbank_prev) / _nbank_prev * 100) if (_nbank_ltp and _nbank_prev) else None
 
     _vix        = st.session_state.get("_vix_ltp")
     _usd_inr    = st.session_state.get("_usdinr_ltp")
