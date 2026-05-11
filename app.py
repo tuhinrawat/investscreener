@@ -1137,7 +1137,8 @@ tab_screener, tab_signals, tab_activity = st.tabs([
 @st.fragment(run_every=1)
 def _freshness_bar():
     """Live data-freshness status strip shown below the main tabs."""
-    _now_fb  = datetime.now(_IST)
+    _fb_tz   = timezone(timedelta(hours=5, minutes=30))
+    _now_fb  = datetime.now(_fb_tz)
     _ltp_ts  = st.session_state.get("_live_ltp_ts")
     _sig_ts  = st.session_state.get("_last_metrics_update_ts")   # set by quick/full scan
     _mkt_open = (
