@@ -3844,6 +3844,71 @@ def _live_signals_header():
                         except Exception as _gr_err:
                             st.toast(f"⚠ Gate-C real close failed for {_gr_sym}: {_gr_err}", icon="⚠️")
 
+        # ── Trailing profit exit for real intraday trades ──────────────────────
+        # Logic: once a trade reaches TRAIL_ACTIVATE_PCT profit, track the peak.
+        # If profit falls by TRAIL_DROP_PCT from the peak, close via MARKET order
+        # and cancel the SL-M companion (the exchange-side safety net).
+        _TRAIL_ACTIVATE = 2.0    # % profit to activate trailing
+        _TRAIL_DROP     = 0.03   # % drop from peak to trigger close
+        _trail_peaks    = st.session_state.setdefault("_real_trail_peak", {})
+        _kc_trail       = st.session_state.get("kite_client")
+        _trail_uid      = st.session_state.get("kite_user_id", "")
+        if _kc_trail and getattr(_kc_trail, "authenticated", False) and _trail_uid:
+            try:
+                _rt_list = db.get_open_real_trades(user_id=_trail_uid)
+            except Exception:
+                _rt_list = []
+            for _rt in _rt_list:
+                _rt_id    = _rt.get("id")
+                _rt_sym   = _rt.get("tradingsymbol", "")
+                _rt_entry = float(_rt.get("actual_entry") or 0)
+                _rt_qty   = int(_rt.get("quantity") or 0)
+                _rt_sig   = _rt.get("signal_type", "")
+                if not _rt_entry or not _rt_qty or not _rt_sym:
+                    continue
+                _rt_ltp = _live_ltp_now.get(_rt_sym, 0)
+                if not _rt_ltp:
+                    continue
+                # Direction: long = BUY_ABOVE, short = SELL_BELOW / SELL_ORB
+                _rt_dir = -1 if _rt_sig in ("SELL_BELOW", "SELL_ORB") else 1
+                _rt_pnl_pct = _rt_dir * (_rt_ltp - _rt_entry) / _rt_entry * 100
+
+                # Update peak only while profitable
+                _prev_peak = _trail_peaks.get(_rt_id, 0.0)
+                if _rt_pnl_pct > _prev_peak:
+                    _trail_peaks[_rt_id] = _rt_pnl_pct
+                _cur_peak = _trail_peaks.get(_rt_id, 0.0)
+
+                # Trailing exit condition: peak >= activation AND drop >= trail amount
+                if _cur_peak >= _TRAIL_ACTIVATE and (_cur_peak - _rt_pnl_pct) >= _TRAIL_DROP:
+                    try:
+                        _trail_txn = "SELL" if _rt_dir == 1 else "BUY"
+                        _kc_trail.place_order(
+                            tradingsymbol    = _rt_sym,
+                            qty              = _rt_qty,
+                            transaction_type = _trail_txn,
+                            order_type       = "MARKET",
+                            product          = "MIS",
+                            tag              = "scr_trail",
+                        )
+                        # Cancel the standing SL-M companion — position is now flat
+                        _cancel_companion_orders(
+                            _kc_trail, _rt_id,
+                            sl_oid  = _rt.get("kite_sl_order_id"),
+                            tgt_oid = None,
+                        )
+                        db.close_trade(
+                            _rt_id, _rt_ltp, "TARGET_HIT",
+                            f"🎯 Trailing exit: peak {_cur_peak:.2f}% → dropped to {_rt_pnl_pct:.2f}% @ ₹{_rt_ltp:.2f}",
+                        )
+                        _trail_peaks.pop(_rt_id, None)
+                        st.toast(
+                            f"🎯 Trailing exit: {_rt_sym} | peak {_cur_peak:.2f}% → booked at {_rt_pnl_pct:.2f}% @ ₹{_rt_ltp:.2f}",
+                            icon="🎯",
+                        )
+                    except Exception as _te:
+                        st.toast(f"⚠ Trailing exit failed for {_rt_sym}: {_te}", icon="⚠️")
+
         # ── Pass 2b: T1 / stop exits for scalp trades (same logic, separate dict) ─
         _scalp_exits    = []
         _scalp_partials = []
@@ -4938,9 +5003,9 @@ def _intraday_long_live():
                         # this is safe. For a stricter guarantee, poll order status
                         # and place SL only once status = "COMPLETE".
                         _t1_val  = float(r.get("intraday_t1") or 0)
-                        # ── Exchange-side companion orders (SL + Target) ──────────
-                        # Both live on Zerodha's servers — protect the position
-                        # even if the browser is closed after entry fills.
+                        # ── Exchange-side SL-M only ───────────────────────────────
+                        # Target is managed in-app via trailing profit logic
+                        # (activates at 2% profit, trails by 0.03% from peak).
                         _sl_oid  = None
                         _tgt_oid = None
                         if _stop_val:
@@ -4953,19 +5018,6 @@ def _intraday_long_live():
                                     product          = "MIS",
                                     trigger_price    = _stop_val,
                                     tag              = "scr_sl",
-                                )
-                            except Exception:
-                                pass
-                        if _t1_val and _t1_val > _trigger_price:
-                            try:
-                                _tgt_oid = _kc_rt.place_order(
-                                    tradingsymbol    = sym,
-                                    qty              = _pqty,
-                                    transaction_type = "SELL",
-                                    order_type       = "LIMIT",
-                                    product          = "MIS",
-                                    price            = _t1_val,
-                                    tag              = "scr_tgt",
                                 )
                             except Exception:
                                 pass
@@ -4984,22 +5036,23 @@ def _intraday_long_live():
                             "kite_user_id":            _cur_user_id,
                             "kite_order_id":           _oid,
                             "kite_sl_order_id":        _sl_oid,
-                            "kite_target_order_id":    _tgt_oid,
+                            "kite_target_order_id":    None,
                             "kite_status":             "OPEN",
                             "quantity":                _pqty,
                             "actual_entry":            _trigger_price,
                             "status":                  "OPEN",
-                            "notes":                   f"💸 Real — auto TRIGGERED @ ₹{_trigger_price:.2f} (conf {confidence}/10, ₹{_cap_this_trade:,}) | SL={_sl_oid} TGT={_tgt_oid}",
+                            "notes":                   f"💸 Real — auto TRIGGERED @ ₹{_trigger_price:.2f} (conf {confidence}/10, ₹{_cap_this_trade:,}) | SL={_sl_oid} | trailing profit exit",
                             "is_paper_trade":          False,
                             "intraday_confidence":     confidence,
                         })
-                        # Track companion order IDs in session state for fast cancel
                         st.session_state.setdefault("_real_companions", {})[_rid] = {
-                            "sl": _sl_oid, "tgt": _tgt_oid
+                            "sl": _sl_oid, "tgt": None
                         }
+                        # Initialise trailing peak for this trade
+                        st.session_state.setdefault("_real_trail_peak", {})[_rid] = 0.0
                         st.session_state["real_triggered"][_real_key] = _rid
-                        _confirm_map.pop(sym, None)  # reset timer after firing
-                        st.toast(f"💸 Real BUY [{_conf_tier}]: {sym} @ ₹{_trigger_price:.2f} × {_pqty} | SL={_sl_oid} TGT={_tgt_oid}", icon="💸")
+                        _confirm_map.pop(sym, None)
+                        st.toast(f"💸 Real BUY [{_conf_tier}]: {sym} @ ₹{_trigger_price:.2f} × {_pqty} | SL={_sl_oid} | trailing exit", icon="💸")
                     except Exception as _re:
                         st.toast(f"⚠ Real order failed for {sym}: {_re}", icon="⚠️")
 
@@ -5436,7 +5489,8 @@ def _intraday_short_live():
                             tag              = "scr_intra",
                         )
                         _t1_val_s = float(r.get("intraday_t1") or 0)
-                        # ── Exchange-side companion orders (SL + Target) ──────────
+                        # ── Exchange-side SL-M only ───────────────────────────────
+                        # Target is managed in-app via trailing profit logic.
                         _sl_oid  = None
                         _tgt_oid = None
                         if _stop_val:
@@ -5449,19 +5503,6 @@ def _intraday_short_live():
                                     product          = "MIS",
                                     trigger_price    = _stop_val,
                                     tag              = "scr_sl",
-                                )
-                            except Exception:
-                                pass
-                        if _t1_val_s and _t1_val_s < _trigger_price:
-                            try:
-                                _tgt_oid = _kc_rt.place_order(
-                                    tradingsymbol    = sym,
-                                    qty              = _pqty,
-                                    transaction_type = "BUY",
-                                    order_type       = "LIMIT",
-                                    product          = "MIS",
-                                    price            = _t1_val_s,
-                                    tag              = "scr_tgt",
                                 )
                             except Exception:
                                 pass
@@ -5480,21 +5521,23 @@ def _intraday_short_live():
                             "kite_user_id":            _cur_user_id,
                             "kite_order_id":           _oid,
                             "kite_sl_order_id":        _sl_oid,
-                            "kite_target_order_id":    _tgt_oid,
+                            "kite_target_order_id":    None,
                             "kite_status":             "OPEN",
                             "quantity":                _pqty,
                             "actual_entry":            _trigger_price,
                             "status":                  "OPEN",
-                            "notes":                   f"💸 Real — auto TRIGGERED @ ₹{_trigger_price:.2f} (conf {confidence}/10, ₹{_cap_this_trade:,}) | SL={_sl_oid} TGT={_tgt_oid}",
+                            "notes":                   f"💸 Real — auto TRIGGERED @ ₹{_trigger_price:.2f} (conf {confidence}/10, ₹{_cap_this_trade:,}) | SL={_sl_oid} | trailing profit exit",
                             "is_paper_trade":          False,
                             "intraday_confidence":     confidence,
                         })
                         st.session_state.setdefault("_real_companions", {})[_rid] = {
-                            "sl": _sl_oid, "tgt": _tgt_oid
+                            "sl": _sl_oid, "tgt": None
                         }
+                        # Initialise trailing peak for this trade
+                        st.session_state.setdefault("_real_trail_peak", {})[_rid] = 0.0
                         st.session_state["real_triggered"][_real_key] = _rid
                         _confirm_map_s.pop(_short_key, None)
-                        st.toast(f"💸 Real SHORT [{_conf_tier}]: {sym} @ ₹{_trigger_price:.2f} × {_pqty} | SL={_sl_oid} TGT={_tgt_oid}", icon="💸")
+                        st.toast(f"💸 Real SHORT [{_conf_tier}]: {sym} @ ₹{_trigger_price:.2f} × {_pqty} | SL={_sl_oid} | trailing exit", icon="💸")
                     except Exception as _re:
                         st.toast(f"⚠ Real short order failed for {sym}: {_re}", icon="⚠️")
 
