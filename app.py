@@ -7094,69 +7094,92 @@ with tab_activity:
 
 
 # ============================================================
-# FX + COMMODITY FRAGMENT — 60 s REST fetch for USD/INR & Crude
+# FX + COMMODITY FRAGMENT — 60 s fetch for USD/INR & Crude Oil
 # ============================================================
 @st.fragment(run_every=60)
 def _fetch_fx_commodity():
     """
-    Fetches USD/INR and Crude Oil prices via the Kite REST API.
-    Runs at 60-second intervals to minimise API load — the banner reads from
-    st.session_state so the displayed value only stalens by at most 60 s.
+    Fetches USD/INR and WTI Crude Oil prices.  Refresh every 60 s.
 
-    CDS and MCX segments must be enabled on the user's Kite account.
-    If the call fails (segment not subscribed, market closed, etc.) we silently
-    leave the session state key untouched, so the last known price is retained.
+    Source priority for each metric:
+      USD/INR   1. frankfurter.app (free, open, no key)
+                2. open.er-api.com (free fallback)
+                3. Kite CDS:USDINR (only if user has CDS segment)
+      Crude Oil 1. Yahoo Finance CL=F WTI futures (no key needed)
+                2. Kite MCX (only if user has MCX + correct expiry symbol)
+
+    All calls are fire-and-forget; any failure leaves session state
+    untouched so the last known value stays in the banner.
     """
-    _kc_fx = st.session_state.get("kite_client")
-    if not _kc_fx or not getattr(_kc_fx, "authenticated", False):
-        return
+    import requests as _req_fx
 
-    # USD / INR — CDS segment (currency futures; front-month trades all day)
+    _HDR = {"User-Agent": "Mozilla/5.0 (compatible; screener-app/1.0)"}
+
+    # ── USD / INR ─────────────────────────────────────────────────────────
+    # Source 1: open.er-api.com — free, no auth, updated every few minutes
     try:
-        _fx_raw = _kc_fx.kite.ltp(["CDS:USDINR"])
-        _usd = (_fx_raw.get("CDS:USDINR") or {}).get("last_price")
-        if _usd:
-            st.session_state["_usdinr_ltp"] = float(_usd)
+        _r = _req_fx.get("https://open.er-api.com/v6/latest/USD",
+                         headers=_HDR, timeout=4)
+        _rate = (_r.json().get("rates") or {}).get("INR")
+        if _rate:
+            st.session_state["_usdinr_ltp"] = float(_rate)
     except Exception:
         pass
 
-    # Crude Oil — MCX segment (CRUDEOIL index, not a specific expiry)
+    # Source 2: Kite CDS segment (bonus — only works if user has currency derivatives)
+    if not st.session_state.get("_usdinr_ltp"):
+        try:
+            _kc_fx = st.session_state.get("kite_client")
+            if _kc_fx and getattr(_kc_fx, "authenticated", False):
+                _fx_raw = _kc_fx.kite.ltp(["CDS:USDINR"])
+                _rate   = (_fx_raw.get("CDS:USDINR") or {}).get("last_price")
+                if _rate:
+                    st.session_state["_usdinr_ltp"] = float(_rate)
+        except Exception:
+            pass
+
+    # ── Crude Oil (WTI) ────────────────────────────────────────────────────
+    # Source 1: Yahoo Finance CL=F — WTI front-month futures, no auth needed
     try:
-        _cx_raw = _kc_fx.kite.ltp(["MCX:CRUDEOIL"])
-        _cr = (_cx_raw.get("MCX:CRUDEOIL") or {}).get("last_price")
-        if _cr:
-            st.session_state["_crude_ltp"] = float(_cr)
+        _yf = _req_fx.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/CL=F"
+            "?interval=1d&range=1d",
+            headers=_HDR, timeout=5,
+        )
+        _meta = (_yf.json().get("chart", {}).get("result") or [{}])[0].get("meta", {})
+        _cr_usd = _meta.get("regularMarketPrice")
+        if _cr_usd:
+            _inr_rate = st.session_state.get("_usdinr_ltp") or 84.0
+            st.session_state["_crude_usd"] = float(_cr_usd)
+            st.session_state["_crude_ltp"] = round(float(_cr_usd) * _inr_rate, 1)
     except Exception:
         pass
 
-    # Nifty PCR — 21-strike option chain around ATM (NFO segment)
+    # ── Nifty PCR — option chain OI (NFO segment, market hours only) ─────
     try:
+        _kc_pcr = st.session_state.get("kite_client")
         _nf_atm = st.session_state.get("_nifty_live_ltp")
-        if _nf_atm and _nf_atm > 0 and _is_market_open():
-            import math as _math
-            _atm = int(round(_nf_atm / 50.0)) * 50
-            _strikes = [_atm + i * 50 for i in range(-10, 11)]
-            # Build Kite NFO tradingsymbol — format: NIFTY{DDMMMYY}{STRIKE}CE/PE
+        if (_kc_pcr and getattr(_kc_pcr, "authenticated", False)
+                and _nf_atm and _nf_atm > 0 and _is_market_open()):
+            _atm      = int(round(_nf_atm / 50.0)) * 50
+            _strikes  = [_atm + i * 50 for i in range(-10, 11)]
             from datetime import date as _pcr_date  # noqa: PLC0415
-            _today = _pcr_date.today()
-            # Nearest Thursday (weekly expiry)
-            _days = (3 - _today.weekday()) % 7
-            _exp  = _today + timedelta(days=_days if _days else 7)
-            _exp_str = _exp.strftime("%d%b%y").upper()   # e.g. "29MAY25"
-            _ce_syms = [f"NFO:NIFTY{_exp_str}{s}CE" for s in _strikes]
-            _pe_syms = [f"NFO:NIFTY{_exp_str}{s}PE" for s in _strikes]
-            _all_syms = _ce_syms + _pe_syms
-            # Use full quote for OI data
-            _q_result: dict = {}
-            for _i in range(0, len(_all_syms), 500):
+            _today    = _pcr_date.today()
+            _days_to_thu = (3 - _today.weekday()) % 7
+            _exp      = _today + timedelta(days=_days_to_thu if _days_to_thu else 7)
+            _exp_str  = _exp.strftime("%d%b%y").upper()
+            _ce_syms  = [f"NFO:NIFTY{_exp_str}{s}CE" for s in _strikes]
+            _pe_syms  = [f"NFO:NIFTY{_exp_str}{s}PE" for s in _strikes]
+            _q_res: dict = {}
+            for _i in range(0, len(_ce_syms + _pe_syms), 500):
                 try:
-                    _kc_fx.quote_limiter.wait()
-                    _q_result.update(_kc_fx.kite.quote(_all_syms[_i:_i + 500]))
+                    _kc_pcr.quote_limiter.wait()
+                    _q_res.update(_kc_pcr.kite.quote((_ce_syms + _pe_syms)[_i:_i + 500]))
                 except Exception:
                     break
-            if _q_result:
-                _ce_oi = sum((_q_result.get(s) or {}).get("oi", 0) for s in _ce_syms)
-                _pe_oi = sum((_q_result.get(s) or {}).get("oi", 0) for s in _pe_syms)
+            if _q_res:
+                _ce_oi = sum((_q_res.get(s) or {}).get("oi", 0) for s in _ce_syms)
+                _pe_oi = sum((_q_res.get(s) or {}).get("oi", 0) for s in _pe_syms)
                 if _ce_oi > 0:
                     st.session_state["_nifty_pcr"] = round(_pe_oi / _ce_oi, 2)
     except Exception:
@@ -7257,15 +7280,23 @@ def _ticker_banner():
     if _usd:
         items.append(
             f'<span class="tb-fx">💱&nbsp;USD/INR&nbsp;'
-            f'<span style="color:#f59e0b">{_usd:.4f}</span></span>'
+            f'<span style="color:#f59e0b">₹{_usd:.2f}</span></span>'
         )
 
     # ── 4. Crude Oil ──────────────────────────────────────────────────────
-    _cr = st.session_state.get("_crude_ltp")
-    if _cr:
+    _cr_usd = st.session_state.get("_crude_usd")   # USD/barrel from Yahoo Finance
+    _cr_inr = st.session_state.get("_crude_ltp")   # INR/barrel (converted)
+    if _cr_usd:
+        items.append(
+            f'<span class="tb-cx">🛢&nbsp;Crude(WTI)&nbsp;'
+            f'<span style="color:#f59e0b">${_cr_usd:,.2f}</span>'
+            + (f'&nbsp;<span style="color:#94a3b8">₹{_cr_inr:,.0f}</span>' if _cr_inr else "")
+            + '</span>'
+        )
+    elif _cr_inr:
         items.append(
             f'<span class="tb-cx">🛢&nbsp;Crude&nbsp;'
-            f'<span style="color:#f59e0b">₹{_cr:,.1f}</span></span>'
+            f'<span style="color:#f59e0b">₹{_cr_inr:,.1f}</span></span>'
         )
 
     # ── 5. Nifty PCR ──────────────────────────────────────────────────────
