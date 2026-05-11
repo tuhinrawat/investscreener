@@ -1196,13 +1196,13 @@ if require_all_positive:
 # ============================================================
 import time as _time_mod   # needed for TTL calculations here and in fragment
 
-@st.fragment(run_every=2)
+@st.fragment(run_every=5)
 def _market_pulse_header():
     """
     Compact always-visible metric row above the three main tabs.
-    Runs every 2 s to keep the live index metrics fresh.
-    Heavy fetches (VIX, BANK NIFTY open, AI intel) are cached in session
-    state and only re-fetched when the TTL expires or ⟳ is pressed.
+    Runs every 5 s — Kite ticker data is in-memory so freshness is fine.
+    Heavy fetches (VIX, global indices, sparklines) are TTL-cached in
+    session state and only re-fetched when TTL expires or ⟳ is pressed.
     """
     import requests as _rqm
 
@@ -1332,83 +1332,82 @@ def _market_pulse_header():
         return False
 
     if _force or (_now_ts - st.session_state.get("_global_idx_ts", 0) > 300):
-        _g_data: dict = {}
         import urllib.parse as _ulp
+        from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _asc
 
-        # ── Source A: Yahoo Finance v8/chart per symbol ───────────────────
-        # Same endpoint as VIX/crude — no crumb/cookie auth needed.
-        # interval=1m gives real-time regularMarketPrice in meta.
+        _STOOQ_MAP: dict = {
+            "^GSPC": "^spx", "^IXIC": "^ndq", "^DJI": "^dji",
+            "^FTSE": "^ftx", "^GDAXI": "^dax", "^FCHI": "^cac",
+            "^N225": "^nkx", "^HSI":  "^hsi",  "000001.SS": "^shc",
+            "^KS11": "^ksp", "^AXJO": "^asx",  "^STI": "^sti",
+        }
         _v8_hdr = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                           "AppleWebKit/537.36 (KHTML, like Gecko) "
                           "Chrome/124.0.0.0 Safari/537.36",
             "Accept": "application/json",
         }
-        for _yfsym, (_gname, _greg, _gflag) in _GLOBAL_META.items():
+        _stooq_hdr = {"User-Agent": "Mozilla/5.0 (compatible; screener/1.0)"}
+
+        def _fetch_one(yfsym: str) -> tuple:
+            """Fetch one global index — Yahoo first, Stooq fallback. Returns (yfsym, dict|None)."""
+            _gname, _greg, _gflag = _GLOBAL_META[yfsym]
+            # Yahoo v8/chart — same endpoint that works for VIX/crude
             try:
-                _enc = _ulp.quote(_yfsym, safe="")
-                _gr  = _rqm.get(
+                _enc = _ulp.quote(yfsym, safe="")
+                _r   = _rqm.get(
                     f"https://query1.finance.yahoo.com/v8/finance/chart/{_enc}"
                     "?interval=1m&range=1d",
-                    headers=_v8_hdr, timeout=6,
+                    headers=_v8_hdr, timeout=3,
                 )
-                if _gr.status_code != 200:
-                    continue
-                _gm  = (_gr.json().get("chart", {}).get("result") or [{}])[0].get("meta", {})
-                _gltp  = _gm.get("regularMarketPrice")
-                _gprev = _gm.get("chartPreviousClose") or _gm.get("previousClose")
-                if _gltp is not None and _gprev:
-                    _g_data[_gname] = {
-                        "ltp":      float(_gltp),
-                        "pct":      round((float(_gltp) - float(_gprev)) / float(_gprev) * 100, 2),
-                        "region":   _greg, "flag": _gflag,
-                        "mkt_state": "REGULAR" if _region_open(_greg) else "CLOSED",
-                        "src":      "yahoo",
-                    }
-                _time_mod.sleep(0.1)   # avoid Yahoo rate-limit across 12 symbols
+                if _r.status_code == 200:
+                    _m = (_r.json().get("chart", {}).get("result") or [{}])[0].get("meta", {})
+                    _ltp  = _m.get("regularMarketPrice")
+                    _prev = _m.get("chartPreviousClose") or _m.get("previousClose")
+                    if _ltp is not None and _prev:
+                        return yfsym, {
+                            "ltp": float(_ltp),
+                            "pct": round((float(_ltp) - float(_prev)) / float(_prev) * 100, 2),
+                            "region": _greg, "flag": _gflag,
+                            "mkt_state": "REGULAR" if _region_open(_greg) else "CLOSED",
+                            "src": "yahoo",
+                        }
             except Exception:
                 pass
+            # Stooq fallback
+            _ssym = _STOOQ_MAP.get(yfsym)
+            if _ssym:
+                try:
+                    _sr   = _rqm.get(f"https://stooq.com/q/d/l/?s={_ssym}&i=d",
+                                     headers=_stooq_hdr, timeout=4)
+                    _rows = [r.split(",") for r in _sr.text.strip().splitlines()
+                             if r and not r.startswith("Date")]
+                    if _rows:
+                        _ltp  = float(_rows[0][4])
+                        _prev = float(_rows[1][4]) if len(_rows) >= 2 else None
+                        return yfsym, {
+                            "ltp":  _ltp,
+                            "pct":  round((_ltp - _prev) / _prev * 100, 2) if _prev else None,
+                            "region": _greg, "flag": _gflag,
+                            "mkt_state": "REGULAR" if _region_open(_greg) else "CLOSED",
+                            "src":  "stooq",
+                        }
+                except Exception:
+                    pass
+            return yfsym, None
 
-        # ── Stooq fallback — for any symbol Yahoo missed ───────────────────
-        # Stooq returns real-time/delayed quotes as plain CSV, no key needed.
-        # Daily endpoint gives last N days; we take the 2 most-recent rows for
-        # current price + previous close so % change is accurate.
-        _STOOQ_MAP: dict[str, str] = {
-            "^GSPC":     "^spx",  "^IXIC":    "^ndq",  "^DJI":    "^dji",
-            "^FTSE":     "^ftx",  "^GDAXI":   "^dax",  "^FCHI":   "^cac",
-            "^N225":     "^nkx",  "^HSI":     "^hsi",  "000001.SS":"^shc",
-            "^KS11":     "^ksp",  "^AXJO":    "^asx",  "^STI":    "^sti",
-        }
-        _stooq_hdr = {"User-Agent": "Mozilla/5.0 (compatible; screener/1.0)"}
-        for _yfsym, (_gname, _greg, _gflag) in _GLOBAL_META.items():
-            if _gname in _g_data:
-                continue   # Yahoo already got it
-            _ssym = _STOOQ_MAP.get(_yfsym)
-            if not _ssym:
-                continue
-            try:
-                _sr = _rqm.get(
-                    f"https://stooq.com/q/d/l/?s={_ssym}&i=d",
-                    headers=_stooq_hdr, timeout=6,
-                )
-                # Stooq CSV: Date,Open,High,Low,Close,Volume — newest row first
-                _rows = [r.split(",") for r in _sr.text.strip().splitlines()
-                         if r and not r.startswith("Date")]
-                if not _rows:
-                    continue
-                _ltp  = float(_rows[0][4])   # today's Close
-                _prev = float(_rows[1][4]) if len(_rows) >= 2 else None
-                _pct  = round((_ltp - _prev) / _prev * 100, 2) if _prev else None
-                _g_data[_gname] = {
-                    "ltp":      _ltp,
-                    "pct":      _pct,
-                    "region":   _greg,
-                    "flag":     _gflag,
-                    "mkt_state": "REGULAR" if _region_open(_greg) else "CLOSED",
-                    "src":      "stooq",
-                }
-            except Exception:
-                pass
+        # Fetch all 12 symbols in parallel — caps total wait to ~3-4s instead of 72s
+        _g_data: dict = {}
+        with _TPE(max_workers=12) as _pool:
+            _futs = {_pool.submit(_fetch_one, sym): sym for sym in _GLOBAL_META}
+            for _fut in _asc(_futs, timeout=8):
+                try:
+                    _sym, _result = _fut.result()
+                    if _result:
+                        # store under display label ("S&P 500") — that's what _gcard looks up
+                        _g_data[_GLOBAL_META[_sym][0]] = _result
+                except Exception:
+                    pass
 
         if _g_data:
             st.session_state["_global_idx"]    = _g_data
@@ -1673,36 +1672,59 @@ def _market_pulse_header():
     def _group_label(txt: str) -> str:
         return f'<div style="font-size:9px;color:#334155;text-transform:uppercase;letter-spacing:0.09em;padding:0 10px 0 4px;writing-mode:vertical-lr;transform:rotate(180deg);align-self:center;flex-shrink:0">{txt}</div>'
 
-    # ── Sparklines (pre-generated so card calls are clean) ────────────────
-    # Indices: up = good (green), down = red  →  invert=False (default)
-    _sp_n50    = _sparkline(_spark_data.get("n50",    []), "#60a5fa", "n50")
-    _sp_nbank  = _sparkline(_spark_data.get("nbank",  []), "#818cf8", "nbank")
-    # VIX: rising = fear / bad for market → invert=True.
-    # Extra check: current VIX in extreme zone (< 11 complacency, > 25 panic) → always red.
-    _vix_vals  = _spark_data.get("vix", [])
-    _vix_last  = _vix_vals[-1] if _vix_vals else None
-    _vix_extreme = _vix_last is not None and (_vix_last < 11 or _vix_last > 25)
-    if _vix_extreme and _vix_vals:
-        _sp_vix = _sparkline(_vix_vals, "#ef4444", "vix", invert=False)
+    # ── Sparklines — cached as SVG strings (24h TTL same as _spark_data) ─────
+    # Recompute only when _spark_data itself was refreshed (key changes).
+    # This avoids re-generating 20 SVGs on every 5-second fragment tick.
+    _spk_cache_key = st.session_state.get("_spark_ts", 0)
+    if st.session_state.get("_spk_svg_ts") != _spk_cache_key:
+        _vix_vals    = _spark_data.get("vix", [])
+        _vix_last    = _vix_vals[-1] if _vix_vals else None
+        _vix_extreme = _vix_last is not None and (_vix_last < 11 or _vix_last > 25)
+        _spk_svg: dict = {
+            "n50":    _sparkline(_spark_data.get("n50",    []), "#60a5fa", "n50"),
+            "nbank":  _sparkline(_spark_data.get("nbank",  []), "#818cf8", "nbank"),
+            "vix":    (_sparkline(_vix_vals, "#ef4444", "vix", invert=False)
+                       if _vix_extreme else
+                       _sparkline(_vix_vals, "#f59e0b", "vix", invert=True)),
+            "usdinr": _sparkline(_spark_data.get("usdinr", []), "#f59e0b", "usdinr", invert=True),
+            "wti":    _sparkline(_spark_data.get("wti",    []), "#fb923c", "wti",    invert=True),
+            "brent":  _sparkline(_spark_data.get("brent",  []), "#f97316", "brent",  invert=True),
+            "natgas": _sparkline(_spark_data.get("natgas", []), "#a78bfa", "natgas", invert=True),
+            "sp500":  _sparkline(_spark_data.get("sp500",  []), "#34d399", "sp500",  w=64, h=16),
+            "nasdaq": _sparkline(_spark_data.get("nasdaq", []), "#22d3ee", "nasdaq", w=64, h=16),
+            "dow":    _sparkline(_spark_data.get("dow",    []), "#a3e635", "dow",    w=64, h=16),
+            "ftse":   _sparkline(_spark_data.get("ftse",   []), "#fb7185", "ftse",   w=64, h=16),
+            "dax":    _sparkline(_spark_data.get("dax",    []), "#fbbf24", "dax",    w=64, h=16),
+            "cac":    _sparkline(_spark_data.get("cac",    []), "#c084fc", "cac",    w=64, h=16),
+            "nikkei": _sparkline(_spark_data.get("nikkei", []), "#f472b6", "nikkei", w=64, h=16),
+            "hsi":    _sparkline(_spark_data.get("hsi",    []), "#f97316", "hsi",    w=64, h=16),
+            "sse":    _sparkline(_spark_data.get("sse",    []), "#ef4444", "sse",    w=64, h=16),
+            "kospi":  _sparkline(_spark_data.get("kospi",  []), "#38bdf8", "kospi",  w=64, h=16),
+            "asx":    _sparkline(_spark_data.get("asx",    []), "#4ade80", "asx",    w=64, h=16),
+        }
+        st.session_state["_spk_svg"]    = _spk_svg
+        st.session_state["_spk_svg_ts"] = _spk_cache_key
     else:
-        _sp_vix = _sparkline(_vix_vals, "#f59e0b", "vix", invert=True)
-    # Macro: up = bad for India (INR weakens, oil costs more) → invert=True
-    _sp_usdinr = _sparkline(_spark_data.get("usdinr", []), "#f59e0b", "usdinr", invert=True)
-    _sp_wti    = _sparkline(_spark_data.get("wti",    []), "#fb923c", "wti",    invert=True)
-    _sp_brent  = _sparkline(_spark_data.get("brent",  []), "#f97316", "brent",  invert=True)
-    _sp_natgas = _sparkline(_spark_data.get("natgas", []), "#a78bfa", "natgas", invert=True)
-    # Global indices sparklines (up = good)
-    _sp_sp500  = _sparkline(_spark_data.get("sp500",  []), "#34d399", "sp500",  w=64, h=16)
-    _sp_nasdaq = _sparkline(_spark_data.get("nasdaq", []), "#22d3ee", "nasdaq", w=64, h=16)
-    _sp_dow    = _sparkline(_spark_data.get("dow",    []), "#a3e635", "dow",    w=64, h=16)
-    _sp_ftse   = _sparkline(_spark_data.get("ftse",   []), "#fb7185", "ftse",   w=64, h=16)
-    _sp_dax    = _sparkline(_spark_data.get("dax",    []), "#fbbf24", "dax",    w=64, h=16)
-    _sp_cac    = _sparkline(_spark_data.get("cac",    []), "#c084fc", "cac",    w=64, h=16)
-    _sp_nikkei = _sparkline(_spark_data.get("nikkei", []), "#f472b6", "nikkei", w=64, h=16)
-    _sp_hsi    = _sparkline(_spark_data.get("hsi",    []), "#f97316", "hsi",    w=64, h=16)
-    _sp_sse    = _sparkline(_spark_data.get("sse",    []), "#ef4444", "sse",    w=64, h=16)
-    _sp_kospi  = _sparkline(_spark_data.get("kospi",  []), "#38bdf8", "kospi",  w=64, h=16)
-    _sp_asx    = _sparkline(_spark_data.get("asx",    []), "#4ade80", "asx",    w=64, h=16)
+        _spk_svg = st.session_state["_spk_svg"]
+
+    _sp_n50    = _spk_svg.get("n50",    "")
+    _sp_nbank  = _spk_svg.get("nbank",  "")
+    _sp_vix    = _spk_svg.get("vix",    "")
+    _sp_usdinr = _spk_svg.get("usdinr", "")
+    _sp_wti    = _spk_svg.get("wti",    "")
+    _sp_brent  = _spk_svg.get("brent",  "")
+    _sp_natgas = _spk_svg.get("natgas", "")
+    _sp_sp500  = _spk_svg.get("sp500",  "")
+    _sp_nasdaq = _spk_svg.get("nasdaq", "")
+    _sp_dow    = _spk_svg.get("dow",    "")
+    _sp_ftse   = _spk_svg.get("ftse",   "")
+    _sp_dax    = _spk_svg.get("dax",    "")
+    _sp_cac    = _spk_svg.get("cac",    "")
+    _sp_nikkei = _spk_svg.get("nikkei", "")
+    _sp_hsi    = _spk_svg.get("hsi",    "")
+    _sp_sse    = _spk_svg.get("sse",    "")
+    _sp_kospi  = _spk_svg.get("kospi",  "")
+    _sp_asx    = _spk_svg.get("asx",    "")
 
     # ── Assemble row ──────────────────────────────────────────────────────
     _nifty_val = f"{_nifty_ltp:,.0f}" if _nifty_ltp else "—"
