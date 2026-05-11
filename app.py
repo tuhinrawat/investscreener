@@ -24,6 +24,16 @@ import ai_analyst as _ai
 import market_intel as _mi
 from kite_client import KiteClient
 
+# Background-tab-safe autorefresh: uses a Web Worker (background thread) that
+# browsers cannot throttle, unlike plain setInterval used by fragment run_every.
+try:
+    from streamlit_autorefresh import st_autorefresh as _st_autorefresh
+    _HAS_AUTOREFRESH = True
+except ImportError:
+    _HAS_AUTOREFRESH = False
+    def _st_autorefresh(interval=2000, limit=None, key="ar", debounce=False):  # noqa
+        return 0
+
 # True when running inside a Streamlit Cloud container.
 # Keys must NEVER be written to shared disk in that environment.
 _ON_CLOUD: bool = _os.environ.get("HOME", "").rstrip("/").endswith("appuser")
@@ -3196,6 +3206,13 @@ def _delta_str(sym: str) -> str:
 # fragments to keep their selection state stable across re-renders.
 @st.fragment(run_every=2)
 def _live_signals_header():
+    # ── Web Worker keepalive ─────────────────────────────────────────────────
+    # st_autorefresh uses a Web Worker (background thread) that is NOT throttled
+    # by browser tab visibility policies — unlike fragment run_every which uses
+    # plain setInterval and pauses when the tab is hidden.
+    # Placing it here means it fires even when the user is on another screen.
+    _st_autorefresh(interval=2000, limit=None, key="_ltp_ar", debounce=True)
+
     base_df = st.session_state.get("_signals_base_df", pd.DataFrame())
     if base_df.empty or "swing_signal" not in base_df.columns:
         return
@@ -4130,11 +4147,16 @@ def _intraday_long_live():
         return
 
     # ── LTP freshness guard ───────────────────────────────────────────────────
-    _ltp_ts     = st.session_state.get("_live_ltp_ts")
-    _ltp_stale  = (_ltp_ts is None or
-                   (datetime.now(_IST) - _ltp_ts).total_seconds() > config.LTP_FRESHNESS_SECS)
+    _ltp_ts    = st.session_state.get("_live_ltp_ts")
+    _ltp_age   = (datetime.now(_IST) - _ltp_ts).total_seconds() if _ltp_ts else 9999
+    _ltp_stale = _ltp_age > config.LTP_FRESHNESS_SECS
     if _ltp_stale:
-        st.warning("⚠ LTP prices are stale (>10 s old) — auto-trading paused until fresh data arrives.")
+        _age_str = f"{int(_ltp_age)}s" if _ltp_age < 120 else f"{int(_ltp_age/60)}m"
+        st.info(
+            f"⏸ Prices paused while tab was inactive ({_age_str} ago). "
+            "Refreshing now — auto-trading resumes once fresh prices arrive.",
+            icon="🔄",
+        )
 
     st.caption("Watch for price to trade **above R1**. Enter with stop just below Pivot. T1=R2 (60% exit), T2=R3 (trail 40%).")
 
@@ -4595,11 +4617,16 @@ def _intraday_short_live():
         return
 
     # ── LTP freshness guard ───────────────────────────────────────────────────
-    _ltp_ts     = st.session_state.get("_live_ltp_ts")
-    _ltp_stale  = (_ltp_ts is None or
-                   (datetime.now(_IST) - _ltp_ts).total_seconds() > config.LTP_FRESHNESS_SECS)
+    _ltp_ts_s  = st.session_state.get("_live_ltp_ts")
+    _ltp_age_s = (datetime.now(_IST) - _ltp_ts_s).total_seconds() if _ltp_ts_s else 9999
+    _ltp_stale = _ltp_age_s > config.LTP_FRESHNESS_SECS
     if _ltp_stale:
-        st.warning("⚠ LTP prices are stale (>10 s old) — auto-trading paused until fresh data arrives.")
+        _age_str_s = f"{int(_ltp_age_s)}s" if _ltp_age_s < 120 else f"{int(_ltp_age_s/60)}m"
+        st.info(
+            f"⏸ Prices paused while tab was inactive ({_age_str_s} ago). "
+            "Refreshing now — auto-trading resumes once fresh prices arrive.",
+            icon="🔄",
+        )
 
     _short_sym_q = st.text_input(
         "🔍 Search symbol", placeholder="type to filter…",
@@ -5558,6 +5585,8 @@ def _show_algo_readjust_dialog(uid: str) -> None:
 @st.fragment(run_every=2)
 def _activity_log_live():
     """Auto-refreshes every 2 s: portfolio snapshot, summary banners, trade table."""
+    # Web Worker keepalive — fires even when tab is in background
+    _st_autorefresh(interval=2000, limit=None, key="_actlog_ar", debounce=True)
     _uid = st.session_state.get("kite_user_id", "")
 
     # ── PORTFOLIO SNAPSHOT — live Kite margin + holdings + positions ────────

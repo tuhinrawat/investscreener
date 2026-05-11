@@ -167,8 +167,11 @@ PAPER_CAP_MODERATE = 150_000       # ₹1,50,000 per MODERATE trade (was the old
 PAPER_CAP_MARGINAL = 100_000       # ₹1,00,000 per MARGINAL trade
 # Total capital hard cap: PAPER_CAPITAL (₹9L) — never exceed regardless of confidence
 # Effective max slots: 4 STRONG (₹8L) or 6 MODERATE (₹9L) or 9 MARGINAL (₹9L)
-# LTP freshness gate: if last LTP update older than this, pause auto-triggers
-LTP_FRESHNESS_SECS = 10
+# LTP freshness gate: if last LTP update older than this, pause auto-triggers.
+# Set to 30 s (was 10 s) to absorb brief browser throttling bursts — a Web
+# Worker keepalive (streamlit-autorefresh) ensures updates resume within ~2 s
+# whenever the tab is actually visible.
+LTP_FRESHNESS_SECS = 30
 
 # Daily gain target / trailing cutoff (applies to both paper & real trading)
 # Rule:

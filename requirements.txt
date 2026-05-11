@@ -21,3 +21,5 @@ python-dotenv>=1.0.1
 tqdm>=4.66.0
 ratelimit>=2.2.1
 curl_cffi>=0.7.0
+# Background-tab-safe auto-refresh using a Web Worker (not throttled by browser)
+streamlit-autorefresh>=1.0.1
