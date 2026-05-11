@@ -18,6 +18,9 @@ kiteconnect>=5.0.1
 # AI
 openai>=1.0.0
 
+# Auth
+bcrypt>=4.0.0
+
 # Utilities
 python-dotenv>=1.0.1
 tqdm>=4.66.0

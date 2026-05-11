@@ -147,235 +147,229 @@ st.set_page_config(
 # ls_get / ls_set / ls_delete persist values in the user's own browser.
 # No external package needed — just a tiny vanilla-JS Streamlit component.
 from ls_store import ls_get as _ls_get, ls_set as _ls_set, ls_delete as _ls_del
-
+import auth as _auth
 
 # ============================================================
-# KITE AUTH GATE  — multi-user, session-isolated
+# USER AUTH GATE  — username / password + Kite OAuth
 #
-# Each browser session keeps its own credentials in st.session_state:
-#   kite_api_key      — Kite API key  (entered per-session)
-#   kite_api_secret   — Kite API secret
-#   kite_access_token — OAuth token (set after Zerodha login)
-#   kite_access_date  — date the token was issued (tokens expire daily)
-#   kite_user_id      — Kite user_id fetched from profile (e.g. "ZY1234")
-#   kite_user_name    — Kite display name
+# Flow:
+#   1. Check localStorage for "screener_session" token (persists forever)
+#   2. Validate token against user_sessions DB table → auto-login
+#   3. If no valid token → show Login / Signup page
+#   4. After login: load Kite credentials from users table
+#   5. If Kite token is fresh (issued today) → KiteClient is ready
+#   6. If Kite token is expired → show "Re-authenticate with Kite" button
+#
+# Session state keys set by this block:
+#   app_user          — full users row dict (set = logged in)
+#   kite_api_key      — from users table
+#   kite_api_secret   — from users table
+#   kite_access_token — from users table (if fresh)
 #   kite_authenticated — bool
-#
-# On the very first page load we seed key/secret from env/.env /
-# screener_keys.json so local-dev users don't have to re-enter every time.
-# On Streamlit Cloud each session starts with empty keys and the user
-# enters their own credentials — giving true per-user isolation.
+#   kite_user_id      — Kite profile user_id (e.g. "ZY1234")
+#   kite_user_name    — Kite display name
+#   kite_client       — KiteClient instance (if authenticated)
 # ============================================================
 
-# ── Step 0a: capture incoming request_token BEFORE anything else ──────
-# session_state survives st.rerun() but NOT cross-page navigation.
-# When Zerodha redirects back, it's a fresh page load with empty session.
-# We save the token here so it survives the 1-2 reruns needed for the
-# localStorage component to fire and return the API key/secret.
+# ── Capture Kite OAuth request_token before anything else ─────────────
+# Zerodha redirects back with ?request_token=XXX on a fresh page load.
+# Save it immediately so it survives the re-renders needed for the DB
+# session lookup and localStorage component to fire.
 if "request_token" in st.query_params:
     st.session_state["_pending_rt"] = st.query_params["request_token"]
-    st.query_params.clear()          # clean the URL immediately
-
-# ── Step 0b: seed / refresh session-state keys ────────────────────────
-def _persist_local_keys(api_key: str, api_secret: str) -> None:
-    """
-    Save Kite credentials to both screener_keys.json and .env so they
-    survive page refreshes AND process restarts without the user re-entering them.
-    """
-    _ai.save_kite_keys(api_key, api_secret)
-    # Also patch .env in-place so os.getenv() picks them up on the next process start
-    try:
-        from pathlib import Path as _PL
-        _env_path = _PL(__file__).parent / ".env"
-        _lines = _env_path.read_text().splitlines() if _env_path.exists() else []
-        _new_lines = []
-        _wrote_k = _wrote_s = False
-        for _ln in _lines:
-            if _ln.startswith("KITE_API_KEY="):
-                _new_lines.append(f"KITE_API_KEY={api_key}")
-                _wrote_k = True
-            elif _ln.startswith("KITE_API_SECRET="):
-                _new_lines.append(f"KITE_API_SECRET={api_secret}")
-                _wrote_s = True
-            else:
-                _new_lines.append(_ln)
-        if not _wrote_k:
-            _new_lines.append(f"KITE_API_KEY={api_key}")
-        if not _wrote_s:
-            _new_lines.append(f"KITE_API_SECRET={api_secret}")
-        _env_path.write_text("\n".join(_new_lines) + "\n")
-    except Exception:
-        pass  # .env write failure is non-fatal; screener_keys.json is the primary fallback
+    st.query_params.clear()
 
 
-def _init_session_kite_state():
-    """
-    Merge localStorage values into session_state.
+# ── Helper: seed session_state Kite keys from a users-table row ───────
+def _load_kite_from_user(user: dict) -> None:
+    """Populate Kite session_state from a validated users row."""
+    st.session_state["kite_api_key"]    = user.get("kite_api_key",    "")
+    st.session_state["kite_api_secret"] = user.get("kite_api_secret", "")
+    st.session_state["kite_user_id"]    = user.get("kite_user_id",    "")
+    token = user.get("kite_access_token", "")
+    fresh = _auth.is_kite_token_fresh(user.get("kite_token_updated_at"))
+    if token and fresh:
+        st.session_state["kite_access_token"]  = token
+        st.session_state["kite_authenticated"] = True
+        try:
+            _kc_boot = KiteClient(
+                api_key    = user["kite_api_key"],
+                api_secret = user["kite_api_secret"],
+            )
+            _kc_boot.set_access_token(token)
+            st.session_state["kite_client"] = _kc_boot
+        except Exception:
+            pass
+    else:
+        st.session_state["kite_access_token"]  = ""
+        st.session_state["kite_authenticated"] = False
+        st.session_state.pop("kite_client", None)
+    st.session_state.setdefault("kite_user_name", "")
+    st.session_state.setdefault("kite_access_date", "")
 
-    On Cloud this runs on EVERY render (no early-exit guard) so that when
-    the localStorage component fires on render-2 after a fresh page load,
-    the values are picked up immediately without a manual st.rerun() loop.
 
-    On local dev it runs only once (env-var seeding is deterministic).
-    """
-    if not _ON_CLOUD:
-        # Local dev: seed once per session. Read .env first, then fall back
-        # to screener_keys.json so keys saved via the UI survive page refreshes.
-        if "kite_ss_initialized" in st.session_state:
-            return
-        _k_local = _os.getenv("KITE_API_KEY", "")
-        _s_local = _os.getenv("KITE_API_SECRET", "")
-        if not _k_local or not _s_local:
-            try:
-                import json as _json_loc
-                from pathlib import Path as _Path_loc
-                _kf = _Path_loc(__file__).parent / "screener_keys.json"
-                if _kf.exists():
-                    _stored = _json_loc.loads(_kf.read_text())
-                    _k_local = _k_local or _stored.get("kite_api_key", "")
-                    _s_local = _s_local or _stored.get("kite_api_secret", "")
-            except Exception:
-                pass
-        st.session_state.setdefault("kite_api_key",       _k_local)
-        st.session_state.setdefault("kite_api_secret",    _s_local)
-        st.session_state.setdefault("kite_access_token",  "")
-        st.session_state.setdefault("kite_access_date",   "")
-        st.session_state.setdefault("kite_user_id",       "")
-        st.session_state.setdefault("kite_user_name",     "")
-        st.session_state.setdefault("kite_authenticated", False)
-        st.session_state["kite_ss_initialized"] = True
-        return
+# ── Step 1: try auto-login from localStorage session token ────────────
+if "app_user" not in st.session_state:
+    _stored_token = _ls_get("screener_session")
+    if _stored_token:
+        _restored_user = db.get_user_by_session(_stored_token)
+        if _restored_user:
+            st.session_state["app_user"]          = _restored_user
+            st.session_state["_session_token"]    = _stored_token
+            _load_kite_from_user(_restored_user)
 
-    # ── Cloud path: always re-read from localStorage ────────────────
-    # ls_get returns None until the component JS fires (1 render after
-    # page load).  We only overwrite session_state when we get a real
-    # value so we don't clobber tokens that were just set by complete_auth().
-    _k     = _ls_get("kite_api_key")
-    _s     = _ls_get("kite_api_secret")
-    _token = _ls_get("kite_access_token")
-    _tdate = _ls_get("kite_access_date")
 
-    if _k:     st.session_state["kite_api_key"]       = _k
-    if _s:     st.session_state["kite_api_secret"]    = _s
-    if _token: st.session_state["kite_access_token"]  = _token
-    if _tdate: st.session_state["kite_access_date"]   = _tdate
+# ── Step 2: if still not logged in → show Login / Signup page ─────────
+def _show_auth_page() -> None:
+    """Full-screen login / signup. Calls st.stop() so the main app doesn't render."""
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"] {display: none;}
+        .auth-card {
+            background:#0f172a;border:1px solid #1e293b;border-radius:16px;
+            padding:40px 44px;max-width:480px;margin:60px auto 0;
+        }
+        .auth-title {font-size:1.6rem;font-weight:800;color:#f1f5f9;margin-bottom:4px;}
+        .auth-sub   {font-size:0.9rem;color:#64748b;margin-bottom:28px;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    # Ensure defaults exist so later code never gets a KeyError.
-    st.session_state.setdefault("kite_api_key",       "")
-    st.session_state.setdefault("kite_api_secret",    "")
-    st.session_state.setdefault("kite_access_token",  "")
-    st.session_state.setdefault("kite_access_date",   "")
-    st.session_state.setdefault("kite_user_id",       "")
-    st.session_state.setdefault("kite_user_name",     "")
-    st.session_state.setdefault("kite_authenticated", False)
+    _, _col, _ = st.columns([1, 2, 1])
+    with _col:
+        st.markdown(
+            '<div style="text-align:center;margin-bottom:8px;font-size:2.4rem;">📊</div>'
+            '<div style="text-align:center;font-size:1.5rem;font-weight:800;color:#f1f5f9'
+            ';margin-bottom:2px;">NSE Screener</div>'
+            '<div style="text-align:center;color:#64748b;font-size:0.85rem;margin-bottom:28px;">'
+            'Intraday · Swing · Scalping · Market Intel</div>',
+            unsafe_allow_html=True,
+        )
 
-_init_session_kite_state()
+        _auth_tab, _signup_tab = st.tabs(["🔑 Login", "✨ Sign Up"])
 
-_ss_api_key    = st.session_state.get("kite_api_key",    "")
-_ss_api_secret = st.session_state.get("kite_api_secret", "")
-_pending_rt    = st.session_state.get("_pending_rt",     "")
+        # ── LOGIN ──────────────────────────────────────────────────────────
+        with _auth_tab:
+            _login_user = st.text_input("Username", key="login_username",
+                                        placeholder="your username")
+            _login_pass = st.text_input("Password", type="password",
+                                        key="login_password",
+                                        placeholder="your password")
+            if st.button("Login", type="primary", use_container_width=True,
+                         key="login_btn"):
+                if not (_login_user.strip() and _login_pass.strip()):
+                    st.error("Enter username and password.")
+                else:
+                    _u = db.get_user_by_username(_login_user.strip())
+                    if not _u or not _auth.verify_password(_login_pass, _u["password_hash"]):
+                        st.error("Incorrect username or password.")
+                    else:
+                        _tok = _auth.new_session_token()
+                        db.create_session(_u["id"], _tok)
+                        db.update_last_login(_u["id"])
+                        st.session_state["app_user"]       = _u
+                        st.session_state["_session_token"] = _tok
+                        _ls_set("screener_session", _tok, expires_days=36500)
+                        _load_kite_from_user(_u)
+                        st.rerun()
 
-# ── Step 1 — exchange pending request_token (if we have keys) ─────────
-# Keys may arrive 1 render cycle after the OAuth redirect because the
-# localStorage component needs one render to fire.
+        # ── SIGN UP ────────────────────────────────────────────────────────
+        with _signup_tab:
+            _su_user = st.text_input("Choose a username", key="su_username",
+                                     placeholder="e.g. tuhin")
+            _su_pass = st.text_input("Choose a password", type="password",
+                                     key="su_password",
+                                     placeholder="min 6 characters")
+            _su_pass2 = st.text_input("Confirm password", type="password",
+                                      key="su_password2",
+                                      placeholder="repeat password")
+            st.markdown("##### Kite Connect credentials")
+            st.caption(
+                "Get these from [developers.kite.trade](https://developers.kite.trade) "
+                "→ My Apps. Set redirect URL to your app URL."
+            )
+            _su_key = st.text_input("Kite API Key", key="su_kite_key",
+                                    type="password", placeholder="Kite API Key")
+            _su_sec = st.text_input("Kite API Secret", key="su_kite_secret",
+                                    type="password", placeholder="Kite API Secret")
+
+            if st.button("Create Account", type="primary",
+                         use_container_width=True, key="signup_btn"):
+                _errs = []
+                if not _su_user.strip():      _errs.append("Username is required.")
+                if len(_su_pass) < 6:         _errs.append("Password must be at least 6 characters.")
+                if _su_pass != _su_pass2:     _errs.append("Passwords do not match.")
+                if not _su_key.strip():       _errs.append("Kite API Key is required.")
+                if not _su_sec.strip():       _errs.append("Kite API Secret is required.")
+                if _errs:
+                    for _e in _errs:
+                        st.error(_e)
+                else:
+                    try:
+                        _ph  = _auth.hash_password(_su_pass)
+                        _uid = db.create_user(
+                            _su_user.strip(), _ph,
+                            _su_key.strip(), _su_sec.strip(),
+                        )
+                        _tok = _auth.new_session_token()
+                        db.create_session(_uid, _tok)
+                        _new_u = db.get_user_by_username(_su_user.strip())
+                        st.session_state["app_user"]       = _new_u
+                        st.session_state["_session_token"] = _tok
+                        _ls_set("screener_session", _tok, expires_days=36500)
+                        _load_kite_from_user(_new_u)
+                        st.success(f"Welcome, {_su_user.strip()}! Redirecting…")
+                        st.rerun()
+                    except Exception as _se:
+                        if "unique" in str(_se).lower():
+                            st.error("That username is already taken. Choose another.")
+                        else:
+                            st.error(f"Sign-up failed: {_se}")
+
+    st.stop()
+
+
+if "app_user" not in st.session_state:
+    _show_auth_page()
+
+# ── From here: user is authenticated ──────────────────────────────────
+_app_user    = st.session_state["app_user"]
+_cur_user_id = st.session_state.get("kite_user_id", "") or _app_user.get("kite_user_id", "")
+
+# ── Kite OAuth callback: exchange pending request_token ───────────────
+_pending_rt    = st.session_state.get("_pending_rt", "")
+_ss_api_key    = st.session_state.get("kite_api_key",    "") or _app_user.get("kite_api_key",    "")
+_ss_api_secret = st.session_state.get("kite_api_secret", "") or _app_user.get("kite_api_secret", "")
+
 if _pending_rt and _ss_api_key and _ss_api_secret:
     with st.spinner("Completing Zerodha authentication…"):
         try:
             _client    = KiteClient(api_key=_ss_api_key, api_secret=_ss_api_secret)
             _acc_token = _client.complete_auth(_pending_rt)
             _profile   = _client.get_profile()
+            _kite_uid  = _profile.get("user_id",   "")
+            _kite_name = _profile.get("user_name", "")
             _today_str = date_type.today().isoformat()
+            # Persist token to DB (tied to user account)
+            db.update_kite_auth(_app_user["id"], _kite_uid, _acc_token)
+            # Update in-memory user dict
+            _app_user["kite_user_id"]          = _kite_uid
+            _app_user["kite_access_token"]     = _acc_token
+            st.session_state["app_user"]       = _app_user
             st.session_state["kite_access_token"]  = _acc_token
             st.session_state["kite_access_date"]   = _today_str
-            st.session_state["kite_user_id"]       = _profile.get("user_id",   "")
-            st.session_state["kite_user_name"]     = _profile.get("user_name", "")
+            st.session_state["kite_user_id"]       = _kite_uid
+            st.session_state["kite_user_name"]     = _kite_name
             st.session_state["kite_authenticated"] = True
             st.session_state["kite_client"]        = _client
             st.session_state.pop("_pending_rt", None)
-            if _ON_CLOUD:
-                _ls_set("kite_access_token", _acc_token,  expires_days=1)
-                _ls_set("kite_access_date",  _today_str,  expires_days=1)
             st.rerun()
         except Exception as _auth_err:
             st.session_state.pop("_pending_rt", None)
-            st.error(f"Authentication failed: {_auth_err}. Please try logging in again.")
+            st.error(f"Kite authentication failed: {_auth_err}")
             st.stop()
-
-# ── Step 2b — no keys at all: show onboarding ─────────────────────────
-# Note: if _pending_rt is set (user just came back from Zerodha), we still
-# show this form because localStorage may not have saved keys yet.
-# _pending_rt is preserved across the rerun — as soon as the user enters
-# their API Key + Secret and clicks Save, Step 1 above exchanges the token.
-if not (_ss_api_key and _ss_api_secret):
-    st.sidebar.title("⚙️ Setup")
-    st.sidebar.subheader("🔑 Zerodha Kite Connect")
-    if _pending_rt:
-        st.sidebar.warning(
-            "🔐 You've authenticated with Zerodha! Enter your API Key & Secret below "
-            "to finish connecting — we'll complete the login automatically."
-        )
-    else:
-        st.sidebar.caption(
-            "Enter your Kite Connect API credentials below to get started.  \n"
-            "Keys are stored **only in your browser** and never shared."
-        )
-    _setup_k = st.sidebar.text_input(
-        "API Key",
-        value="",
-        type="password",
-        key="setup_kite_key",
-        help="Found in your Kite Developer Console → My Apps → API Key",
-    )
-    _setup_s = st.sidebar.text_input(
-        "API Secret",
-        value="",
-        type="password",
-        key="setup_kite_secret",
-        help="Found in your Kite Developer Console → My Apps → API Secret",
-    )
-    if st.sidebar.button("💾 Save & Connect", type="primary",
-                         use_container_width=True, key="setup_kite_save"):
-        if _setup_k.strip() and _setup_s.strip():
-            st.session_state["kite_api_key"]    = _setup_k.strip()
-            st.session_state["kite_api_secret"] = _setup_s.strip()
-            if _ON_CLOUD:
-                _ls_set("kite_api_key",    _setup_k.strip(), expires_days=365)
-                _ls_set("kite_api_secret", _setup_s.strip(), expires_days=365)
-            else:
-                _persist_local_keys(_setup_k.strip(), _setup_s.strip())
-            st.rerun()
-        else:
-            st.sidebar.error("Both API Key and Secret are required.")
-
-    _, _oc, _ = st.columns([1, 3, 1])
-    with _oc:
-        st.markdown(
-            """
-            <div style="text-align:center;margin-top:60px;">
-              <div style="font-size:3rem;margin-bottom:8px;">📊</div>
-              <h2 style="color:#f1f5f9;margin-bottom:4px;">NSE Swing Screener</h2>
-              <p style="color:#64748b;margin-bottom:32px;">
-                Enter your Zerodha Kite Connect API credentials in the sidebar to get started.
-              </p>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        with st.expander("📋 How to get your API Key & Secret", expanded=True):
-            st.markdown(
-                """
-                1. Go to [developers.kite.trade](https://developers.kite.trade) and log in
-                2. Click **Create new app** → fill in a name (e.g. "Screener")
-                3. Set **Redirect URL** to:
-                   - Streamlit Cloud: `https://tuhinrawat-investscreener-app-miqshh.streamlit.app/`
-                   - Local dev: `http://127.0.0.1:8501`
-                4. Copy **API Key** and **API Secret** from the app detail page
-                5. Paste them in the **sidebar on the left** and click **Save & Connect**
-
-                Keys stay only in your browser and are never shared with other users.
-                """
-            )
-    st.stop()
 
 # ── Step 2 — restore session token if we have one for today ───────────
 if not st.session_state.get("kite_authenticated"):
@@ -648,6 +642,25 @@ if st.session_state.get("_paper_sync_date") != _today_str:
 # ============================================================
 st.sidebar.title("⚙️ Controls")
 
+# ── User profile + logout ──────────────────────────────────────────────
+with st.sidebar.expander(f"👤 {_app_user.get('username','').upper()}", expanded=False):
+    st.caption(f"**Account:** {_app_user.get('username','')}")
+    if _app_user.get("kite_user_id"):
+        st.caption(f"**Kite ID:** {_app_user['kite_user_id']}")
+    st.caption(
+        f"**Kite:** {'✅ Connected' if st.session_state.get('kite_authenticated') else '⚠️ Token expired'}"
+    )
+    if st.button("🚪 Logout", use_container_width=True, key="sidebar_logout_btn"):
+        _tok_to_del = st.session_state.get("_session_token", "")
+        if _tok_to_del:
+            db.delete_session(_tok_to_del)
+        _ls_del("screener_session")
+        for _k in ["app_user", "_session_token", "kite_authenticated", "kite_client",
+                   "kite_access_token", "kite_user_id", "kite_user_name"]:
+            st.session_state.pop(_k, None)
+        st.rerun()
+st.sidebar.markdown("---")
+
 # --- Refresh status
 last_update = db.get_last_metrics_update()
 st.sidebar.caption(f"**Last metrics update:** {last_update}")
@@ -873,12 +886,16 @@ with st.sidebar.expander("🔄 Update API Keys", expanded=False):
         if _upd_k.strip() and _upd_s.strip():
             st.session_state["kite_api_key"]    = _upd_k.strip()
             st.session_state["kite_api_secret"] = _upd_s.strip()
-            if _ON_CLOUD:
-                _ls_set("kite_api_key",    _upd_k.strip(), expires_days=365)
-                _ls_set("kite_api_secret", _upd_s.strip(), expires_days=365)
-            else:
-                _persist_local_keys(_upd_k.strip(), _upd_s.strip())
-            # Clear auth so new keys take effect on next Zerodha login
+            # Persist to users table (single source of truth)
+            try:
+                db.update_kite_credentials(
+                    _app_user["id"], _upd_k.strip(), _upd_s.strip()
+                )
+                _app_user["kite_api_key"]    = _upd_k.strip()
+                _app_user["kite_api_secret"] = _upd_s.strip()
+                st.session_state["app_user"] = _app_user
+            except Exception:
+                pass
             for _k in ("kite_authenticated", "kite_client", "kite_access_token",
                        "kite_access_date", "kite_user_id", "kite_user_name"):
                 st.session_state.pop(_k, None)
