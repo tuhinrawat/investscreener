@@ -627,7 +627,7 @@ if "scalp_triggered" not in st.session_state:
 if "scalp_open" not in st.session_state:
     st.session_state["scalp_open"] = {}
 
-_SCALP_ENTRY_CONFIRM_SECS = 10  # scalps need faster execution: 10 s (vs 30 s intraday)
+_SCALP_ENTRY_CONFIRM_SECS = 5   # 5 s confirmation (ORB signals are cleaner; was 10 s)
 
 # ── Market Intel state ────────────────────────────────────────────────────────
 # _intel_job_status : "idle" | "running" | "done" | "error: <msg>"
@@ -1336,34 +1336,18 @@ def _market_pulse_header():
     # ── Build metric card HTML helper ─────────────────────────────────────
     def _card(label: str, val: str, sub: str = "", sub_col: str = "#94a3b8",
               val_col: str = "#e2e8f0", badge: str = "", badge_col: str = "#64748b") -> str:
-        _badge_html = (
-            f'&nbsp;<span style="font-size:9px;padding:1px 5px;border-radius:3px;'
-            f'background:{badge_col}22;color:{badge_col};font-weight:600">{badge}</span>'
-            if badge else ""
-        )
-        _sub_html = (
-            f'<div style="font-size:10px;color:{sub_col};margin-top:1px">{sub}</div>'
-            if sub else ""
-        )
-        return f"""
-        <div style="display:flex;flex-direction:column;padding:4px 14px;
-                    border-left:1px solid #1e293b;min-width:70px;flex-shrink:0">
-            <div style="font-size:9px;color:#475569;text-transform:uppercase;
-                        letter-spacing:0.07em;margin-bottom:2px">{label}</div>
-            <div style="font-size:13px;font-weight:600;font-family:'SF Mono','Fira Code',monospace;
-                        color:{val_col};white-space:nowrap">{val}{_badge_html}</div>
-            {_sub_html}
-        </div>"""
+        _bdg = (f'&nbsp;<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:{badge_col}22;color:{badge_col};font-weight:600">{badge}</span>' if badge else "")
+        _sub = (f'<div style="font-size:10px;color:{sub_col};margin-top:1px">{sub}</div>' if sub else "")
+        return (f'<div style="display:flex;flex-direction:column;padding:4px 14px;border-left:1px solid #1e293b;min-width:70px;flex-shrink:0">'
+                f'<div style="font-size:9px;color:#475569;text-transform:uppercase;letter-spacing:0.07em;margin-bottom:2px">{label}</div>'
+                f'<div style="font-size:13px;font-weight:600;font-family:\'SF Mono\',\'Fira Code\',monospace;color:{val_col};white-space:nowrap">{val}{_bdg}</div>'
+                f'{_sub}</div>')
 
     def _divider() -> str:
         return '<div style="width:1px;background:#1e293b;margin:2px 4px;align-self:stretch"></div>'
 
     def _group_label(txt: str) -> str:
-        return (
-            f'<div style="font-size:9px;color:#334155;text-transform:uppercase;'
-            f'letter-spacing:0.09em;padding:0 10px 0 4px;writing-mode:vertical-lr;'
-            f'transform:rotate(180deg);align-self:center;flex-shrink:0">{txt}</div>'
-        )
+        return f'<div style="font-size:9px;color:#334155;text-transform:uppercase;letter-spacing:0.09em;padding:0 10px 0 4px;writing-mode:vertical-lr;transform:rotate(180deg);align-self:center;flex-shrink:0">{txt}</div>'
 
     # ── Assemble row ──────────────────────────────────────────────────────
     _nifty_val = f"{_nifty_ltp:,.0f}" if _nifty_ltp else "—"
@@ -1392,42 +1376,36 @@ def _market_pulse_header():
                 sub_col=_conf_color,
                 val_col=_bias_color)
         + (
-            f'<div style="display:flex;flex-direction:column;padding:4px 14px;'
-            f'border-left:1px solid #1e293b;min-width:120px;flex-shrink:0">'
-            f'<div style="font-size:9px;color:#475569;text-transform:uppercase;'
-            f'letter-spacing:0.07em;margin-bottom:4px">SECTOR LEADERS</div>'
-            f'<div style="display:flex;gap:6px;flex-wrap:wrap">{_sector_html or "<span style=\\'color:#334155;font-size:10px\\'>Run Market Intel →</span>"}</div>'
-            f'</div>'
+            '<div style="display:flex;flex-direction:column;padding:4px 14px;border-left:1px solid #1e293b;min-width:120px;flex-shrink:0">'
+            '<div style="font-size:9px;color:#475569;text-transform:uppercase;letter-spacing:0.07em;margin-bottom:4px">SECTOR LEADERS</div>'
+            f'<div style="display:flex;gap:6px;flex-wrap:wrap">{_sector_html or "<span style=\'color:#475569;font-size:10px\'>Run Market Intel</span>"}</div>'
+            '</div>'
             if _sectors or not _bias else ""
         )
         + (
-            f'<div style="padding:4px 10px;align-self:center;flex-shrink:0">'
-            f'<span style="font-size:9px;color:#334155">⏱ {_intel_age_str}</span></div>'
+            f'<div style="padding:4px 10px;align-self:center;flex-shrink:0"><span style="font-size:9px;color:#334155">⏱ {_intel_age_str}</span></div>'
             if _intel_age_str else ""
         )
     )
 
-    _row_html = f"""
-<div style="background:#080e1c;border:1px solid #1a2744;border-radius:8px;
-            padding:6px 4px;display:flex;align-items:stretch;gap:0;
-            overflow-x:auto;margin-bottom:6px;scrollbar-width:none">
-    {_cards_g1}
-    {_divider()}
-    {_cards_g2}
-    {_divider()}
-    {_cards_g3}
-</div>
-<style>
-/* hide horizontal scrollbar on market pulse row */
-div[data-testid="stMarkdownContainer"] div[style*="080e1c"]::-webkit-scrollbar {{
-    display: none;
-}}
-</style>"""
+    _row_html = (
+        '<div style="background:#080e1c;border:1px solid #1a2744;border-radius:8px;padding:6px 4px;display:flex;align-items:stretch;gap:0;overflow-x:auto;margin-bottom:6px;scrollbar-width:none">'
+        + _cards_g1 + _divider() + _cards_g2 + _divider() + _cards_g3
+        + '</div>'
+        + '<style>div[data-testid="stMarkdownContainer"] div[style*="080e1c"]::-webkit-scrollbar{display:none}</style>'
+    )
 
     # ── Layout: metrics row + refresh button ──────────────────────────────
     _mc, _bc = st.columns([22, 1])
     with _mc:
-        st.markdown(_row_html, unsafe_allow_html=True)
+        # Collapse all whitespace / newlines before passing to st.markdown.
+        # Streamlit's markdown parser treats lines with ≥4 leading spaces as
+        # code blocks, which causes indented HTML fragments to render as raw text.
+        import re as _re_mph
+        st.markdown(
+            _re_mph.sub(r"\s+", " ", _row_html).strip(),
+            unsafe_allow_html=True,
+        )
     with _bc:
         if st.button("⟳", key="_mph_refresh_btn",
                      help="Refresh VIX, BANK NIFTY open, USD/INR, Crude Oil, and AI Intel now"):
@@ -4689,7 +4667,7 @@ def _intraday_paper_banner():
 # ── FRAGMENT 2d: scalping signals (ORB — Opening Range Breakout) ─────────────
 # Refreshes every 5 s (slower than intraday because candle fetches are heavier).
 # ORB is valid only after 9:30 AM (need 15-min opening range to be complete).
-@st.fragment(run_every=3)
+@st.fragment(run_every=1)
 def _intraday_scalp_live():
     """
     Scalp signal tab — Opening Range Breakout with 3 confirmations:
@@ -4803,30 +4781,45 @@ def _intraday_scalp_live():
         if _avg_turnover_cr > 0 and _avg_turnover_cr < config.SCALP_MIN_TURNOVER_CR:
             continue
 
-        # ── Fetch / cache 5-min candles ───────────────────────────────────────
+        # ── Fetch / cache 5-min candles (30 s TTL) ───────────────────────────
+        # Indicators (ORB, VWAP, RSI) are recomputed only when candles change —
+        # NOT on every 1-second tick.  The hot path is LTP-vs-ORB, pure arithmetic.
         try:
             _candle_cache = st.session_state.setdefault("_scalp_candle_cache", {})
+            _indic_cache  = st.session_state.setdefault("_scalp_indic_cache", {})
             _cache_ts_key = f"_scalp_ts_{_sym}"
             _last_fetch   = st.session_state.get(_cache_ts_key)
             _candles_df   = _candle_cache.get(_sym, pd.DataFrame())
-            if (_last_fetch is None or
-                    (datetime.now(_IST) - _last_fetch).total_seconds() > 300
-                    or _candles_df.empty):
+            _need_refresh = (
+                _last_fetch is None
+                or (datetime.now(_IST) - _last_fetch).total_seconds() > 30
+                or _candles_df.empty
+            )
+            if _need_refresh:
                 _candles_df = _kc_scalp.get_today_candles(_tok, interval="5minute")
                 _candle_cache[_sym] = _candles_df
                 st.session_state[_cache_ts_key] = datetime.now(_IST)
+                if not _candles_df.empty:
+                    _avg_vol_c = float(_row.get("avg_volume") or 0)
+                    _indic_cache[_sym] = {
+                        "orb":       _ind.opening_range(_candles_df, minutes=config.SCALP_ORB_MINUTES),
+                        "vwap":      _ind.vwap(_candles_df),
+                        "rsi":       _ind.rsi_intraday(_candles_df),
+                        "vol_ratio": _ind.intraday_volume_ratio(_candles_df, _avg_vol_c) if _avg_vol_c > 0 else None,
+                    }
         except Exception:
             _candles_df = pd.DataFrame()
 
         if _candles_df.empty:
             continue
 
-        # ── Compute intraday indicators ───────────────────────────────────────
-        _orb_data   = _ind.opening_range(_candles_df, minutes=config.SCALP_ORB_MINUTES)
-        _vwap_price = _ind.vwap(_candles_df)
-        _rsi_5m     = _ind.rsi_intraday(_candles_df)
+        # ── Read cached indicators (recomputed only at 30 s cadence above) ─
+        _cached_ind = _indic_cache.get(_sym, {})
+        _orb_data   = _cached_ind.get("orb")
+        _vwap_price = _cached_ind.get("vwap")
+        _rsi_5m     = _cached_ind.get("rsi")
+        _vol_ratio  = _cached_ind.get("vol_ratio")
         _avg_vol    = float(_row.get("avg_volume") or 0)
-        _vol_ratio  = _ind.intraday_volume_ratio(_candles_df, _avg_vol) if _avg_vol > 0 else None
 
         if not _orb_data:
             continue
