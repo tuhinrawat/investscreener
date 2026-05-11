@@ -145,6 +145,25 @@ st.set_page_config(
     layout="wide",
 )
 
+# Suppress Streamlit's default fragment fade-out/fade-in animation.
+# Without this, every fragment re-render briefly blacks out its section.
+st.markdown(
+    """
+    <style>
+    /* Remove the opacity transition Streamlit applies during fragment updates */
+    [data-testid="stVerticalBlock"] > div,
+    .stFragment > div,
+    [data-testid="element-container"] {
+        animation: none !important;
+        transition: opacity 0ms !important;
+    }
+    /* Keep the custom component iframes invisible (they're 0-height utility iframes) */
+    iframe[title="kite_ls"] { display: none !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # ── Browser localStorage (per-user, per-domain) ──────────────────────
 # ls_get / ls_set / ls_delete persist values in the user's own browser.
 # No external package needed — just a tiny vanilla-JS Streamlit component.
@@ -3326,12 +3345,6 @@ def _delta_str(sym: str) -> str:
 # fragments to keep their selection state stable across re-renders.
 @st.fragment(run_every=1)
 def _live_signals_header():
-    # ── Web Worker keepalive ─────────────────────────────────────────────────
-    # st_autorefresh uses a Web Worker (background thread) that is NOT throttled
-    # by browser tab visibility policies — unlike fragment run_every which uses
-    # plain setInterval and pauses when the tab is hidden.
-    # Placing it here means it fires even when the user is on another screen.
-    _st_autorefresh(interval=1000, limit=None, key="_ltp_ar", debounce=True)
 
     base_df = st.session_state.get("_signals_base_df", pd.DataFrame())
     if base_df.empty or "swing_signal" not in base_df.columns:
@@ -4062,7 +4075,7 @@ def _trading_mode_control():
 
 
 # ── FRAGMENT 2b: paper-trade banner (auto-refresh, daily gate logic) ─────────
-@st.fragment(run_every=1)
+@st.fragment(run_every=2)
 def _intraday_paper_banner():
     """
     Renders the 'Paper Trades Today' dashboard strip and enforces the
@@ -4204,7 +4217,7 @@ def _intraday_paper_banner():
 # ── FRAGMENT 2d: scalping signals (ORB — Opening Range Breakout) ─────────────
 # Refreshes every 5 s (slower than intraday because candle fetches are heavier).
 # ORB is valid only after 9:30 AM (need 15-min opening range to be complete).
-@st.fragment(run_every=2)
+@st.fragment(run_every=3)
 def _intraday_scalp_live():
     """
     Scalp signal tab — Opening Range Breakout with 3 confirmations:
