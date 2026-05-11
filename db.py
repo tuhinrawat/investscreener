@@ -260,6 +260,7 @@ def init_schema():
                 kite_user_id        VARCHAR,
                 kite_order_id       VARCHAR,
                 kite_sl_order_id    VARCHAR,
+                kite_target_order_id VARCHAR,
                 kite_status         VARCHAR,
                 quantity            INTEGER,
                 actual_entry        DOUBLE PRECISION,
@@ -352,9 +353,10 @@ def init_schema():
         _add_column_if_missing(cur, "computed_metrics", "intraday_s3",       "DOUBLE PRECISION")
         _add_column_if_missing(cur, "computed_metrics", "intraday_t2",       "DOUBLE PRECISION")
         _add_column_if_missing(cur, "computed_metrics", "intraday_gap_flag", "VARCHAR")
-        _add_column_if_missing(cur, "computed_metrics", "intraday_nifty_gate","VARCHAR")
-        _add_column_if_missing(cur, "trade_log",        "intraday_confidence","INTEGER")
-        _add_column_if_missing(cur, "trade_log",        "rec_t2",            "DOUBLE PRECISION")
+        _add_column_if_missing(cur, "computed_metrics",  "intraday_nifty_gate",    "VARCHAR")
+        _add_column_if_missing(cur, "trade_log",         "intraday_confidence",    "INTEGER")
+        _add_column_if_missing(cur, "trade_log",         "rec_t2",                 "DOUBLE PRECISION")
+        _add_column_if_missing(cur, "trade_log",         "kite_target_order_id",   "VARCHAR")
 
         # One-time migration: UTC → IST shift on logged_at
         cur.execute("SELECT value FROM _db_meta WHERE key = 'logged_at_utc_to_ist_done'")
@@ -689,13 +691,14 @@ def log_trade(trade: dict) -> int:
                 setup_type, signal_type,
                 rec_entry, rec_stop, rec_t1, rec_t2, rec_rr, rec_reason,
                 rec_composite_score, rec_ai_score,
-                kite_user_id, kite_order_id, kite_sl_order_id, kite_status,
+                kite_user_id, kite_order_id, kite_sl_order_id, kite_target_order_id,
+                kite_status,
                 quantity, actual_entry, actual_exit, status, notes,
                 pnl_amount, pnl_pct, slippage_entry_pct, rr_realised,
                 is_paper_trade, intraday_confidence, logged_at
             ) VALUES (
                 %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
             ) RETURNING id
         """, [
             trade.get("trade_date"),
@@ -714,6 +717,7 @@ def log_trade(trade: dict) -> int:
             trade.get("kite_user_id"),
             trade.get("kite_order_id"),
             trade.get("kite_sl_order_id"),
+            trade.get("kite_target_order_id"),
             trade.get("kite_status"),
             trade.get("quantity"),
             trade.get("actual_entry"),
@@ -1210,13 +1214,15 @@ def get_open_real_trades(user_id: str = "") -> list:
             clauses.append("kite_user_id = %s")
             params.append(user_id)
         cur.execute(
-            "SELECT id, tradingsymbol, signal_type, actual_entry, rec_stop "
+            "SELECT id, tradingsymbol, signal_type, actual_entry, rec_stop, "
+            "kite_sl_order_id, kite_target_order_id "
             "FROM trade_log WHERE " + " AND ".join(clauses) + " ORDER BY id",
             params,
         )
         return [
             {"id": r[0], "tradingsymbol": r[1], "signal_type": r[2],
-             "actual_entry": r[3], "rec_stop": r[4]}
+             "actual_entry": r[3], "rec_stop": r[4],
+             "kite_sl_order_id": r[5], "kite_target_order_id": r[6]}
             for r in cur.fetchall()
         ]
     finally:

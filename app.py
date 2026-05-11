@@ -3191,6 +3191,29 @@ with tab_screener:
 _IST = timezone(timedelta(hours=5, minutes=30))
 
 
+def _cancel_companion_orders(kc, trade_id: int, sl_oid=None, tgt_oid=None) -> None:
+    """
+    Cancel the exchange-side SL and/or target companion orders for a real trade.
+    Called whenever a real trade is exited (target hit, stop hit, kill switch,
+    EOD force-close, manual close).  Silently ignores errors — a companion order
+    that is already COMPLETE or CANCELLED will just raise an exception we swallow.
+    """
+    if kc is None or not getattr(kc, "authenticated", False):
+        return
+    # Prefer caller-supplied IDs; fall back to session state cache
+    companions = st.session_state.get("_real_companions", {}).get(trade_id, {})
+    _sl  = sl_oid  or companions.get("sl")
+    _tgt = tgt_oid or companions.get("tgt")
+    for _oid in (_sl, _tgt):
+        if _oid:
+            try:
+                kc.cancel_order(_oid)
+            except Exception:
+                pass
+    # Clear the cache entry
+    st.session_state.get("_real_companions", {}).pop(trade_id, None)
+
+
 def _is_market_open() -> bool:
     """True only during NSE cash market hours (9:15–15:30 IST, Mon–Fri)."""
     now = datetime.now(_IST)
@@ -3755,7 +3778,12 @@ def _live_signals_header():
                 _kpos    = _day_pos.get(_rt_sym)
                 if not _kpos:
                     # Not found in Kite positions — may have been fully squared silently.
-                    # Close at last known LTP to avoid leaving DB in OPEN state.
+                    # Cancel companion orders and close DB record.
+                    _cancel_companion_orders(
+                        _kc_sync, _rt_id,
+                        sl_oid  = _rt.get("kite_sl_order_id"),
+                        tgt_oid = _rt.get("kite_target_order_id"),
+                    )
                     _fallback_ltp = _live_ltp_now.get(_rt_sym, 0)
                     if _fallback_ltp:
                         try:
@@ -3779,6 +3807,12 @@ def _live_signals_header():
                     if _exit_px:
                         try:
                             _kpnl = float(_kpos.get("realised") or _kpos.get("pnl") or 0)
+                            # Cancel whichever companion order didn't fire
+                            _cancel_companion_orders(
+                                _kc_sync, _rt_id,
+                                sl_oid  = _rt.get("kite_sl_order_id"),
+                                tgt_oid = _rt.get("kite_target_order_id"),
+                            )
                             db.close_trade(
                                 _rt_id, _exit_px, "CLOSED",
                                 f"🤖 Kite auto-squared 3:20 PM @ ₹{_exit_px:.2f} "
@@ -3899,10 +3933,17 @@ def _trading_mode_control():
                 ] if not _open_real.empty and "kite_order_id" in _open_real.columns else pd.DataFrame()
                 for _, _rrow in _real_open_rows.iterrows():
                     _oid = _rrow.get("kite_order_id")
+                    _tid = int(_rrow["id"])
                     try:
                         _kc_ctrl.cancel_order(_oid)
+                        # Cancel companion SL + target orders so they don't orphan
+                        _cancel_companion_orders(
+                            _kc_ctrl, _tid,
+                            sl_oid  = _rrow.get("kite_sl_order_id"),
+                            tgt_oid = _rrow.get("kite_target_order_id"),
+                        )
                         db.close_trade(
-                            int(_rrow["id"]), 0.0, "CANCELLED",
+                            _tid, 0.0, "CANCELLED",
                             "🔴 Kill switch — Kite order cancelled"
                         )
                         _cancelled_real += 1
@@ -4721,7 +4762,12 @@ def _intraday_long_live():
                         # In practice Kite fills near-instantly for liquid stocks so
                         # this is safe. For a stricter guarantee, poll order status
                         # and place SL only once status = "COMPLETE".
-                        _sl_oid = None
+                        _t1_val  = float(r.get("intraday_t1") or 0)
+                        # ── Exchange-side companion orders (SL + Target) ──────────
+                        # Both live on Zerodha's servers — protect the position
+                        # even if the browser is closed after entry fills.
+                        _sl_oid  = None
+                        _tgt_oid = None
                         if _stop_val:
                             try:
                                 _sl_oid = _kc_rt.place_order(
@@ -4735,32 +4781,50 @@ def _intraday_long_live():
                                 )
                             except Exception:
                                 pass
+                        if _t1_val and _t1_val > _trigger_price:
+                            try:
+                                _tgt_oid = _kc_rt.place_order(
+                                    tradingsymbol    = sym,
+                                    qty              = _pqty,
+                                    transaction_type = "SELL",
+                                    order_type       = "LIMIT",
+                                    product          = "MIS",
+                                    price            = _t1_val,
+                                    tag              = "scr_tgt",
+                                )
+                            except Exception:
+                                pass
                         _rid = db.log_trade({
-                            "trade_date":          datetime.now(_IST).date(),
-                            "tradingsymbol":       sym,
-                            "instrument_token":    int(r.get("instrument_token") or 0),
-                            "setup_type":          "INTRADAY",
-                            "signal_type":         "BUY_ABOVE",
-                            "rec_entry":           entry_val,
-                            "rec_stop":            _stop_val,
-                            "rec_t1":              float(r.get("intraday_t1") or 0),
-                            "rec_rr":              None,
-                            "rec_reason":          str(r.get("intraday_reason") or "")[:200],
-                            "rec_composite_score": r.get("composite_score"),
-                            "kite_user_id":        _cur_user_id,
-                            "kite_order_id":       _oid,
-                            "kite_sl_order_id":    _sl_oid,
-                            "kite_status":         "OPEN",
-                            "quantity":            _pqty,
-                            "actual_entry":        _trigger_price,
-                            "status":              "OPEN",
-                            "notes":               f"💸 Real — auto TRIGGERED @ ₹{_trigger_price:.2f} (conf {confidence}/10, ₹{_cap_this_trade:,})",
-                            "is_paper_trade":      False,
-                            "intraday_confidence": confidence,
+                            "trade_date":              datetime.now(_IST).date(),
+                            "tradingsymbol":           sym,
+                            "instrument_token":        int(r.get("instrument_token") or 0),
+                            "setup_type":              "INTRADAY",
+                            "signal_type":             "BUY_ABOVE",
+                            "rec_entry":               entry_val,
+                            "rec_stop":                _stop_val,
+                            "rec_t1":                  _t1_val,
+                            "rec_rr":                  None,
+                            "rec_reason":              str(r.get("intraday_reason") or "")[:200],
+                            "rec_composite_score":     r.get("composite_score"),
+                            "kite_user_id":            _cur_user_id,
+                            "kite_order_id":           _oid,
+                            "kite_sl_order_id":        _sl_oid,
+                            "kite_target_order_id":    _tgt_oid,
+                            "kite_status":             "OPEN",
+                            "quantity":                _pqty,
+                            "actual_entry":            _trigger_price,
+                            "status":                  "OPEN",
+                            "notes":                   f"💸 Real — auto TRIGGERED @ ₹{_trigger_price:.2f} (conf {confidence}/10, ₹{_cap_this_trade:,}) | SL={_sl_oid} TGT={_tgt_oid}",
+                            "is_paper_trade":          False,
+                            "intraday_confidence":     confidence,
                         })
+                        # Track companion order IDs in session state for fast cancel
+                        st.session_state.setdefault("_real_companions", {})[_rid] = {
+                            "sl": _sl_oid, "tgt": _tgt_oid
+                        }
                         st.session_state["real_triggered"][_real_key] = _rid
                         _confirm_map.pop(sym, None)  # reset timer after firing
-                        st.toast(f"💸 Real BUY [{_conf_tier}]: {sym} @ ₹{_trigger_price:.2f} × {_pqty} | Kite {_oid}", icon="💸")
+                        st.toast(f"💸 Real BUY [{_conf_tier}]: {sym} @ ₹{_trigger_price:.2f} × {_pqty} | SL={_sl_oid} TGT={_tgt_oid}", icon="💸")
                     except Exception as _re:
                         st.toast(f"⚠ Real order failed for {sym}: {_re}", icon="⚠️")
 
@@ -5201,8 +5265,10 @@ def _intraday_short_live():
                             price            = round(_trigger_price * 0.999, 1),
                             tag              = "scr_intra",
                         )
-                        # SL-M cover order placed after entry
-                        _sl_oid = None
+                        _t1_val_s = float(r.get("intraday_t1") or 0)
+                        # ── Exchange-side companion orders (SL + Target) ──────────
+                        _sl_oid  = None
+                        _tgt_oid = None
                         if _stop_val:
                             try:
                                 _sl_oid = _kc_rt.place_order(
@@ -5216,32 +5282,49 @@ def _intraday_short_live():
                                 )
                             except Exception:
                                 pass
+                        if _t1_val_s and _t1_val_s < _trigger_price:
+                            try:
+                                _tgt_oid = _kc_rt.place_order(
+                                    tradingsymbol    = sym,
+                                    qty              = _pqty,
+                                    transaction_type = "BUY",
+                                    order_type       = "LIMIT",
+                                    product          = "MIS",
+                                    price            = _t1_val_s,
+                                    tag              = "scr_tgt",
+                                )
+                            except Exception:
+                                pass
                         _rid = db.log_trade({
-                            "trade_date":          datetime.now(_IST).date(),
-                            "tradingsymbol":       sym,
-                            "instrument_token":    int(r.get("instrument_token") or 0),
-                            "setup_type":          "INTRADAY",
-                            "signal_type":         "SELL_BELOW",
-                            "rec_entry":           entry_val,
-                            "rec_stop":            _stop_val,
-                            "rec_t1":              float(r.get("intraday_t1") or 0),
-                            "rec_rr":              None,
-                            "rec_reason":          str(r.get("intraday_reason") or "")[:200],
-                            "rec_composite_score": r.get("composite_score"),
-                            "kite_user_id":        _cur_user_id,
-                            "kite_order_id":       _oid,
-                            "kite_sl_order_id":    _sl_oid,
-                            "kite_status":         "OPEN",
-                            "quantity":            _pqty,
-                            "actual_entry":        _trigger_price,
-                            "status":              "OPEN",
-                            "notes":               f"💸 Real — auto TRIGGERED @ ₹{_trigger_price:.2f} (conf {confidence}/10, ₹{_cap_this_trade:,})",
-                            "is_paper_trade":      False,
-                            "intraday_confidence": confidence,
+                            "trade_date":              datetime.now(_IST).date(),
+                            "tradingsymbol":           sym,
+                            "instrument_token":        int(r.get("instrument_token") or 0),
+                            "setup_type":              "INTRADAY",
+                            "signal_type":             "SELL_BELOW",
+                            "rec_entry":               entry_val,
+                            "rec_stop":                _stop_val,
+                            "rec_t1":                  _t1_val_s,
+                            "rec_rr":                  None,
+                            "rec_reason":              str(r.get("intraday_reason") or "")[:200],
+                            "rec_composite_score":     r.get("composite_score"),
+                            "kite_user_id":            _cur_user_id,
+                            "kite_order_id":           _oid,
+                            "kite_sl_order_id":        _sl_oid,
+                            "kite_target_order_id":    _tgt_oid,
+                            "kite_status":             "OPEN",
+                            "quantity":                _pqty,
+                            "actual_entry":            _trigger_price,
+                            "status":                  "OPEN",
+                            "notes":                   f"💸 Real — auto TRIGGERED @ ₹{_trigger_price:.2f} (conf {confidence}/10, ₹{_cap_this_trade:,}) | SL={_sl_oid} TGT={_tgt_oid}",
+                            "is_paper_trade":          False,
+                            "intraday_confidence":     confidence,
                         })
+                        st.session_state.setdefault("_real_companions", {})[_rid] = {
+                            "sl": _sl_oid, "tgt": _tgt_oid
+                        }
                         st.session_state["real_triggered"][_real_key] = _rid
                         _confirm_map_s.pop(_short_key, None)
-                        st.toast(f"💸 Real SHORT [{_conf_tier}]: {sym} @ ₹{_trigger_price:.2f} × {_pqty} | Kite {_oid}", icon="💸")
+                        st.toast(f"💸 Real SHORT [{_conf_tier}]: {sym} @ ₹{_trigger_price:.2f} × {_pqty} | SL={_sl_oid} TGT={_tgt_oid}", icon="💸")
                     except Exception as _re:
                         st.toast(f"⚠ Real short order failed for {sym}: {_re}", icon="⚠️")
 
