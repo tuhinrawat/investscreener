@@ -1303,11 +1303,40 @@ def _market_pulse_header():
     # Build reverse map: yf_symbol → (label, region, flag)
     _sym_to_meta = {v[0]: (k, v[1], v[2]) for k, v in _GLOBAL_META.items()}
 
+    # ── Time-based market-open helper (source of truth for OPEN/CLOSED badge) ──
+    # Pure stdlib — no pytz needed. Convert UTC now to each region's offset.
+    def _region_open(region: str) -> bool:
+        """Return True if the region's primary exchange is in regular session now."""
+        _utcnow = datetime.utcnow()
+        _wd     = _utcnow.weekday()   # 0=Mon … 6=Sun
+        if _wd >= 5:                  # weekend everywhere
+            return False
+        try:
+            if region == "US":
+                # ET = UTC-5 (EST) / UTC-4 (EDT); US DST active Mar–Nov
+                # Simple approximation: if UTC month in [3..10] use -4 else -5
+                _off = -4 if 3 <= _utcnow.month <= 10 else -5
+                _loc = _utcnow + timedelta(hours=_off)
+                return (9, 30) <= (_loc.hour, _loc.minute) < (16, 0)
+            if region == "EU":
+                # CET/CEST: UTC+1 / UTC+2; exchanges open 08:00–17:30 local
+                _off = 2 if 3 <= _utcnow.month <= 10 else 1
+                _loc = _utcnow + timedelta(hours=_off)
+                return (8, 0) <= (_loc.hour, _loc.minute) < (17, 30)
+            if region == "ASIA":
+                # HK/SH/TK ≈ UTC+8 / UTC+9; broad 09:00–15:30 window
+                _loc = _utcnow + timedelta(hours=8)
+                return (9, 0) <= (_loc.hour, _loc.minute) < (15, 30)
+        except Exception:
+            pass
+        return False
+
     if _force or (_now_ts - st.session_state.get("_global_idx_ts", 0) > 300):
         _g_data: dict = {}
         try:
-            _syms_csv = ",".join(v[0] for v in _GLOBAL_META.values())
-            # Use richer headers to avoid Yahoo rate-limiting / CDN stale responses
+            import urllib.parse as _ulp
+            # Encode each symbol so ^ → %5E; keep commas as separator
+            _syms_csv = ",".join(_ulp.quote(v[0], safe="") for v in _GLOBAL_META.values())
             _YF_HDR = {
                 "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                                "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -1317,25 +1346,26 @@ def _market_pulse_header():
                 "Referer": "https://finance.yahoo.com",
             }
             _qr = _rqm.get(
-                f"https://query1.finance.yahoo.com/v7/finance/quote"
-                f"?symbols={_syms_csv}&fields=regularMarketPrice,"
-                f"regularMarketChangePercent,marketState,shortName",
+                f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={_syms_csv}",
                 headers=_YF_HDR, timeout=8,
             )
             _quotes = (_qr.json().get("quoteResponse", {}).get("result") or [])
             for _q in _quotes:
                 _qsym  = _q.get("symbol", "")
                 _qltp  = _q.get("regularMarketPrice")
-                _qpct  = _q.get("regularMarketChangePercent")   # already in %
-                _qstate= _q.get("marketState", "CLOSED")
+                _qpct  = _q.get("regularMarketChangePercent")
+                # Use time-based open check as primary; fall back to Yahoo's field
+                _ystate = _q.get("marketState", "CLOSED")
                 if _qsym in _sym_to_meta and _qltp is not None:
                     _gname, _greg, _gflag = _sym_to_meta[_qsym]
+                    _computed_open = _region_open(_greg)
                     _g_data[_gname] = {
-                        "ltp":      float(_qltp),
-                        "pct":      round(float(_qpct), 2) if _qpct is not None else None,
-                        "region":   _greg,
-                        "flag":     _gflag,
-                        "mkt_state": _qstate,
+                        "ltp":       float(_qltp),
+                        "pct":       round(float(_qpct), 2) if _qpct is not None else None,
+                        "region":    _greg,
+                        "flag":      _gflag,
+                        # REGULAR if our clock says open; else use Yahoo's state
+                        "mkt_state": "REGULAR" if _computed_open else _ystate,
                     }
         except Exception:
             pass
