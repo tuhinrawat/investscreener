@@ -1435,11 +1435,16 @@ def _market_pulse_header():
         except Exception:
             pass
 
-    # If force-refresh, bust FX/commodity + sparkline + sector + global cache
+    # If force-refresh: reset TTL timestamps so every block re-fetches immediately,
+    # but DO NOT delete the cached price dicts — they serve as fallback if the
+    # new fetch fails (network hiccup, Yahoo rate-limit, etc.) so the UI never
+    # goes blank mid-session.
     if _force:
-        for _k in ("_usdinr_ltp", "_crude_usd", "_crude_ltp", "_brent_usd", "_natgas_usd", "_nifty_pcr",
-                   "_spark_data", "_spark_ts", "_sect_perf", "_sect_ts",
-                   "_global_idx", "_global_idx_ts"):
+        for _k in ("_vix_ts", "_nidx_prevclose_date", "_sect_ts",
+                   "_spark_ts", "_global_idx_ts", "_mph_intel_ts"):
+            st.session_state.pop(_k, None)
+        # FX/commodity scalars are cheap to re-fetch; clear so fresh values show
+        for _k in ("_usdinr_ltp", "_crude_usd", "_crude_ltp", "_brent_usd", "_natgas_usd"):
             st.session_state.pop(_k, None)
 
     # ── Read all values from session state ───────────────────────────────
