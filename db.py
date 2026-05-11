@@ -52,10 +52,21 @@ _pool: psycopg2.pool.ThreadedConnectionPool | None = None
 def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
     global _pool, _DATABASE_URL
     if not _DATABASE_URL:
-        # Try loading from .env at runtime (local dev)
+        # 1. Try Streamlit secrets (cloud deployment)
+        try:
+            import streamlit as _st_inner
+            _u = _st_inner.secrets.get("DATABASE_URL", "")
+            if _u:
+                _DATABASE_URL = _u
+                os.environ["DATABASE_URL"] = _u
+        except Exception:
+            pass
+    if not _DATABASE_URL:
+        # 2. Try .env with explicit path (local dev, CWD-independent)
         try:
             from dotenv import load_dotenv
-            load_dotenv(override=False)
+            from pathlib import Path as _PL
+            load_dotenv(dotenv_path=_PL(__file__).parent / ".env", override=False)
             _DATABASE_URL = os.environ.get("DATABASE_URL", "")
         except ImportError:
             pass

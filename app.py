@@ -22,8 +22,8 @@ import os as _os
 # db.get_conn() can build the connection pool before any table function runs.
 # Priority: already in env > Streamlit secrets > .env file.
 if not _os.environ.get("DATABASE_URL"):
+    # 1. Streamlit Cloud secrets
     try:
-        # Streamlit Cloud: secrets are in st.secrets
         import streamlit as _st_boot
         _db_url = _st_boot.secrets.get("DATABASE_URL", "")
         if _db_url:
@@ -31,9 +31,11 @@ if not _os.environ.get("DATABASE_URL"):
     except Exception:
         pass
 if not _os.environ.get("DATABASE_URL"):
+    # 2. .env file — explicit path so it works regardless of CWD
     try:
         from dotenv import load_dotenv as _lde
-        _lde(override=False)
+        from pathlib import Path as _PL_boot
+        _lde(dotenv_path=_PL_boot(__file__).parent / ".env", override=False)
     except ImportError:
         pass
 
