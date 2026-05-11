@@ -6255,10 +6255,14 @@ def _show_algo_readjust_dialog(uid: str) -> None:
 # ============================================================
 # ACTIVITY LOG — live fragment (stats + table + paper perf)
 # ============================================================
-@st.fragment(run_every=5)
+@st.fragment(run_every=30)
 def _activity_log_live():
-    """Auto-refreshes every 5 s: portfolio snapshot, summary banners, trade table."""
+    """Auto-refreshes every 30 s: portfolio snapshot, summary banners, trade table.
+    Forced-stale immediately when a trade is closed/edited via _actlog_stale flag."""
     _uid = st.session_state.get("kite_user_id", "")
+
+    # ── Consume the stale flag once at the top so both cache blocks share it ──
+    _actlog_stale = st.session_state.pop("_actlog_stale", False)
 
     # ── Market-hours gate: skip live Kite API calls outside 9:00–15:35 IST ──
     _now_act = datetime.now(_IST)
@@ -6320,29 +6324,52 @@ def _activity_log_live():
                 st.rerun()
 
     # ── PORTFOLIO SNAPSHOT — live Kite margin + holdings + positions ────────
+    # Cached for 60 s to avoid hitting Kite API on every fragment tick.
     _pf_kc = st.session_state.get("kite_client")
     _pf_ok = _pf_kc is not None and getattr(_pf_kc, "authenticated", False) and _act_in_market
     if _pf_ok:
-        try:
-            _margins   = _pf_kc.get_margins("equity")
-            _eq        = _margins.get("equity", _margins)
-            _avail     = _eq.get("available", {})
-            _used      = _eq.get("used", {})
-            _net_bal   = float(_eq.get("net", 0) or 0)
-            _live_bal  = float(_avail.get("live_balance", _avail.get("cash", 0)) or 0)
-            _used_deb  = float(_used.get("debits", 0) or 0)
-            _holdings  = _pf_kc.get_holdings()
-            _h_value   = sum(float(h.get("last_price", 0)) * float(h.get("quantity", 0))
-                             for h in _holdings if h.get("quantity", 0) > 0)
-            _h_pnl     = sum(float(h.get("pnl", 0)) for h in _holdings)
-            _h_day_pnl = sum(float(h.get("day_change", 0)) * float(h.get("quantity", 0))
-                             for h in _holdings if h.get("quantity", 0) > 0)
-            _h_count   = sum(1 for h in _holdings if h.get("quantity", 0) > 0)
-            _positions = _pf_kc.get_positions()
-            _net_pos   = _positions.get("net", []) if isinstance(_positions, dict) else []
-            _pos_open  = [p for p in _net_pos if p.get("quantity", 0) != 0]
-            _pos_value = sum(abs(float(p.get("value", 0))) for p in _pos_open)
-            _pos_m2m   = sum(float(p.get("m2m", 0)) for p in _net_pos)
+        _pf_cache_age = (
+            (_now_act - st.session_state["_pf_snap_ts"]).total_seconds()
+            if st.session_state.get("_pf_snap_ts") else 999
+        )
+        _pf_stale = _actlog_stale or _pf_cache_age > 60
+        if _pf_stale or not st.session_state.get("_pf_snap"):
+            try:
+                _margins   = _pf_kc.get_margins("equity")
+                _eq        = _margins.get("equity", _margins)
+                _avail     = _eq.get("available", {})
+                _used      = _eq.get("used", {})
+                _holdings  = _pf_kc.get_holdings()
+                _positions = _pf_kc.get_positions()
+                _net_pos   = _positions.get("net", []) if isinstance(_positions, dict) else []
+                st.session_state["_pf_snap"] = {
+                    "net_bal":   float(_eq.get("net", 0) or 0),
+                    "live_bal":  float(_avail.get("live_balance", _avail.get("cash", 0)) or 0),
+                    "used_deb":  float(_used.get("debits", 0) or 0),
+                    "h_value":   sum(float(h.get("last_price", 0)) * float(h.get("quantity", 0)) for h in _holdings if h.get("quantity", 0) > 0),
+                    "h_pnl":     sum(float(h.get("pnl", 0)) for h in _holdings),
+                    "h_day_pnl": sum(float(h.get("day_change", 0)) * float(h.get("quantity", 0)) for h in _holdings if h.get("quantity", 0) > 0),
+                    "h_count":   sum(1 for h in _holdings if h.get("quantity", 0) > 0),
+                    "pos_open":  [p for p in _net_pos if p.get("quantity", 0) != 0],
+                    "pos_value": sum(abs(float(p.get("value", 0))) for p in _net_pos if p.get("quantity", 0) != 0),
+                    "pos_m2m":   sum(float(p.get("m2m", 0)) for p in _net_pos),
+                }
+                st.session_state["_pf_snap_ts"] = _now_act
+            except Exception as _pf_err:
+                st.caption(f"⚠ Portfolio data unavailable: {_pf_err}")
+                st.session_state.pop("_pf_snap", None)
+        _pf = st.session_state.get("_pf_snap")
+        if _pf:
+            _net_bal   = _pf["net_bal"]
+            _live_bal  = _pf["live_bal"]
+            _used_deb  = _pf["used_deb"]
+            _h_value   = _pf["h_value"]
+            _h_pnl     = _pf["h_pnl"]
+            _h_day_pnl = _pf["h_day_pnl"]
+            _h_count   = _pf["h_count"]
+            _pos_open  = _pf["pos_open"]
+            _pos_value = _pf["pos_value"]
+            _pos_m2m   = _pf["pos_m2m"]
             _pf_m2m_c  = "#22c55e" if _pos_m2m >= 0 else "#ef4444"
             _pf_hp_c   = "#22c55e" if _h_pnl   >= 0 else "#ef4444"
             st.markdown(
@@ -6370,25 +6397,19 @@ def _activity_log_live():
                 f'</div>',
                 unsafe_allow_html=True,
             )
-        except Exception as _pf_err:
-            st.caption(f"⚠ Portfolio data unavailable: {_pf_err}")
 
     # ── Summary banners: Paper | Real ──────────────────────────────────────
-    # Cache stats for 10 s — they only change when trades are logged/closed.
-    # Set st.session_state["_actlog_stale"] = True anywhere a trade is changed
-    # to force an immediate refresh.
-    _actlog_now    = datetime.now(_IST)
+    # Cache stats for 30 s. Set _actlog_stale = True to force immediate refresh.
     _actlog_last   = st.session_state.get("_actlog_db_ts")
-    _actlog_age    = (_actlog_now - _actlog_last).total_seconds() if _actlog_last else 999
-    _actlog_stale  = st.session_state.pop("_actlog_stale", False)  # consume flag
-    if _actlog_stale or _actlog_age > 10 or not st.session_state.get("_actlog_stats_a"):
+    _actlog_age    = (_now_act - _actlog_last).total_seconds() if _actlog_last else 999
+    if _actlog_stale or _actlog_age > 30 or not st.session_state.get("_actlog_stats_a"):
         _stats_paper = db.get_trade_stats(user_id=_uid, is_paper=True)
         _stats_real  = db.get_trade_stats(user_id=_uid, is_paper=False)
         _stats_all   = db.get_trade_stats(user_id=_uid)
         st.session_state["_actlog_stats_p"]  = _stats_paper
         st.session_state["_actlog_stats_r"]  = _stats_real
         st.session_state["_actlog_stats_a"]  = _stats_all
-        st.session_state["_actlog_db_ts"]    = _actlog_now
+        st.session_state["_actlog_db_ts"]    = _now_act
     else:
         _stats_paper = st.session_state["_actlog_stats_p"]
         _stats_real  = st.session_state["_actlog_stats_r"]
@@ -6522,8 +6543,8 @@ def _activity_log_live():
 
     st.markdown("---")
 
-    # ── Load trade log from cache (10s TTL) ─────────────────────────────────
-    if _actlog_stale or _actlog_age > 10 or "actlog_log_df" not in st.session_state:
+    # ── Load trade log from cache (30s TTL) ─────────────────────────────────
+    if _actlog_stale or _actlog_age > 30 or "actlog_log_df" not in st.session_state:
         _log_df_all = db.load_trade_log(user_id=_uid)
         st.session_state["actlog_log_df"] = _log_df_all
     else:
