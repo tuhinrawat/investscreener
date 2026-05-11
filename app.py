@@ -3293,16 +3293,16 @@ def _delta_str(sym: str) -> str:
 
 
 # ── FRAGMENT 1: live header (badge + LTP fetch + metric pills) ────────────────
-# Runs every 2 s. Does NOT contain any st.tabs() — tabs must live outside
+# Runs every 1 s. Does NOT contain any st.tabs() — tabs must live outside
 # fragments to keep their selection state stable across re-renders.
-@st.fragment(run_every=2)
+@st.fragment(run_every=1)
 def _live_signals_header():
     # ── Web Worker keepalive ─────────────────────────────────────────────────
     # st_autorefresh uses a Web Worker (background thread) that is NOT throttled
     # by browser tab visibility policies — unlike fragment run_every which uses
     # plain setInterval and pauses when the tab is hidden.
     # Placing it here means it fires even when the user is on another screen.
-    _st_autorefresh(interval=2000, limit=None, key="_ltp_ar", debounce=True)
+    _st_autorefresh(interval=1000, limit=None, key="_ltp_ar", debounce=True)
 
     base_df = st.session_state.get("_signals_base_df", pd.DataFrame())
     if base_df.empty or "swing_signal" not in base_df.columns:
@@ -3362,7 +3362,9 @@ def _live_signals_header():
                 access_token=st.session_state.get("kite_access_token", ""),
             )
             if _fc.authenticated:
-                fresh = _fc.get_ltp_batch([f"NSE:{s}" for s in _signal_syms])
+                # Include NIFTY 50 in the main batch — eliminates a second API round-trip
+                _batch_syms = [f"NSE:{s}" for s in _signal_syms] + ["NSE:NIFTY 50"]
+                fresh = _fc.get_ltp_batch(_batch_syms)
                 # Snapshot current → previous BEFORE overwriting with new prices
                 if "_live_ltp" in st.session_state:
                     st.session_state["_prev_ltp"] = dict(st.session_state["_live_ltp"])
@@ -3371,18 +3373,14 @@ def _live_signals_header():
                 }
                 st.session_state["_live_ltp_ts"] = datetime.now(_IST)
 
-                # ── Nifty 50 intraday direction gate ─────────────────────────
-                # Fetch Nifty 50 LTP separately and compute today's % change vs
-                # the previous close stored in computed_metrics.
+                # ── Nifty 50 intraday direction gate (extracted from same batch) ─
                 try:
-                    _nf_raw = _fc.get_ltp_batch(["NSE:NIFTY 50"])
-                    _nifty_ltp = _nf_raw.get("NSE:NIFTY 50") or _nf_raw.get("NIFTY 50")
+                    _nifty_ltp = fresh.get("NSE:NIFTY 50") or fresh.get("NIFTY 50")
                     if _nifty_ltp:
                         _nifty_ltp_f = float(_nifty_ltp)
                         st.session_state["_nifty_live_ltp"] = _nifty_ltp_f
                         _nf_prev = st.session_state.get("_nifty_prev_close")
                         if not _nf_prev or _nf_prev <= 0:
-                            # Bootstrap: use OHLC to get today's open as prev-close proxy
                             try:
                                 _nf_ohlc = _fc.get_today_open(["NSE:NIFTY 50"])
                                 _nf_open  = _nf_ohlc.get("NSE:NIFTY 50") or _nf_ohlc.get("NIFTY 50")
@@ -3941,7 +3939,7 @@ def _trading_mode_control():
 
 
 # ── FRAGMENT 2b: paper-trade banner (auto-refresh, daily gate logic) ─────────
-@st.fragment(run_every=2)
+@st.fragment(run_every=1)
 def _intraday_paper_banner():
     """
     Renders the 'Paper Trades Today' dashboard strip and enforces the
@@ -4083,7 +4081,7 @@ def _intraday_paper_banner():
 # ── FRAGMENT 2d: scalping signals (ORB — Opening Range Breakout) ─────────────
 # Refreshes every 5 s (slower than intraday because candle fetches are heavier).
 # ORB is valid only after 9:30 AM (need 15-min opening range to be complete).
-@st.fragment(run_every=5)
+@st.fragment(run_every=2)
 def _intraday_scalp_live():
     """
     Scalp signal tab — Opening Range Breakout with 3 confirmations:
@@ -4507,7 +4505,7 @@ def _intraday_scalp_live():
 # ── FRAGMENT 2a: intraday LONG table (live status column) ────────────────────
 # Runs every 2 s inside the Long sub-tab. No st.tabs() here — the sub-tabs
 # that contain this fragment are created OUTSIDE in _signals_main().
-@st.fragment(run_every=2)
+@st.fragment(run_every=1)
 def _intraday_long_live():
     # Skip all work outside market hours — fragment still runs but is instant
     if not _is_market_open():
@@ -4515,6 +4513,13 @@ def _intraday_long_live():
     base_df = st.session_state.get("_signals_base_df", pd.DataFrame())
     if base_df.empty:
         return
+
+    # ── Skip re-render if LTP hasn't changed since we last built the table ───
+    _cur_ltp_ts = st.session_state.get("_live_ltp_ts")
+    if _cur_ltp_ts is not None and _cur_ltp_ts == st.session_state.get("_long_last_ltp_ts"):
+        return  # prices unchanged — no point rebuilding the full table
+    st.session_state["_long_last_ltp_ts"] = _cur_ltp_ts
+
     df_l = base_df.copy()
     for _sym, _price in st.session_state.get("_live_ltp", {}).items():
         df_l.loc[df_l["tradingsymbol"] == _sym, "ltp"] = _price
@@ -4985,7 +4990,7 @@ def _intraday_long_live():
 
 
 # ── FRAGMENT 2b: intraday SHORT table (live status column) ───────────────────
-@st.fragment(run_every=2)
+@st.fragment(run_every=1)
 def _intraday_short_live():
     # Skip all work outside market hours — fragment still runs but is instant
     if not _is_market_open():
@@ -4993,6 +4998,13 @@ def _intraday_short_live():
     base_df = st.session_state.get("_signals_base_df", pd.DataFrame())
     if base_df.empty:
         return
+
+    # ── Skip re-render if LTP hasn't changed since we last built the table ───
+    _cur_ltp_ts_s = st.session_state.get("_live_ltp_ts")
+    if _cur_ltp_ts_s is not None and _cur_ltp_ts_s == st.session_state.get("_short_last_ltp_ts"):
+        return
+    st.session_state["_short_last_ltp_ts"] = _cur_ltp_ts_s
+
     df_s = base_df.copy()
     for _sym, _price in st.session_state.get("_live_ltp", {}).items():
         df_s.loc[df_s["tradingsymbol"] == _sym, "ltp"] = _price
@@ -5978,11 +5990,9 @@ def _show_algo_readjust_dialog(uid: str) -> None:
 # ============================================================
 # ACTIVITY LOG — live fragment (stats + table + paper perf)
 # ============================================================
-@st.fragment(run_every=2)
+@st.fragment(run_every=5)
 def _activity_log_live():
-    """Auto-refreshes every 2 s: portfolio snapshot, summary banners, trade table."""
-    # Web Worker keepalive — fires even when tab is in background
-    _st_autorefresh(interval=2000, limit=None, key="_actlog_ar", debounce=True)
+    """Auto-refreshes every 5 s: portfolio snapshot, summary banners, trade table."""
     _uid = st.session_state.get("kite_user_id", "")
 
     # ── Market-hours gate: skip live Kite API calls outside 9:00–15:35 IST ──
@@ -6040,6 +6050,7 @@ def _activity_log_live():
                             pass
                 except Exception:
                     pass
+                st.session_state["_actlog_stale"] = True
                 st.success("All open paper trades closed.")
                 st.rerun()
 
@@ -6098,9 +6109,25 @@ def _activity_log_live():
             st.caption(f"⚠ Portfolio data unavailable: {_pf_err}")
 
     # ── Summary banners: Paper | Real ──────────────────────────────────────
-    _stats_paper = db.get_trade_stats(user_id=_uid, is_paper=True)
-    _stats_real  = db.get_trade_stats(user_id=_uid, is_paper=False)
-    _stats_all   = db.get_trade_stats(user_id=_uid)
+    # Cache stats for 10 s — they only change when trades are logged/closed.
+    # Set st.session_state["_actlog_stale"] = True anywhere a trade is changed
+    # to force an immediate refresh.
+    _actlog_now    = datetime.now(_IST)
+    _actlog_last   = st.session_state.get("_actlog_db_ts")
+    _actlog_age    = (_actlog_now - _actlog_last).total_seconds() if _actlog_last else 999
+    _actlog_stale  = st.session_state.pop("_actlog_stale", False)  # consume flag
+    if _actlog_stale or _actlog_age > 10 or not st.session_state.get("_actlog_stats_a"):
+        _stats_paper = db.get_trade_stats(user_id=_uid, is_paper=True)
+        _stats_real  = db.get_trade_stats(user_id=_uid, is_paper=False)
+        _stats_all   = db.get_trade_stats(user_id=_uid)
+        st.session_state["_actlog_stats_p"]  = _stats_paper
+        st.session_state["_actlog_stats_r"]  = _stats_real
+        st.session_state["_actlog_stats_a"]  = _stats_all
+        st.session_state["_actlog_db_ts"]    = _actlog_now
+    else:
+        _stats_paper = st.session_state["_actlog_stats_p"]
+        _stats_real  = st.session_state["_actlog_stats_r"]
+        _stats_all   = st.session_state["_actlog_stats_a"]
 
     if _stats_all.get("total", 0) == 0:
         st.info(
@@ -6159,32 +6186,42 @@ def _activity_log_live():
             f'</div>'
         )
 
-    # ── Charges and net P&L for banners ─────────────────────────────────────
-    _paper_charges = 0.0
-    _real_charges  = 0.0
-    try:
-        _paper_charges = db.get_total_charges(user_id=_uid, is_paper=True)
-        _real_charges  = db.get_total_charges(user_id=_uid, is_paper=False)
-    except Exception:
-        pass
+    # ── Charges and net P&L for banners — served from 10s cache ─────────────
+    if _actlog_stale or _actlog_age > 10 or "actlog_paper_chg" not in st.session_state:
+        _paper_charges = 0.0
+        _real_charges  = 0.0
+        try:
+            _paper_charges = db.get_total_charges(user_id=_uid, is_paper=True)
+            _real_charges  = db.get_total_charges(user_id=_uid, is_paper=False)
+        except Exception:
+            pass
+        _p_today_pnl = 0.0
+        try:
+            _p_today_pnl = db.get_today_closed_pnl(user_id=_uid, is_paper=True)
+        except Exception:
+            pass
+        _r_today_pnl = 0.0
+        try:
+            _r_today_pnl = db.get_today_closed_pnl(user_id=_uid, is_paper=False)
+        except Exception:
+            pass
+        st.session_state["actlog_paper_chg"]   = _paper_charges
+        st.session_state["actlog_real_chg"]    = _real_charges
+        st.session_state["actlog_p_today_pnl"] = _p_today_pnl
+        st.session_state["actlog_r_today_pnl"] = _r_today_pnl
+    else:
+        _paper_charges = st.session_state.get("actlog_paper_chg", 0.0)
+        _real_charges  = st.session_state.get("actlog_real_chg", 0.0)
+        _p_today_pnl   = st.session_state.get("actlog_p_today_pnl", 0.0)
+        _r_today_pnl   = st.session_state.get("actlog_r_today_pnl", 0.0)
 
     # Extra info on the paper banner: today's realised return + gate status
-    _p_today_pnl = 0.0
-    try:
-        _p_today_pnl = db.get_today_closed_pnl(user_id=_uid, is_paper=True)
-    except Exception:
-        pass
     _p_today_ret   = (_p_today_pnl / _cap * 100) if _cap else 0.0
     _p_hwm         = st.session_state.get("paper_day_hwm_pct", 0.0)
     _p_cutoff      = (_p_hwm - config.DAILY_TRAIL_PCT) if _p_hwm >= config.DAILY_TARGET_LOW_PCT else None
     _p_blocked_now = st.session_state.get("paper_day_blocked", False)
 
     # Real: today's realised return
-    _r_today_pnl = 0.0
-    try:
-        _r_today_pnl = db.get_today_closed_pnl(user_id=_uid, is_paper=False)
-    except Exception:
-        pass
     _r_today_ret = (_r_today_pnl / _cap * 100) if _cap else 0.0
 
     if _p_blocked_now:
@@ -6219,8 +6256,12 @@ def _activity_log_live():
 
     st.markdown("---")
 
-    # ── Load all trades once; split into today (active) vs past (archive) ──
-    _log_df_all = db.load_trade_log(user_id=_uid)
+    # ── Load trade log from cache (10s TTL) ─────────────────────────────────
+    if _actlog_stale or _actlog_age > 10 or "actlog_log_df" not in st.session_state:
+        _log_df_all = db.load_trade_log(user_id=_uid)
+        st.session_state["actlog_log_df"] = _log_df_all
+    else:
+        _log_df_all = st.session_state["actlog_log_df"]
     _today_pd   = pd.Timestamp.today().normalize()
     if not _log_df_all.empty and "trade_date" in _log_df_all.columns:
         _tdate_col    = pd.to_datetime(_log_df_all["trade_date"], errors="coerce")
@@ -6456,6 +6497,7 @@ def _activity_log_live():
                 _close_notes  = _ct3.text_input("Notes", key="close_notes")
                 if st.button("✅ Close Trade", type="primary", key="close_trade_btn"):
                     db.close_trade(_sel_id, float(_close_exit), _close_status, _close_notes or None)
+                    st.session_state["_actlog_stale"] = True
                     st.success(f"Trade #{_sel_id} closed as {_close_status} at ₹{_close_exit:.2f}")
                     st.rerun()
 
@@ -6464,6 +6506,7 @@ def _activity_log_live():
             _del_id = st.number_input("Trade ID to delete", min_value=1, step=1, key="del_trade_id")
             if st.button("Delete", type="secondary", key="del_trade_btn"):
                 db.delete_trade(int(_del_id))
+                st.session_state["_actlog_stale"] = True
                 st.success(f"Trade #{_del_id} deleted.")
                 st.rerun()
 
