@@ -3481,12 +3481,18 @@ def _live_signals_header():
     _ltp_err = None
     if _market_open and _signal_syms:
         try:
-            _fc = st.session_state.get("kite_client") or KiteClient(
-                api_key=st.session_state.get("kite_api_key", ""),
-                api_secret=st.session_state.get("kite_api_secret", ""),
-                access_token=st.session_state.get("kite_access_token", ""),
-            )
-            if _fc.authenticated:
+            # Prefer the already-constructed client from session state.
+            # Only fall back to constructing a new one if we have all credentials —
+            # avoids a KiteClient.__init__ (imports CurlSession) on every 1s tick
+            # when the user has not yet authenticated.
+            _fc = st.session_state.get("kite_client")
+            if _fc is None and st.session_state.get("kite_access_token"):
+                _fc = KiteClient(
+                    api_key=st.session_state.get("kite_api_key", ""),
+                    api_secret=st.session_state.get("kite_api_secret", ""),
+                    access_token=st.session_state.get("kite_access_token", ""),
+                )
+            if _fc and _fc.authenticated:
                 # Include NIFTY 50 in the main batch — eliminates a second API round-trip
                 _batch_syms = [f"NSE:{s}" for s in _signal_syms] + ["NSE:NIFTY 50"]
                 fresh = _fc.get_ltp_batch(_batch_syms)
@@ -3581,8 +3587,9 @@ def _live_signals_header():
 
     # Apply live LTP for metric pill counts
     df_c = base_df.copy()
-    for _sym, _price in st.session_state.get("_live_ltp", {}).items():
-        df_c.loc[df_c["tradingsymbol"] == _sym, "ltp"] = _price
+    _ltp_map = st.session_state.get("_live_ltp", {})
+    if _ltp_map and "tradingsymbol" in df_c.columns:
+        df_c["ltp"] = df_c["tradingsymbol"].map(_ltp_map).fillna(df_c.get("ltp", 0))
 
     _n_sb  = int((df_c["swing_signal"]    == "BUY").sum())
     _n_ss  = int((df_c["swing_signal"]    == "SELL").sum())
@@ -3714,15 +3721,26 @@ def _live_signals_header():
         _g_has_real  = _g_kc_gate is not None and getattr(_g_kc_gate, "authenticated", False)
         if _g_cutoff is not None and (_g_has_paper or _g_has_real):
             _g_uid  = st.session_state.get("kite_user_id", "")
-            # Closed P&L for both paper and real today
-            try:
-                _g_closed_paper = db.get_today_closed_pnl(user_id=_g_uid, is_paper=True)
-            except Exception:
-                _g_closed_paper = 0.0
-            try:
-                _g_closed_real = db.get_today_closed_pnl(user_id=_g_uid, is_paper=False)
-            except Exception:
-                _g_closed_real = 0.0
+            # Closed P&L — cached 5 s so we don't hit the DB on every 1s tick
+            _g_pnl_now  = datetime.now(_IST)
+            _g_pnl_last = st.session_state.get("_gate_pnl_ts")
+            _g_pnl_age  = (_g_pnl_now - _g_pnl_last).total_seconds() if _g_pnl_last else 999
+            if _g_pnl_age > 5 or "_gate_closed_paper" not in st.session_state:
+                try:
+                    st.session_state["_gate_closed_paper"] = db.get_today_closed_pnl(user_id=_g_uid, is_paper=True)
+                except Exception:
+                    st.session_state["_gate_closed_paper"] = 0.0
+                try:
+                    st.session_state["_gate_closed_real"] = db.get_today_closed_pnl(user_id=_g_uid, is_paper=False)
+                except Exception:
+                    st.session_state["_gate_closed_real"] = 0.0
+                try:
+                    st.session_state["_gate_real_open"] = db.get_open_real_trades(user_id=_g_uid)
+                except Exception:
+                    st.session_state["_gate_real_open"] = []
+                st.session_state["_gate_pnl_ts"] = _g_pnl_now
+            _g_closed_paper = st.session_state.get("_gate_closed_paper", 0.0)
+            _g_closed_real  = st.session_state.get("_gate_closed_real",  0.0)
             _g_real = _g_closed_paper + _g_closed_real
 
             # Compute per-trade MTM for open paper positions
@@ -3739,11 +3757,8 @@ def _live_signals_header():
                 _g_per_trade[_g_pid] = (_g_trade_mtm, _g_ltp)
                 _g_mtm_sum += _g_trade_mtm
 
-            # Add open real position MTM to the total
-            try:
-                _g_real_open_mtm = db.get_open_real_trades(user_id=_g_uid)
-            except Exception:
-                _g_real_open_mtm = []
+            # Add open real position MTM to the total (uses 5s cached value)
+            _g_real_open_mtm = st.session_state.get("_gate_real_open", [])
             for _grm in _g_real_open_mtm:
                 _grm_sym   = _grm.get("tradingsymbol", "")
                 _grm_ltp   = _live_ltp_now.get(_grm_sym, 0)
@@ -3782,10 +3797,7 @@ def _live_signals_header():
                 # orphaned SL + target companion orders.
                 _g_kc = st.session_state.get("kite_client")
                 if _g_kc and getattr(_g_kc, "authenticated", False):
-                    try:
-                        _g_real_open = db.get_open_real_trades(user_id=_g_uid)
-                    except Exception:
-                        _g_real_open = []
+                    _g_real_open = st.session_state.get("_gate_real_open", [])
                     for _gr in _g_real_open:
                         _gr_sym   = _gr.get("tradingsymbol", "")
                         _gr_ltp   = _live_ltp_now.get(_gr_sym, 0)
@@ -4785,8 +4797,9 @@ def _intraday_long_live():
         return
 
     df_l = base_df.copy()
-    for _sym, _price in st.session_state.get("_live_ltp", {}).items():
-        df_l.loc[df_l["tradingsymbol"] == _sym, "ltp"] = _price
+    _ltp_m = st.session_state.get("_live_ltp", {})
+    if _ltp_m and "tradingsymbol" in df_l.columns:
+        df_l["ltp"] = df_l["tradingsymbol"].map(_ltp_m).fillna(df_l.get("ltp", 0))
 
     _si = (
         df_l[df_l["intraday_signal"] == "BUY_ABOVE"]
@@ -4834,6 +4847,16 @@ def _intraday_long_live():
     if _long_sym_q:
         _si = _si[_si["tradingsymbol"].str.contains(_long_sym_q.strip(), case=False, na=False, regex=False)]
 
+    # Compute deployed capital ONCE per render, not inside the per-row loop
+    _deployed_long = (
+        sum(v.get("cap", config.PAPER_CAP_MODERATE)
+            for v in st.session_state.get("paper_open", {}).values())
+        + sum(v.get("cap", config.SCALP_CAP_PER_TRADE)
+              for v in st.session_state.get("scalp_open", {}).values())
+    )
+    _avail_bal_long = st.session_state.get("_paper_balance", float(config.PAPER_CAPITAL))
+    _trade_mode_long = st.session_state.get("trading_mode", "paper")
+
     _si_rows = []
     for _, r in _si.iterrows():
         sym        = r.get("tradingsymbol", "")
@@ -4880,17 +4903,8 @@ def _intraday_long_live():
             _cap_this_trade = 0
             _conf_tier = "LOW"
 
-        # ── Capital availability gate (replaces fixed slot count) ─────────────
-        # Include BOTH intraday (paper_open) and scalp (scalp_open) positions
-        # so the total never exceeds PAPER_CAPITAL (₹9L).
-        _deployed = (
-            sum(v.get("cap", config.PAPER_CAP_MODERATE)
-                for v in st.session_state.get("paper_open", {}).values())
-            + sum(v.get("cap", config.SCALP_CAP_PER_TRADE)
-                  for v in st.session_state.get("scalp_open", {}).values())
-        )
-        _avail_bal  = st.session_state.get("_paper_balance", float(config.PAPER_CAPITAL))
-        _remaining  = _avail_bal - _deployed
+        # ── Capital availability gate ─────────────────────────────────────────
+        _remaining    = _avail_bal_long - _deployed_long
         _within_limit = (_cap_this_trade > 0) and (_remaining >= _cap_this_trade)
 
         # Quantity based on tier capital and actual trigger price
@@ -4898,7 +4912,7 @@ def _intraday_long_live():
         _pqty = max(1, int(_cap_this_trade / (_trigger_price or 1))) if _cap_this_trade else 1
 
         # ── Auto-trade when TRIGGERED ─────────────────────────────────────────
-        _trade_mode = st.session_state.get("trading_mode", "paper")
+        _trade_mode = _trade_mode_long
         _paper_key  = (_today_str, sym)
         _real_key   = (_today_str, sym)
 
@@ -5276,8 +5290,9 @@ def _intraday_short_live():
         return
 
     df_s = base_df.copy()
-    for _sym, _price in st.session_state.get("_live_ltp", {}).items():
-        df_s.loc[df_s["tradingsymbol"] == _sym, "ltp"] = _price
+    _ltp_ms = st.session_state.get("_live_ltp", {})
+    if _ltp_ms and "tradingsymbol" in df_s.columns:
+        df_s["ltp"] = df_s["tradingsymbol"].map(_ltp_ms).fillna(df_s.get("ltp", 0))
 
     _ss = (
         df_s[df_s["intraday_signal"] == "SELL_BELOW"]
@@ -5330,6 +5345,16 @@ def _intraday_short_live():
             icon="🟢",
         )
 
+    # Compute deployed capital ONCE per render, not inside the per-row loop
+    _deployed_short = (
+        sum(v.get("cap", config.PAPER_CAP_MODERATE)
+            for v in st.session_state.get("paper_open", {}).values())
+        + sum(v.get("cap", config.SCALP_CAP_PER_TRADE)
+              for v in st.session_state.get("scalp_open", {}).values())
+    )
+    _avail_bal_short  = st.session_state.get("_paper_balance", float(config.PAPER_CAPITAL))
+    _trade_mode_short = st.session_state.get("trading_mode", "paper")
+
     _ss_rows = []
     for _, r in _ss.iterrows():
         sym        = r.get("tradingsymbol", "")
@@ -5376,22 +5401,14 @@ def _intraday_short_live():
             _conf_tier = "LOW"
 
         # ── Capital availability gate ─────────────────────────────────────────
-        # Include both intraday and scalp positions for correct total exposure.
-        _deployed = (
-            sum(v.get("cap", config.PAPER_CAP_MODERATE)
-                for v in st.session_state.get("paper_open", {}).values())
-            + sum(v.get("cap", config.SCALP_CAP_PER_TRADE)
-                  for v in st.session_state.get("scalp_open", {}).values())
-        )
-        _avail_bal  = st.session_state.get("_paper_balance", float(config.PAPER_CAPITAL))
-        _remaining  = _avail_bal - _deployed
+        _remaining    = _avail_bal_short - _deployed_short
         _within_limit = (_cap_this_trade > 0) and (_remaining >= _cap_this_trade)
 
         _trigger_price = ltp_now if ltp_now > 0 else entry_val
         _pqty = max(1, int(_cap_this_trade / (_trigger_price or 1))) if _cap_this_trade else 1
 
         # ── Auto-trade when TRIGGERED ─────────────────────────────────────────
-        _trade_mode = st.session_state.get("trading_mode", "paper")
+        _trade_mode = _trade_mode_short
         _paper_key  = (_today_str, sym)
         _real_key   = (_today_str, sym)
 
@@ -5733,8 +5750,9 @@ def _swing_buy_tab_content():
     if base_df.empty:
         return
     df_live = base_df.copy()
-    for _sym, _price in st.session_state.get("_live_ltp", {}).items():
-        df_live.loc[df_live["tradingsymbol"] == _sym, "ltp"] = _price
+    _ltp_sw1 = st.session_state.get("_live_ltp", {})
+    if _ltp_sw1 and "tradingsymbol" in df_live.columns:
+        df_live["ltp"] = df_live["tradingsymbol"].map(_ltp_sw1).fillna(df_live.get("ltp", 0))
 
     _sb = (
         df_live[df_live["swing_signal"] == "BUY"]
@@ -5800,8 +5818,9 @@ def _exit_sell_tab_content():
     if base_df.empty:
         return
     df_live = base_df.copy()
-    for _sym, _price in st.session_state.get("_live_ltp", {}).items():
-        df_live.loc[df_live["tradingsymbol"] == _sym, "ltp"] = _price
+    _ltp_vx = st.session_state.get("_live_ltp", {})
+    if _ltp_vx and "tradingsymbol" in df_live.columns:
+        df_live["ltp"] = df_live["tradingsymbol"].map(_ltp_vx).fillna(df_live.get("ltp", 0))
 
     _se = (
         df_live[df_live["swing_signal"] == "SELL"]
@@ -5866,8 +5885,9 @@ def _scaling_tab_content():
     if base_df.empty:
         return
     df_live = base_df.copy()
-    for _sym, _price in st.session_state.get("_live_ltp", {}).items():
-        df_live.loc[df_live["tradingsymbol"] == _sym, "ltp"] = _price
+    _ltp_vx = st.session_state.get("_live_ltp", {})
+    if _ltp_vx and "tradingsymbol" in df_live.columns:
+        df_live["ltp"] = df_live["tradingsymbol"].map(_ltp_vx).fillna(df_live.get("ltp", 0))
 
     _ssc = (
         df_live[df_live["scale_signal"] == "INITIAL_ENTRY"]
@@ -5956,8 +5976,9 @@ def _signals_main():
 
     # Apply most-recent live LTP (updated by the header fragment every 2 s)
     df_live = base_df.copy()
-    for _sym, _price in st.session_state.get("_live_ltp", {}).items():
-        df_live.loc[df_live["tradingsymbol"] == _sym, "ltp"] = _price
+    _ltp_vx = st.session_state.get("_live_ltp", {})
+    if _ltp_vx and "tradingsymbol" in df_live.columns:
+        df_live["ltp"] = df_live["tradingsymbol"].map(_ltp_vx).fillna(df_live.get("ltp", 0))
 
     st.markdown("---")
 

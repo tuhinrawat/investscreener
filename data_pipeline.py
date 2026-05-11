@@ -340,13 +340,19 @@ def compute_metrics_for_universe(universe_df: pd.DataFrame) -> pd.DataFrame:
     else:
         print("⚠ Nifty 50 history not cached — relative strength will be NULL")
 
+    # Bulk-load ALL OHLCV in one query — eliminates N individual DB round-trips
+    all_tokens = universe_df["instrument_token"].dropna().astype(int).tolist()
+    print(f"Bulk-loading OHLCV for {len(all_tokens)} tokens in one query…")
+    ohlcv_map = db.load_ohlcv_bulk(all_tokens)
+    print(f"Loaded OHLCV for {len(ohlcv_map)} tokens")
+
     rows = []
     for row in tqdm(universe_df.itertuples(index=False), total=len(universe_df),
                     desc="Computing indicators"):
         token = int(row.instrument_token)
         symbol = row.tradingsymbol
 
-        ohlcv = db.load_ohlcv(token)
+        ohlcv = ohlcv_map.get(token, pd.DataFrame())
         if ohlcv.empty or len(ohlcv) < 30:
             continue
 
@@ -643,6 +649,10 @@ def refresh_signals_only(progress_callback=None, user_id: str = "") -> dict:
     updated = 0
     errors  = 0
 
+    # Bulk-load ALL OHLCV in a single DB round-trip
+    all_tokens = metrics["instrument_token"].dropna().astype(int).tolist()
+    ohlcv_map  = db.load_ohlcv_bulk(all_tokens)
+
     for idx, row in metrics.iterrows():
         sym   = row.get("tradingsymbol", "?")
         token = row.get("instrument_token")
@@ -653,7 +663,7 @@ def refresh_signals_only(progress_callback=None, user_id: str = "") -> dict:
             progress_callback(idx, total, sym)
 
         try:
-            ohlcv = db.load_ohlcv(int(token))
+            ohlcv = ohlcv_map.get(int(token), pd.DataFrame())
             if ohlcv.empty or len(ohlcv) < 5:
                 continue
             m    = row.to_dict()

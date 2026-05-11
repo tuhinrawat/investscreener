@@ -76,32 +76,36 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
         )
     if _pool is None or _pool.closed:
         _pool = psycopg2.pool.ThreadedConnectionPool(
-            minconn=1, maxconn=8, dsn=_DATABASE_URL
+            minconn=2, maxconn=20, dsn=_DATABASE_URL
         )
     return _pool
 
 
 def get_conn() -> psycopg2.extensions.connection:
     """
-    Borrow a connection from the pool, validating it is alive first.
+    Borrow a connection from the pool.
 
-    Neon serverless scales its compute to zero after inactivity, which kills
-    existing TCP connections without notifying psycopg2's pool. The next
-    getconn() call hands out a dead socket, and the first cursor.execute()
-    raises OperationalError. We catch that here by pinging with SELECT 1;
-    if the ping fails we rebuild the entire pool and return a fresh conn.
+    Uses conn.closed (synchronous psycopg2 attribute — no network round-trip)
+    as a fast pre-check. Only falls back to a full SELECT 1 ping when the
+    connection appears open but may be stale (Neon idle timeout). Rebuilds the
+    entire pool on dead-connection detection.
     """
     global _pool
     pool = _get_pool()
     conn = pool.getconn()
+    if conn.closed:
+        # Definitely dead — rebuild pool immediately
+        try:
+            pool.closeall()
+        except Exception:
+            pass
+        _pool = None
+        return _get_pool().getconn()
     try:
-        # Lightweight liveness check
-        _c = conn.cursor()
-        _c.execute("SELECT 1")
-        _c.close()
-        conn.rollback()          # leave connection in clean state
+        # Fast transaction-state reset — no extra round-trip if already clean
+        conn.rollback()
     except Exception:
-        # Dead connection — tear down pool and start fresh
+        # rollback failed → connection is dead despite conn.closed == 0
         try:
             pool.closeall()
         except Exception:
@@ -137,8 +141,17 @@ def _df_from_cursor(cur) -> pd.DataFrame:
 
 # ── Schema ────────────────────────────────────────────────────────────────────
 
+_schema_initialized: bool = False  # module-level guard — init runs once per process
+
 def init_schema():
-    """Creates all tables if they don't exist. Idempotent — safe every run."""
+    """Creates all tables if they don't exist. Idempotent — safe every run.
+
+    Protected by a module-level flag so it only executes once per Python process.
+    Repeated calls from Streamlit reruns are instant no-ops.
+    """
+    global _schema_initialized
+    if _schema_initialized:
+        return
     conn = get_conn()
     cur  = conn.cursor()
     try:
@@ -378,6 +391,20 @@ def init_schema():
                 "ON CONFLICT (key) DO NOTHING"
             )
 
+        # ── Performance indexes (idempotent) ──────────────────────────────────
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_trade_log_user_status
+                ON trade_log (kite_user_id, status, trade_date DESC)
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_trade_log_paper_date
+                ON trade_log (is_paper_trade, status, trade_date)
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ohlcv_token_date
+                ON daily_ohlcv (instrument_token, date DESC)
+        """)
+
         conn.commit()
     except Exception:
         conn.rollback()
@@ -385,6 +412,7 @@ def init_schema():
     finally:
         cur.close()
         release_conn(conn)
+    _schema_initialized = True
 
 
 def _add_column_if_missing(cur, table: str, col: str, dtype: str) -> None:
@@ -608,6 +636,40 @@ def load_ohlcv(instrument_token: int) -> pd.DataFrame:
     finally:
         cur.close()
         release_conn(conn)
+
+
+def load_ohlcv_bulk(instrument_tokens: list) -> dict:
+    """Load OHLCV for ALL tokens in a single query. Returns {token: DataFrame}.
+
+    Replaces N individual load_ohlcv() calls in compute_metrics / refresh_signals
+    — one round-trip instead of N, dramatically faster on Neon serverless.
+    """
+    if not instrument_tokens:
+        return {}
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT instrument_token, date, open, high, low, close, volume "
+            "FROM daily_ohlcv WHERE instrument_token = ANY(%s) ORDER BY instrument_token, date",
+            [list(instrument_tokens)],
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        release_conn(conn)
+
+    result: dict = {}
+    for row in rows:
+        tok = row[0]
+        if tok not in result:
+            result[tok] = []
+        result[tok].append(row[1:])  # (date, open, high, low, close, volume)
+
+    return {
+        tok: pd.DataFrame(vals, columns=["date", "open", "high", "low", "close", "volume"])
+        for tok, vals in result.items()
+    }
 
 
 def save_ai_result(instrument_token: int, result: dict):

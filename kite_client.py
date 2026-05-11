@@ -31,21 +31,23 @@ _KC_ON_CLOUD: bool = _kc_os.environ.get("HOME", "").rstrip("/").endswith("appuse
 
 class RateLimiter:
     """
-    Simple token-bucket rate limiter.
-    Why not the `ratelimit` library decorator? Because we want to share
-    one limiter across multiple call sites (historical fetches happen
-    in a loop) and decorators make that awkward.
+    Thread-safe token-bucket rate limiter.
+    Lock prevents two concurrent Streamlit threads from both skipping sleep
+    and firing simultaneous API calls that would trigger a 429.
     """
     def __init__(self, calls_per_sec: float):
+        import threading
         self.min_interval = 1.0 / calls_per_sec
         self.last_call = 0.0
+        self._lock = threading.Lock()
 
     def wait(self):
-        elapsed = time.time() - self.last_call
-        sleep_for = self.min_interval - elapsed
-        if sleep_for > 0:
-            time.sleep(sleep_for)
-        self.last_call = time.time()
+        with self._lock:
+            elapsed = time.time() - self.last_call
+            sleep_for = self.min_interval - elapsed
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            self.last_call = time.time()
 
 
 class KiteClient:
