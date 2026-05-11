@@ -170,14 +170,15 @@ def fetch_historical_for_universe(
     full_from_date = to_date - timedelta(days=days)
 
     # Load latest cached date per token for incremental refresh
-    con = db.get_conn()
-    latest_df = con.execute(
+    conn = db.get_conn()
+    cur  = conn.cursor()
+    cur.execute(
         "SELECT instrument_token, MAX(date) AS latest FROM daily_ohlcv GROUP BY instrument_token"
-    ).df()
-    con.close()
-    latest_map: dict[int, date] = dict(
-        zip(latest_df["instrument_token"], latest_df["latest"])
     )
+    rows = cur.fetchall()
+    cur.close()
+    db.release_conn(conn)
+    latest_map: dict[int, date] = {int(r[0]): r[1] for r in rows}
 
     # Decide from_date per stock: full lookback for new stocks, delta for cached
     today = to_date.date()
@@ -397,9 +398,12 @@ def full_rescan(progress_callback=None, client: "KiteClient | None" = None) -> d
     age = db.get_instruments_age_days()
     needs_refresh = age < 0 or age > config.INSTRUMENTS_REFRESH_DAYS
     if not needs_refresh:
-        con = db.get_conn()
-        universe = con.execute("SELECT * FROM instruments").df()
-        con.close()
+        conn = db.get_conn()
+        cur  = conn.cursor()
+        cur.execute("SELECT * FROM instruments")
+        universe = db._df_from_cursor(cur)
+        cur.close()
+        db.release_conn(conn)
         # Bonds/SGBs/surveillance stocks have hyphens in tradingsymbol
         # (e.g., OMFURN-ST, 672KL27-SG). If any exist, the DB predates the
         # hyphen filter — force a clean pull.
@@ -557,7 +561,7 @@ def refresh_signals_only(progress_callback=None, user_id: str = "") -> dict:
     """
     Recompute ALL trade signals from OHLCV already stored in the DB.
 
-    No API calls needed — reads historical data from local DuckDB, runs
+    No API calls needed — reads historical data from Neon Postgres, runs
     swing / intraday / scaling signal logic, and writes results back.
     Typical runtime: 30–60 s for ~1000 stocks.
 
