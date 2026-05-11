@@ -147,7 +147,25 @@ BENCHMARK_EXCHANGE = "NSE"
 # ============================================================
 # NIFTY 50 instrument token (constant) — used for benchmark queries
 # ============================================================
-NIFTY_50_TOKEN = 256265
+NIFTY_50_TOKEN   = 256265
+NIFTY_BANK_TOKEN = 260105   # NSE:NIFTY BANK index token
+
+# ============================================================
+# NIFTY 50 constituent symbols — for the live ticker banner and
+# WebSocket subscription basket.  Updated as of May 2026.
+# ============================================================
+NIFTY50_SYMBOLS: list = [
+    "ADANIENT",   "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT",  "AXISBANK",
+    "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BPCL",        "BHARTIARTL",
+    "BRITANNIA",  "CIPLA",      "COALINDIA",  "DIVISLAB",    "DRREDDY",
+    "EICHERMOT",  "GRASIM",     "HCLTECH",    "HDFCBANK",    "HDFCLIFE",
+    "HEROMOTOCO", "HINDALCO",   "HINDUNILVR", "ICICIBANK",   "ITC",
+    "INDUSINDBK", "INFY",       "JSWSTEEL",   "KOTAKBANK",   "LT",
+    "LTIM",       "M&M",        "MARUTI",     "NTPC",        "NESTLEIND",
+    "ONGC",       "POWERGRID",  "RELIANCE",   "SBILIFE",     "SHRIRAMFIN",
+    "SBIN",       "SUNPHARMA",  "TCS",        "TATACONSUM",  "TATAMOTORS",
+    "TATASTEEL",  "TECHM",      "TITAN",      "ULTRACEMCO",  "WIPRO",
+]
 
 # ============================================================
 # PAPER TRADING — virtual capital for signal evaluation

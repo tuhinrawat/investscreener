@@ -45,6 +45,7 @@ import data_pipeline
 import ai_analyst as _ai
 import market_intel as _mi
 from kite_client import KiteClient
+import kite_client as _kc_module
 
 # Background-tab-safe autorefresh: uses a Web Worker (background thread) that
 # browsers cannot throttle, unlike plain setInterval used by fragment run_every.
@@ -544,6 +545,35 @@ if "kite_client" not in st.session_state or not st.session_state["kite_client"]:
     )
     if _kc.authenticated:
         st.session_state["kite_client"] = _kc
+
+# ── Start KiteTicker WebSocket (once per process, reconnects automatically) ──
+# We start the ticker whenever Kite is authenticated AND the ticker isn't alive.
+# Token map: signal symbols + all Nifty 50 stocks + NIFTY 50 / BANK NIFTY indices.
+_kc_ticker_client = st.session_state.get("kite_client")
+if (_kc_ticker_client and getattr(_kc_ticker_client, "authenticated", False)
+        and not _kc_module.is_ticker_alive()):
+    _ticker_tok_map: dict = {
+        config.NIFTY_50_TOKEN:   "NIFTY 50",
+        config.NIFTY_BANK_TOKEN: "NIFTY BANK",
+    }
+    # Add Nifty 50 constituent stocks
+    try:
+        _ticker_tok_map.update(db.get_nifty50_tokens())
+    except Exception:
+        pass
+    # Add current signal symbols (so live signals get WebSocket prices too)
+    try:
+        _sbase = st.session_state.get("_signals_base_df")
+        if _sbase is not None and not _sbase.empty and "instrument_token" in _sbase.columns:
+            for _tr in _sbase[["instrument_token", "tradingsymbol"]].dropna().itertuples(index=False):
+                _ticker_tok_map[int(_tr.instrument_token)] = str(_tr.tradingsymbol)
+    except Exception:
+        pass
+    _kc_module.start_ticker(
+        api_key=st.session_state.get("kite_api_key", ""),
+        access_token=st.session_state.get("kite_access_token", ""),
+        token_symbol_map=_ticker_tok_map,
+    )
 
 # Convenience alias — current Kite user id for per-user DB filtering
 _cur_user_id: str = st.session_state.get("kite_user_id", "")
@@ -3480,53 +3510,80 @@ def _live_signals_header():
 
     _ltp_err = None
     if _market_open and _signal_syms:
-        try:
-            # Prefer the already-constructed client from session state.
-            # Only fall back to constructing a new one if we have all credentials —
-            # avoids a KiteClient.__init__ (imports CurlSession) on every 1s tick
-            # when the user has not yet authenticated.
-            _fc = st.session_state.get("kite_client")
-            if _fc is None and st.session_state.get("kite_access_token"):
-                _fc = KiteClient(
-                    api_key=st.session_state.get("kite_api_key", ""),
-                    api_secret=st.session_state.get("kite_api_secret", ""),
-                    access_token=st.session_state.get("kite_access_token", ""),
-                )
-            if _fc and _fc.authenticated:
-                # Include NIFTY 50 in the main batch — eliminates a second API round-trip
-                _batch_syms = [f"NSE:{s}" for s in _signal_syms] + ["NSE:NIFTY 50"]
-                fresh = _fc.get_ltp_batch(_batch_syms)
-                # Snapshot current → previous BEFORE overwriting with new prices
-                if "_live_ltp" in st.session_state:
-                    st.session_state["_prev_ltp"] = dict(st.session_state["_live_ltp"])
-                st.session_state["_live_ltp"] = {
-                    k.split(":", 1)[-1]: v for k, v in fresh.items()
-                }
-                st.session_state["_live_ltp_ts"] = datetime.now(_IST)
-
-                # ── Nifty 50 intraday direction gate (extracted from same batch) ─
-                try:
-                    _nifty_ltp = fresh.get("NSE:NIFTY 50") or fresh.get("NIFTY 50")
-                    if _nifty_ltp:
-                        _nifty_ltp_f = float(_nifty_ltp)
-                        st.session_state["_nifty_live_ltp"] = _nifty_ltp_f
+        # ── Priority 1: WebSocket ticker (100-250 ms, no rate limit) ────────────
+        _ws_used = False
+        if _kc_module.is_ticker_alive():
+            try:
+                _ticker_snap = _kc_module.get_all_ticker_prices()
+                if _ticker_snap:
+                    if "_live_ltp" in st.session_state:
+                        st.session_state["_prev_ltp"] = dict(st.session_state["_live_ltp"])
+                    st.session_state["_live_ltp"]    = _ticker_snap
+                    st.session_state["_live_ltp_ts"] = datetime.now(_IST)
+                    # Nifty 50 direction gate from ticker
+                    _nf_ws = _ticker_snap.get("NIFTY 50")
+                    if _nf_ws:
+                        st.session_state["_nifty_live_ltp"] = float(_nf_ws)
                         _nf_prev = st.session_state.get("_nifty_prev_close")
-                        if not _nf_prev or _nf_prev <= 0:
-                            try:
-                                _nf_ohlc = _fc.get_today_open(["NSE:NIFTY 50"])
-                                _nf_open  = _nf_ohlc.get("NSE:NIFTY 50") or _nf_ohlc.get("NIFTY 50")
-                                if _nf_open and _nf_open > 0:
-                                    st.session_state["_nifty_prev_close"] = float(_nf_open)
-                                    _nf_prev = float(_nf_open)
-                            except Exception:
-                                pass
                         if _nf_prev and _nf_prev > 0:
-                            _nifty_pct = (_nifty_ltp_f - _nf_prev) / _nf_prev * 100
-                            st.session_state["_nifty_intraday_pct"] = round(_nifty_pct, 3)
-                except Exception:
-                    pass
-        except Exception as exc:
-            _ltp_err = str(exc)[:80]
+                            st.session_state["_nifty_intraday_pct"] = round(
+                                (float(_nf_ws) - _nf_prev) / _nf_prev * 100, 3
+                            )
+                    _ws_used = True
+                    # Also update signal subscriptions if new symbols appeared
+                    _kc_module.update_ticker_subscriptions({})   # no-op placeholder
+            except Exception:
+                pass
+
+        # ── Priority 2: REST fallback (when ticker is starting up or disconnected) ─
+        if not _ws_used:
+            try:
+                # Prefer the already-constructed client from session state.
+                # Only fall back to constructing a new one if we have all credentials —
+                # avoids a KiteClient.__init__ (imports CurlSession) on every 1s tick
+                # when the user has not yet authenticated.
+                _fc = st.session_state.get("kite_client")
+                if _fc is None and st.session_state.get("kite_access_token"):
+                    _fc = KiteClient(
+                        api_key=st.session_state.get("kite_api_key", ""),
+                        api_secret=st.session_state.get("kite_api_secret", ""),
+                        access_token=st.session_state.get("kite_access_token", ""),
+                    )
+                if _fc and _fc.authenticated:
+                    # Include NIFTY 50 in the main batch — eliminates a second API round-trip
+                    _batch_syms = [f"NSE:{s}" for s in _signal_syms] + ["NSE:NIFTY 50"]
+                    fresh = _fc.get_ltp_batch(_batch_syms)
+                    # Snapshot current → previous BEFORE overwriting with new prices
+                    if "_live_ltp" in st.session_state:
+                        st.session_state["_prev_ltp"] = dict(st.session_state["_live_ltp"])
+                    st.session_state["_live_ltp"] = {
+                        k.split(":", 1)[-1]: v for k, v in fresh.items()
+                    }
+                    st.session_state["_live_ltp_ts"] = datetime.now(_IST)
+
+                    # ── Nifty 50 intraday direction gate (extracted from same batch) ─
+                    try:
+                        _nifty_ltp = fresh.get("NSE:NIFTY 50") or fresh.get("NIFTY 50")
+                        if _nifty_ltp:
+                            _nifty_ltp_f = float(_nifty_ltp)
+                            st.session_state["_nifty_live_ltp"] = _nifty_ltp_f
+                            _nf_prev = st.session_state.get("_nifty_prev_close")
+                            if not _nf_prev or _nf_prev <= 0:
+                                try:
+                                    _nf_ohlc = _fc.get_today_open(["NSE:NIFTY 50"])
+                                    _nf_open  = _nf_ohlc.get("NSE:NIFTY 50") or _nf_ohlc.get("NIFTY 50")
+                                    if _nf_open and _nf_open > 0:
+                                        st.session_state["_nifty_prev_close"] = float(_nf_open)
+                                        _nf_prev = float(_nf_open)
+                                except Exception:
+                                    pass
+                            if _nf_prev and _nf_prev > 0:
+                                _nifty_pct = (_nifty_ltp_f - _nf_prev) / _nf_prev * 100
+                                st.session_state["_nifty_intraday_pct"] = round(_nifty_pct, 3)
+                    except Exception:
+                        pass
+            except Exception as exc:
+                _ltp_err = str(exc)[:80]
 
     _hc1, _hc2 = st.columns([5, 2])
     _hc1.subheader("🎯 Trade Signals")
@@ -7034,3 +7091,248 @@ with tab_activity:
 
     # ── Live-refreshing portfolio snapshot + stats + table (fragment) ────────
     _activity_log_live()
+
+
+# ============================================================
+# FX + COMMODITY FRAGMENT — 60 s REST fetch for USD/INR & Crude
+# ============================================================
+@st.fragment(run_every=60)
+def _fetch_fx_commodity():
+    """
+    Fetches USD/INR and Crude Oil prices via the Kite REST API.
+    Runs at 60-second intervals to minimise API load — the banner reads from
+    st.session_state so the displayed value only stalens by at most 60 s.
+
+    CDS and MCX segments must be enabled on the user's Kite account.
+    If the call fails (segment not subscribed, market closed, etc.) we silently
+    leave the session state key untouched, so the last known price is retained.
+    """
+    _kc_fx = st.session_state.get("kite_client")
+    if not _kc_fx or not getattr(_kc_fx, "authenticated", False):
+        return
+
+    # USD / INR — CDS segment (currency futures; front-month trades all day)
+    try:
+        _fx_raw = _kc_fx.kite.ltp(["CDS:USDINR"])
+        _usd = (_fx_raw.get("CDS:USDINR") or {}).get("last_price")
+        if _usd:
+            st.session_state["_usdinr_ltp"] = float(_usd)
+    except Exception:
+        pass
+
+    # Crude Oil — MCX segment (CRUDEOIL index, not a specific expiry)
+    try:
+        _cx_raw = _kc_fx.kite.ltp(["MCX:CRUDEOIL"])
+        _cr = (_cx_raw.get("MCX:CRUDEOIL") or {}).get("last_price")
+        if _cr:
+            st.session_state["_crude_ltp"] = float(_cr)
+    except Exception:
+        pass
+
+    # Nifty PCR — 21-strike option chain around ATM (NFO segment)
+    try:
+        _nf_atm = st.session_state.get("_nifty_live_ltp")
+        if _nf_atm and _nf_atm > 0 and _is_market_open():
+            import math as _math
+            _atm = int(round(_nf_atm / 50.0)) * 50
+            _strikes = [_atm + i * 50 for i in range(-10, 11)]
+            # Build Kite NFO tradingsymbol — format: NIFTY{DDMMMYY}{STRIKE}CE/PE
+            from datetime import date as _pcr_date  # noqa: PLC0415
+            _today = _pcr_date.today()
+            # Nearest Thursday (weekly expiry)
+            _days = (3 - _today.weekday()) % 7
+            _exp  = _today + timedelta(days=_days if _days else 7)
+            _exp_str = _exp.strftime("%d%b%y").upper()   # e.g. "29MAY25"
+            _ce_syms = [f"NFO:NIFTY{_exp_str}{s}CE" for s in _strikes]
+            _pe_syms = [f"NFO:NIFTY{_exp_str}{s}PE" for s in _strikes]
+            _all_syms = _ce_syms + _pe_syms
+            # Use full quote for OI data
+            _q_result: dict = {}
+            for _i in range(0, len(_all_syms), 500):
+                try:
+                    _kc_fx.quote_limiter.wait()
+                    _q_result.update(_kc_fx.kite.quote(_all_syms[_i:_i + 500]))
+                except Exception:
+                    break
+            if _q_result:
+                _ce_oi = sum((_q_result.get(s) or {}).get("oi", 0) for s in _ce_syms)
+                _pe_oi = sum((_q_result.get(s) or {}).get("oi", 0) for s in _pe_syms)
+                if _ce_oi > 0:
+                    st.session_state["_nifty_pcr"] = round(_pe_oi / _ce_oi, 2)
+    except Exception:
+        pass
+
+
+_fetch_fx_commodity()
+
+
+# ============================================================
+# LIVE TICKER BANNER — scrolling bottom bar with all Nifty 50
+# stocks, key indices, USD/INR, Crude Oil, and Nifty PCR.
+# ============================================================
+@st.fragment(run_every=1)
+def _ticker_banner():
+    """
+    Renders a fixed-position scrolling ticker at the very bottom of the
+    viewport.  Reads from the WebSocket price dict (sub-second latency)
+    when the ticker is alive, falling back to session-state REST prices.
+
+    Styling notes:
+      • position:fixed so it never scrolls out of view.
+      • animation uses translateX so the GPU handles the scroll (no reflow).
+      • Content is duplicated so the loop is seamless (no gap at the end).
+      • padding-bottom on .main ensures the last widget isn't hidden behind
+        the banner.
+    """
+    # ── Choose price source ───────────────────────────────────────────────
+    if _kc_module.is_ticker_alive():
+        _prices = _kc_module.get_all_ticker_prices()
+    else:
+        _prices = st.session_state.get("_live_ltp", {})
+
+    if not _prices:
+        # Not authenticated or no prices yet — show minimal placeholder
+        st.markdown(
+            "<div style='position:fixed;bottom:0;left:0;right:0;height:26px;"
+            "background:#0a0f1a;border-top:1px solid #1e2d40;z-index:9999;"
+            "display:flex;align-items:center;padding:0 12px'>"
+            "<span style='color:#475569;font-size:10px;font-family:monospace'>"
+            "⏳ Ticker initialising — connect Kite to see live prices</span></div>",
+            unsafe_allow_html=True,
+        )
+        return
+
+    _prev    = st.session_state.get("_prev_ltp", {})
+    _mkt_open = _is_market_open()
+
+    def _fmt_item(sym: str, ltp: float, css_class: str = "tb-stk") -> str:
+        prev = _prev.get(sym, ltp)
+        pct  = (ltp - prev) / prev * 100 if prev and prev != ltp else 0.0
+        col  = "#22c55e" if pct >= 0 else "#ef4444"
+        arrow = "▲" if pct >= 0 else "▼"
+        pct_str = f"{arrow}{abs(pct):.2f}%"
+        return (
+            f'<span class="{css_class}">'
+            f'{sym}&nbsp;<span style="color:{col}">{ltp:,.2f}&nbsp;{pct_str}</span>'
+            f'</span>'
+        )
+
+    items: list = []
+
+    # ── 1. Key indices ─────────────────────────────────────────────────────
+    for _idx_sym in ("NIFTY 50", "NIFTY BANK"):
+        _ltp = _prices.get(_idx_sym)
+        if _ltp:
+            items.append(_fmt_item(_idx_sym, _ltp, "tb-idx"))
+
+    # ── 2. Nifty 50 constituent stocks (alphabetical for easy scanning) ───
+    for _sym in sorted(config.NIFTY50_SYMBOLS):
+        _ltp = _prices.get(_sym)
+        if _ltp:
+            items.append(_fmt_item(_sym, _ltp, "tb-stk"))
+
+    # ── 3. USD/INR ────────────────────────────────────────────────────────
+    _usd = st.session_state.get("_usdinr_ltp")
+    if _usd:
+        items.append(
+            f'<span class="tb-fx">💱&nbsp;USD/INR&nbsp;'
+            f'<span style="color:#f59e0b">{_usd:.4f}</span></span>'
+        )
+
+    # ── 4. Crude Oil ──────────────────────────────────────────────────────
+    _cr = st.session_state.get("_crude_ltp")
+    if _cr:
+        items.append(
+            f'<span class="tb-cx">🛢&nbsp;Crude&nbsp;'
+            f'<span style="color:#f59e0b">₹{_cr:,.1f}</span></span>'
+        )
+
+    # ── 5. Nifty PCR ──────────────────────────────────────────────────────
+    _pcr = st.session_state.get("_nifty_pcr")
+    if _pcr:
+        _pcr_col = "#22c55e" if _pcr > 1.0 else "#ef4444"
+        _pcr_lbl = "Bullish" if _pcr > 1.2 else ("Bearish" if _pcr < 0.8 else "Neutral")
+        items.append(
+            f'<span class="tb-pcr">⚖️&nbsp;PCR&nbsp;'
+            f'<span style="color:{_pcr_col}">{_pcr:.2f}&nbsp;({_pcr_lbl})</span></span>'
+        )
+
+    if not items:
+        return
+
+    _sep     = '&nbsp;&nbsp;<span style="color:#1e3a5f">|</span>&nbsp;&nbsp;'
+    _content = _sep.join(items)
+    # Duplicate for seamless infinite loop
+    _content_full = _content + _sep + _content
+
+    # Scale scroll duration with number of items for readable speed
+    _duration = max(45, len(items) * 2)
+
+    _mkt_badge = ""
+    if not _mkt_open:
+        _mkt_badge = (
+            '<div style="flex-shrink:0;padding:0 10px;border-right:1px solid #1e3a5f;'
+            'font-size:10px;color:#f59e0b;font-family:monospace;white-space:nowrap">'
+            '⏸&nbsp;CLOSED</div>'
+        )
+
+    _ws_badge = (
+        '<div style="flex-shrink:0;padding:0 8px;border-right:1px solid #1e3a5f;'
+        'font-size:10px;font-family:monospace;white-space:nowrap;color:'
+        + ('#22c55e' if _kc_module.is_ticker_alive() else '#64748b') + '">'
+        + ('⚡&nbsp;WS' if _kc_module.is_ticker_alive() else '⚠&nbsp;REST')
+        + '</div>'
+    )
+
+    st.markdown(f"""
+<style>
+@keyframes _tb_scroll {{
+    0%   {{ transform: translateX(0); }}
+    100% {{ transform: translateX(-50%); }}
+}}
+._tb_wrap {{
+    position: fixed;
+    bottom: 0; left: 0; right: 0;
+    height: 26px;
+    background: #060d18;
+    border-top: 1px solid #1e3a5f;
+    overflow: hidden;
+    z-index: 9999;
+    display: flex;
+    align-items: center;
+    gap: 0;
+}}
+._tb_scroll_area {{
+    flex: 1;
+    overflow: hidden;
+    height: 100%;
+    display: flex;
+    align-items: center;
+}}
+._tb_inner {{
+    display: inline-flex;
+    white-space: nowrap;
+    align-items: center;
+    height: 100%;
+    animation: _tb_scroll {_duration}s linear infinite;
+    will-change: transform;
+}}
+._tb_wrap .tb-idx  {{ font-size:11px;padding:0 6px;color:#e2e8f0;font-weight:600;font-family:'SF Mono','Fira Code',monospace; }}
+._tb_wrap .tb-stk  {{ font-size:10px;padding:0 5px;color:#94a3b8;font-family:'SF Mono','Fira Code',monospace; }}
+._tb_wrap .tb-fx   {{ font-size:10px;padding:0 5px;color:#fbbf24;font-family:'SF Mono','Fira Code',monospace; }}
+._tb_wrap .tb-cx   {{ font-size:10px;padding:0 5px;color:#fb923c;font-family:'SF Mono','Fira Code',monospace; }}
+._tb_wrap .tb-pcr  {{ font-size:10px;padding:0 5px;color:#a78bfa;font-family:'SF Mono','Fira Code',monospace; }}
+/* Push page content up so the last widget isn't hidden behind the banner */
+section.main .block-container {{ padding-bottom: 36px !important; }}
+</style>
+<div class="_tb_wrap">
+    {_ws_badge}
+    {_mkt_badge}
+    <div class="_tb_scroll_area">
+        <div class="_tb_inner">{_content_full}</div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+
+_ticker_banner()

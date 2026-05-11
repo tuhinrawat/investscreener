@@ -864,6 +864,28 @@ def close_trade(trade_id: int, actual_exit: float, status: str, notes: str = Non
             pass  # never let a capital-update failure block a trade close
 
 
+def get_nifty50_tokens() -> dict:
+    """
+    Return {instrument_token: tradingsymbol} for Nifty 50 constituent stocks.
+    Queries the instruments table using the hardcoded symbol list from config.
+    Returns an empty dict if the instruments table is empty or hasn't been loaded.
+    """
+    from config import NIFTY50_SYMBOLS  # noqa: PLC0415
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT instrument_token, tradingsymbol FROM instruments "
+                "WHERE exchange = 'NSE' AND tradingsymbol = ANY(%s)",
+                [NIFTY50_SYMBOLS],
+            )
+            return {int(row[0]): str(row[1]) for row in cur.fetchall()}
+    except Exception:
+        return {}
+    finally:
+        put_conn(conn)
+
+
 def get_user_capital(user_id) -> float:
     """Return the user's current paper balance.  Falls back to PAPER_CAPITAL if no row yet."""
     from config import PAPER_CAPITAL  # local import to avoid circular

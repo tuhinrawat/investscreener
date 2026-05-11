@@ -429,3 +429,165 @@ class KiteClient:
             except Exception:
                 pass
         return result
+
+
+# ======================================================================
+# KITE TICKER — WebSocket real-time LTP (100–250 ms latency vs 500–1000 ms REST)
+#
+# Architecture:
+#   • One module-level KiteTicker instance shared across all Streamlit
+#     render threads (fragments share the same Python process).
+#   • Prices are written by the WebSocket thread into _TICKER_PRICES under
+#     a threading.Lock, and read lock-free from render threads (dict reads
+#     in CPython are effectively atomic for simple key lookups, but we
+#     still protect bulk reads with the lock for consistency).
+#   • start_ticker() is idempotent — calling it while already running
+#     disconnects the old socket cleanly before starting a new one.
+#   • is_ticker_alive() checks both _TICKER_RUNNING flag and that a tick
+#     arrived within the last 10 s (stale guard for silent disconnects).
+# ======================================================================
+import threading as _kc_threading
+
+_TICKER_LOCK: "_kc_threading.Lock" = _kc_threading.Lock()
+_TICKER_PRICES: dict = {}          # instrument_token (int) → last_price (float)
+_TICKER_SYM_MAP: dict = {}         # instrument_token (int) → display name (str)
+_TICKER_TS: float = 0.0            # epoch-seconds of last tick received
+_TICKER_OBJ = None                 # KiteTicker instance (or None)
+_TICKER_RUNNING: bool = False      # set False on disconnect/error
+
+
+def _ticker_on_ticks(ws, ticks):
+    global _TICKER_TS
+    with _TICKER_LOCK:
+        for tick in ticks:
+            token = tick.get("instrument_token")
+            ltp   = tick.get("last_price")
+            if token is not None and ltp is not None:
+                _TICKER_PRICES[token] = float(ltp)
+        _TICKER_TS = time.time()
+
+
+def _ticker_on_connect(ws, response):
+    tokens = list(_TICKER_SYM_MAP.keys())
+    if tokens:
+        ws.subscribe(tokens)
+        ws.set_mode(ws.MODE_LTP, tokens)
+
+
+def _ticker_on_error(ws, code, reason):
+    global _TICKER_RUNNING
+    _TICKER_RUNNING = False
+
+
+def _ticker_on_close(ws, code, reason):
+    global _TICKER_RUNNING
+    _TICKER_RUNNING = False
+
+
+def start_ticker(api_key: str, access_token: str, token_symbol_map: dict) -> bool:
+    """
+    Start (or restart) the KiteTicker WebSocket in a background thread.
+
+    token_symbol_map: {instrument_token: display_name}
+      e.g. {738561: "RELIANCE", 256265: "NIFTY 50", 260105: "NIFTY BANK", …}
+
+    Returns True if the socket was started successfully, False on error.
+    Safe to call multiple times — cleans up the previous connection first.
+    """
+    global _TICKER_OBJ, _TICKER_SYM_MAP, _TICKER_RUNNING, _TICKER_PRICES
+
+    stop_ticker()   # disconnect any existing socket cleanly
+
+    if not api_key or not access_token or not token_symbol_map:
+        return False
+
+    with _TICKER_LOCK:
+        _TICKER_SYM_MAP.clear()
+        _TICKER_SYM_MAP.update(token_symbol_map)
+        _TICKER_PRICES.clear()
+
+    try:
+        from kiteconnect import KiteTicker as _KT  # noqa: PLC0415
+        kt = _KT(api_key, access_token)
+        kt.on_ticks   = _ticker_on_ticks
+        kt.on_connect = _ticker_on_connect
+        kt.on_error   = _ticker_on_error
+        kt.on_close   = _ticker_on_close
+        _TICKER_OBJ     = kt
+        _TICKER_RUNNING = True
+        kt.connect(threaded=True)
+        return True
+    except Exception:
+        _TICKER_RUNNING = False
+        return False
+
+
+def stop_ticker() -> None:
+    """Disconnect the WebSocket and reset state."""
+    global _TICKER_OBJ, _TICKER_RUNNING
+    if _TICKER_OBJ is not None:
+        try:
+            _TICKER_OBJ.close()
+        except Exception:
+            pass
+        _TICKER_OBJ = None
+    _TICKER_RUNNING = False
+
+
+def is_ticker_alive() -> bool:
+    """
+    True if the WebSocket connection is active AND a tick arrived in the last 10 s.
+    The 10-s recency guard catches silent disconnects where the socket flag
+    stays True but the feed has stalled.
+    """
+    if not _TICKER_RUNNING:
+        return False
+    return (time.time() - _TICKER_TS) < 10.0
+
+
+def get_all_ticker_prices() -> dict:
+    """
+    Returns {display_name: last_price} for every subscribed instrument
+    that has received at least one tick.
+    Thread-safe snapshot under the module lock.
+    """
+    with _TICKER_LOCK:
+        return {
+            _TICKER_SYM_MAP[t]: p
+            for t, p in _TICKER_PRICES.items()
+            if t in _TICKER_SYM_MAP
+        }
+
+
+def get_ticker_ltp(symbol: str) -> "float | None":
+    """Return the latest WebSocket price for a symbol (by display name), or None."""
+    with _TICKER_LOCK:
+        for token, name in _TICKER_SYM_MAP.items():
+            if name == symbol:
+                return _TICKER_PRICES.get(token)
+    return None
+
+
+def get_ticker_ts() -> float:
+    """Epoch seconds of the most recent tick received (0 if none yet)."""
+    return _TICKER_TS
+
+
+def update_ticker_subscriptions(new_token_symbol_map: dict) -> None:
+    """
+    Add new instrument tokens to the running ticker without restarting.
+    Already-subscribed tokens are left unchanged.
+    """
+    global _TICKER_SYM_MAP
+    if _TICKER_OBJ is None or not _TICKER_RUNNING:
+        return
+    with _TICKER_LOCK:
+        new_tokens = [t for t in new_token_symbol_map if t not in _TICKER_SYM_MAP]
+        if not new_tokens:
+            return
+        _TICKER_SYM_MAP.update(new_token_symbol_map)
+    try:
+        _TICKER_OBJ.subscribe(new_tokens)
+        _TICKER_OBJ.set_mode(_TICKER_OBJ.MODE_LTP, new_tokens)
+    except Exception:
+        pass
