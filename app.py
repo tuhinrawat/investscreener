@@ -1548,23 +1548,77 @@ def _market_pulse_header():
         )
     )
 
-    # ── Sector leaders (AI Intel stance) — slim row ───────────────────────
-    if _sector_html:
-        _sector_row_html = (
-            '<div style="background:#080e1c;border:1px solid #1a2744;border-radius:6px;'
-            'padding:3px 10px;display:flex;align-items:center;gap:10px;margin-bottom:3px;'
-            'overflow-x:auto;scrollbar-width:none">'
-            '<span style="font-size:9px;color:#334155;text-transform:uppercase;'
-            'letter-spacing:0.09em;white-space:nowrap;flex-shrink:0">AI SECTOR BIAS</span>'
-            '<span style="color:#1e293b;flex-shrink:0">│</span>'
-            + _sector_html
-            + '</div>'
-        )
-    else:
-        _sector_row_html = ""
+    # ── Sector name normalisation map (AI free-text → our index short key) ──
+    # AI returns arbitrary names; map to the canonical keys we use in _SECTOR_SYMBOLS
+    _AI_SECT_NORM: dict[str, str] = {
+        "bank": "BANK", "banking": "BANK", "nifty bank": "BANK", "psu bank": "PSUBANK",
+        "psubank": "PSUBANK", "public sector": "PSUBANK",
+        "it": "IT", "technology": "IT", "tech": "IT", "software": "IT", "information technology": "IT",
+        "pharma": "PHARMA", "pharmaceutical": "PHARMA", "healthcare": "PHARMA",
+        "auto": "AUTO", "automobile": "AUTO", "automotive": "AUTO",
+        "fmcg": "FMCG", "consumer": "FMCG", "consumer goods": "FMCG", "consumption": "FMCG",
+        "metal": "METAL", "metals": "METAL", "steel": "METAL", "mining": "METAL",
+        "realty": "REALTY", "real estate": "REALTY", "realestate": "REALTY",
+        "energy": "ENERGY", "oil": "ENERGY", "oil & gas": "ENERGY", "oil&gas": "ENERGY",
+        "oil and gas": "ENERGY", "gas": "ENERGY", "power": "ENERGY", "crude": "ENERGY",
+        "infra": "INFRA", "infrastructure": "INFRA",
+        "media": "MEDIA",
+        "finserv": "FINSERV", "financial services": "FINSERV", "finance": "FINSERV", "nbfc": "FINSERV",
+        "midcap": "MID100", "mid cap": "MID100", "mid-cap": "MID100",
+        "smallcap": "SML100", "small cap": "SML100", "small-cap": "SML100",
+    }
 
     # ── Live sectoral index performance (Kite real-time) ─────────────────
     _sect_perf_data: list = st.session_state.get("_sect_perf", [])
+
+    # Build a lookup: short_key → pct  (e.g. "IT" → 0.22)
+    _live_sect_pct: dict[str, float] = {s[0]: s[1] for s in _sect_perf_data}
+
+    # ── Build AI sector annotation row with ✓/✗ vs live ──────────────────
+    _ai_sect_parts: list = []
+    if _sectors:
+        for _sn, _sc in sorted(_sectors.items(), key=lambda x: x[1]["bull"] - x[1]["bear"], reverse=True):
+            _net = _sc["bull"] - _sc["bear"]
+            if _net == 0:
+                continue
+            _predicted_up = _net > 0
+            _sn_norm = _AI_SECT_NORM.get(_sn.strip().lower(), "")
+            _actual_pct = _live_sect_pct.get(_sn_norm) if _sn_norm else None
+            # Match = prediction direction agrees with actual direction
+            if _actual_pct is not None:
+                _match   = (_predicted_up and _actual_pct >= 0) or (not _predicted_up and _actual_pct < 0)
+                _verdict = '<span style="font-size:9px;color:#22c55e">✓</span>' if _match else '<span style="font-size:9px;color:#ef4444">✗</span>'
+                _act_str = f'<span style="color:{"#22c55e" if _actual_pct >= 0 else "#ef4444"};font-size:9px">{"▲" if _actual_pct >= 0 else "▼"}{abs(_actual_pct):.2f}%</span>'
+            else:
+                _verdict = ""
+                _act_str = ""
+            _pred_col = "#22c55e" if _predicted_up else "#ef4444"
+            _pred_arr = "▲" if _predicted_up else "▼"
+            _sn_short = _sn[:8] if len(_sn) <= 8 else (_sn[:7] + "…")
+            _ai_sect_parts.append(
+                f'<span style="white-space:nowrap;font-size:10px;display:inline-flex;align-items:center;gap:2px">'
+                f'<span style="color:{_pred_col}">{_pred_arr}</span>'
+                f'<span style="color:#94a3b8">{_sn_short}</span>'
+                + (f'<span style="color:#334155;font-size:8px">&nbsp;AI</span>' if not _act_str else "")
+                + (f'&nbsp;→&nbsp;{_act_str}&nbsp;{_verdict}' if _act_str else "")
+                + '</span>'
+            )
+
+    _sector_row_html = ""
+    if _ai_sect_parts:
+        _sep_dot = '<span style="color:#1e3a5f;margin:0 4px">·</span>'
+        _sector_row_html = (
+            '<div style="background:#080e1c;border:1px solid #1a2744;border-radius:6px;'
+            'padding:3px 10px;display:flex;align-items:center;gap:8px;margin-bottom:3px;'
+            'overflow-x:auto;scrollbar-width:none">'
+            '<span style="font-size:9px;color:#334155;text-transform:uppercase;'
+            'letter-spacing:0.09em;white-space:nowrap;flex-shrink:0">AI SECTOR BIAS vs LIVE</span>'
+            '<span style="color:#1e293b;flex-shrink:0">│</span>'
+            + _sep_dot.join(_ai_sect_parts)
+            + '</div>'
+        )
+
+    # ── Live sector indices strip (all sectors sorted by move) ───────────
     if _sect_perf_data:
         _sect_parts = []
         for _sn, _spct, _sltp in _sect_perf_data:
@@ -1577,7 +1631,7 @@ def _market_pulse_header():
                 f'{_si}{abs(_spct):.2f}%</span>'
                 f'</span>'
             )
-        _sep_dot = '<span style="color:#1e3a5f;margin:0 2px">·</span>'
+        _sep_dot2 = '<span style="color:#1e3a5f;margin:0 2px">·</span>'
         _live_badge = ('<span style="font-size:8px;padding:1px 4px;border-radius:3px;'
                        'background:#22c55e22;color:#22c55e;font-weight:600;flex-shrink:0">LIVE</span>'
                        if _kite_ok else "")
@@ -1589,7 +1643,7 @@ def _market_pulse_header():
             'letter-spacing:0.09em;white-space:nowrap;flex-shrink:0">SECTOR INDICES</span>'
             + _live_badge
             + '<span style="color:#1e293b;flex-shrink:0">│</span>'
-            + _sep_dot.join(_sect_parts)
+            + _sep_dot2.join(_sect_parts)
             + '</div>'
         )
     else:
