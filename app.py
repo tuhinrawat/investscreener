@@ -6754,14 +6754,35 @@ def _activity_log_live():
         else:                               _cur = _cur.sort_values(["_so","logged_at"],   ascending=[True, False])
         _cur = _cur.drop(columns=["_so"])
 
-        st.caption(f"Showing {len(_cur)} trade(s) for today · auto-refreshes every 2 s")
+        _open_rows  = _cur[_cur["status"] == "OPEN"].copy()
+        _closed_rows = _cur[_cur["status"] != "OPEN"].copy()
+        _n_open_act  = len(_open_rows)
+        _n_closed_act = len(_closed_rows)
+        st.caption(f"Showing {len(_cur)} trade(s) for today · Open trades refresh every second")
 
-        if not _cur.empty:
-            _cur = _enrich_df(_cur, inject_mtm=True)
-            _render_trade_table(_cur, key_sfx="act")
+        # ── Closed trades (static — no need to refresh every second) ──────────
+        if not _closed_rows.empty:
+            st.markdown("##### Closed today")
+            _render_trade_table(_enrich_df(_closed_rows, inject_mtm=False), key_sfx="act_closed")
+
+        # ── Open trades — live MTM refreshed every 1s ─────────────────────────
+        if not _open_rows.empty:
+            st.markdown("##### Open positions (live P&L)")
+            # Pass open rows via session state so the inner fragment can read them
+            st.session_state["_actlog_open_rows"] = _open_rows
+
+            @st.fragment(run_every=1)
+            def _open_trades_mtm():
+                _rows = st.session_state.get("_actlog_open_rows")
+                if _rows is None or _rows.empty:
+                    return
+                # Re-read enrich_df and render_trade_table from enclosing scope
+                _render_trade_table(_enrich_df(_rows, inject_mtm=True), key_sfx="act_open")
+
+            _open_trades_mtm()
 
         # ── Close an open trade ────────────────────────────────────────────
-        _open_trades = _cur[_cur["status"] == "OPEN"] if not _cur.empty else pd.DataFrame()
+        _open_trades = _open_rows
         if not _open_trades.empty:
             st.markdown("---")
             st.subheader("📌 Close an open trade")
