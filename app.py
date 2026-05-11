@@ -1285,23 +1285,23 @@ def _market_pulse_header():
     # returns regularMarketPrice (live tick) + regularMarketChangePercent +
     # marketState (REGULAR/PRE/POST/CLOSED).  Much more reliable than v8/chart
     # with interval=1d which often returns yesterday's close during market hours.
+    # Keys = YF ticker symbols; values = (display_label, region, flag)
+    # The iteration loop uses: for _yfsym, (_gname, _greg, _gflag) in _GLOBAL_META.items()
+    # so keys MUST be YF symbols and tuple[0] MUST be the display label.
     _GLOBAL_META: dict = {
-        # label          yf_symbol       region   flag
-        "S&P 500":   ("^GSPC",     "US",     "🇺🇸"),
-        "NASDAQ":    ("^IXIC",     "US",     "🇺🇸"),
-        "DOW":       ("^DJI",      "US",     "🇺🇸"),
-        "FTSE":      ("^FTSE",     "EU",     "🇬🇧"),
-        "DAX":       ("^GDAXI",    "EU",     "🇩🇪"),
-        "CAC 40":    ("^FCHI",     "EU",     "🇫🇷"),
-        "NIKKEI":    ("^N225",     "ASIA",   "🇯🇵"),
-        "HANG SENG": ("^HSI",      "ASIA",   "🇭🇰"),
-        "SHANGHAI":  ("000001.SS", "ASIA",   "🇨🇳"),
-        "KOSPI":     ("^KS11",     "ASIA",   "🇰🇷"),
-        "ASX 200":   ("^AXJO",     "ASIA",   "🇦🇺"),
-        "SGX":       ("^STI",      "ASIA",   "🇸🇬"),
+        "^GSPC":     ("S&P 500",   "US",   "🇺🇸"),
+        "^IXIC":     ("NASDAQ",    "US",   "🇺🇸"),
+        "^DJI":      ("DOW",       "US",   "🇺🇸"),
+        "^FTSE":     ("FTSE",      "EU",   "🇬🇧"),
+        "^GDAXI":    ("DAX",       "EU",   "🇩🇪"),
+        "^FCHI":     ("CAC 40",    "EU",   "🇫🇷"),
+        "^N225":     ("NIKKEI",    "ASIA", "🇯🇵"),
+        "^HSI":      ("HANG SENG", "ASIA", "🇭🇰"),
+        "000001.SS": ("SHANGHAI",  "ASIA", "🇨🇳"),
+        "^KS11":     ("KOSPI",     "ASIA", "🇰🇷"),
+        "^AXJO":     ("ASX 200",   "ASIA", "🇦🇺"),
+        "^STI":      ("SGX",       "ASIA", "🇸🇬"),
     }
-    # Build reverse map: yf_symbol → (label, region, flag)
-    _sym_to_meta = {v[0]: (k, v[1], v[2]) for k, v in _GLOBAL_META.items()}
 
     # ── Time-based market-open helper (source of truth for OPEN/CLOSED badge) ──
     # Pure stdlib — no pytz needed. Convert UTC now to each region's offset.
@@ -1338,15 +1338,23 @@ def _market_pulse_header():
         # ── Source A: Yahoo Finance v8/chart per symbol ───────────────────
         # Same endpoint as VIX/crude — no crumb/cookie auth needed.
         # interval=1m gives real-time regularMarketPrice in meta.
-        _v8_hdr = {"User-Agent": "Mozilla/5.0 (compatible; screener/1.0)"}
+        import time as _time_mod
+        _v8_hdr = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+        }
         for _yfsym, (_gname, _greg, _gflag) in _GLOBAL_META.items():
             try:
                 _enc = _ulp.quote(_yfsym, safe="")
                 _gr  = _rqm.get(
                     f"https://query1.finance.yahoo.com/v8/finance/chart/{_enc}"
                     "?interval=1m&range=1d",
-                    headers=_v8_hdr, timeout=4,
+                    headers=_v8_hdr, timeout=6,
                 )
+                if _gr.status_code != 200:
+                    continue
                 _gm  = (_gr.json().get("chart", {}).get("result") or [{}])[0].get("meta", {})
                 _gltp  = _gm.get("regularMarketPrice")
                 _gprev = _gm.get("chartPreviousClose") or _gm.get("previousClose")
@@ -1358,6 +1366,7 @@ def _market_pulse_header():
                         "mkt_state": "REGULAR" if _region_open(_greg) else "CLOSED",
                         "src":      "yahoo",
                     }
+                _time_mod.sleep(0.1)   # avoid Yahoo rate-limit across 12 symbols
             except Exception:
                 pass
 
