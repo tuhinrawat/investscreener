@@ -1369,6 +1369,48 @@ def _market_pulse_header():
                     }
         except Exception:
             pass
+
+        # ── Stooq fallback — for any symbol Yahoo missed ───────────────────
+        # Stooq returns real-time/delayed quotes as plain CSV, no key needed.
+        # Daily endpoint gives last N days; we take the 2 most-recent rows for
+        # current price + previous close so % change is accurate.
+        _STOOQ_MAP: dict[str, str] = {
+            "^GSPC":     "^spx",  "^IXIC":    "^ndq",  "^DJI":    "^dji",
+            "^FTSE":     "^ftx",  "^GDAXI":   "^dax",  "^FCHI":   "^cac",
+            "^N225":     "^nkx",  "^HSI":     "^hsi",  "000001.SS":"^shc",
+            "^KS11":     "^ksp",  "^AXJO":    "^asx",  "^STI":    "^sti",
+        }
+        _stooq_hdr = {"User-Agent": "Mozilla/5.0 (compatible; screener/1.0)"}
+        for _yfsym, (_gname, _greg, _gflag) in _GLOBAL_META.items():
+            if _gname in _g_data:
+                continue   # Yahoo already got it
+            _ssym = _STOOQ_MAP.get(_yfsym)
+            if not _ssym:
+                continue
+            try:
+                _sr = _rqm.get(
+                    f"https://stooq.com/q/d/l/?s={_ssym}&i=d",
+                    headers=_stooq_hdr, timeout=6,
+                )
+                # Stooq CSV: Date,Open,High,Low,Close,Volume — newest row first
+                _rows = [r.split(",") for r in _sr.text.strip().splitlines()
+                         if r and not r.startswith("Date")]
+                if not _rows:
+                    continue
+                _ltp  = float(_rows[0][4])   # today's Close
+                _prev = float(_rows[1][4]) if len(_rows) >= 2 else None
+                _pct  = round((_ltp - _prev) / _prev * 100, 2) if _prev else None
+                _g_data[_gname] = {
+                    "ltp":      _ltp,
+                    "pct":      _pct,
+                    "region":   _greg,
+                    "flag":     _gflag,
+                    "mkt_state": "REGULAR" if _region_open(_greg) else "CLOSED",
+                    "src":      "stooq",
+                }
+            except Exception:
+                pass
+
         if _g_data:
             st.session_state["_global_idx"]    = _g_data
             st.session_state["_global_idx_ts"] = _now_ts
@@ -1392,7 +1434,19 @@ def _market_pulse_header():
             "sse":    "000001.SS",  "kospi":  "%5EKS11",
             "asx":    "%5EAXJO",
         }
-        _new_spark: dict = {}
+        # Stooq symbol map for sparkline fallback (key = spark key)
+        _STOOQ_SPARK: dict[str, str] = {
+            "sp500": "^spx",  "nasdaq": "^ndq", "dow":    "^dji",
+            "ftse":  "^ftx",  "dax":    "^dax", "cac":    "^cac",
+            "nikkei":"^nkx",  "hsi":    "^hsi", "sse":    "^shc",
+            "kospi": "^ksp",  "asx":    "^asx",
+            "n50":   "^nsei", "nbank":  "^nsebank",
+        }
+        _stooq_spark_hdr = {"User-Agent": "Mozilla/5.0 (compatible; screener/1.0)"}
+
+        _existing_spark = dict(st.session_state.get("_spark_data") or {})
+        _new_spark: dict = dict(_existing_spark)  # preserve already-loaded keys
+
         for _sk, _sym in _SPARK_SYMS.items():
             try:
                 _sr = _rqm.get(
@@ -1407,6 +1461,23 @@ def _market_pulse_header():
                     _new_spark[_sk] = _closes
             except Exception:
                 pass
+            # Stooq fallback if Yahoo failed for this key
+            if _sk not in _new_spark and _sk in _STOOQ_SPARK:
+                try:
+                    _ssr = _rqm.get(
+                        f"https://stooq.com/q/d/l/?s={_STOOQ_SPARK[_sk]}&i=d",
+                        headers=_stooq_spark_hdr, timeout=7,
+                    )
+                    _srows = [r.split(",") for r in _ssr.text.strip().splitlines()
+                              if r and not r.startswith("Date")]
+                    # Stooq: newest first; reverse so sparkline plots oldest→newest
+                    _srows.reverse()
+                    _sc = [float(r[4]) for r in _srows if len(r) > 4]
+                    if len(_sc) >= 5:
+                        _new_spark[_sk] = _sc
+                except Exception:
+                    pass
+
         if _new_spark:
             st.session_state["_spark_data"] = _new_spark
             st.session_state["_spark_ts"]   = _now_ts
@@ -1787,15 +1858,18 @@ def _market_pulse_header():
         _gvc = "#e2e8f0" if _gmk == "REGULAR" else "#64748b"
         _gv  = (f"{_gl:,.0f}" if _gl and _gl >= 1000 else f"{_gl:,.2f}" if _gl else "—")
         _gs  = (f'{"▲" if (_gp or 0) >= 0 else "▼"}{abs(_gp):.2f}%' if _gp is not None else "—")
+        _is_closed   = _gmk not in ("REGULAR", "PRE", "POST")
         _closed_badge = ('<span style="font-size:8px;color:#475569">&nbsp;CLOSED</span>'
-                         if _gmk not in ("REGULAR", "PRE", "POST") else "")
+                         if _is_closed else "")
+        _src_badge   = ('<span style="font-size:7px;color:#334155">&nbsp;stooq</span>'
+                        if _gd.get("src") == "stooq" else "")
         _spk = (f'<div style="opacity:0.9">{spark_svg}</div>' if spark_svg else "")
         return (
             f'<div style="display:flex;flex-direction:column;padding:4px 12px 6px 12px;'
             f'border-left:1px solid #1e293b;min-width:76px;flex:1">'
             f'<div style="font-size:9px;color:#475569;text-transform:uppercase;'
             f'letter-spacing:0.06em;margin-bottom:2px;white-space:nowrap">'
-            f'{_gfl}&nbsp;{label}{_closed_badge}</div>'
+            f'{_gfl}&nbsp;{label}{_closed_badge}{_src_badge}</div>'
             f'<div style="font-size:12px;font-weight:600;font-family:\'SF Mono\',monospace;'
             f'color:{_gvc};white-space:nowrap">{_gv}</div>'
             f'<div style="font-size:10px;color:{_gcl};font-family:\'SF Mono\',monospace">{_gs}</div>'
