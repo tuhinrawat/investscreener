@@ -1587,7 +1587,7 @@ def _market_pulse_header():
         _bdg = (f'&nbsp;<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:{badge_col}22;color:{badge_col};font-weight:600">{badge}</span>' if badge else "")
         _sub = (f'<div style="font-size:10px;color:{sub_col};margin-top:1px">{sub}</div>' if sub else "")
         _spk = (f'<div style="opacity:0.9">{spark}</div>' if spark else "")
-        return (f'<div style="display:flex;flex-direction:column;padding:4px 14px 6px 14px;border-left:1px solid #1e293b;min-width:80px;flex-shrink:0">'
+        return (f'<div style="display:flex;flex-direction:column;padding:4px 14px 6px 14px;border-left:1px solid #1e293b;min-width:80px;flex:1">'
                 f'<div style="font-size:9px;color:#475569;text-transform:uppercase;letter-spacing:0.07em;margin-bottom:2px">{label}</div>'
                 f'<div style="font-size:13px;font-weight:600;font-family:\'SF Mono\',\'Fira Code\',monospace;color:{val_col};white-space:nowrap">{val}{_bdg}</div>'
                 f'{_sub}{_spk}</div>')
@@ -1744,20 +1744,26 @@ def _market_pulse_header():
                 f'{_si}{abs(_spct):.2f}%</span>'
                 f'</span>'
             )
-        _sep_dot2 = '<span style="color:#1e3a5f;margin:0 2px">·</span>'
         _live_badge = ('<span style="font-size:8px;padding:1px 4px;border-radius:3px;'
                        'background:#22c55e22;color:#22c55e;font-weight:600;flex-shrink:0">LIVE</span>'
                        if _kite_ok else "")
+        # Wrap each sector chip in a flex:1 cell so they fill the row evenly
+        _sect_cells = "".join(
+            f'<span style="flex:1;text-align:center;white-space:nowrap;font-size:10px">'
+            + p.split('style="white-space:nowrap;font-size:10px">', 1)[-1]  # reuse inner HTML
+            for p in _sect_parts
+        )
         _sect_live_html = (
             '<div style="background:#080e1c;border:1px solid #1a2744;border-radius:6px;'
-            'padding:3px 10px;display:flex;align-items:center;gap:8px;margin-bottom:4px;'
+            'padding:3px 10px;display:flex;align-items:center;gap:4px;margin-bottom:4px;'
             'overflow-x:auto;scrollbar-width:none">'
             '<span style="font-size:9px;color:#334155;text-transform:uppercase;'
             'letter-spacing:0.09em;white-space:nowrap;flex-shrink:0">SECTOR INDICES</span>'
             + _live_badge
-            + '<span style="color:#1e293b;flex-shrink:0">│</span>'
-            + _sep_dot2.join(_sect_parts)
-            + '</div>'
+            + '<span style="color:#1e293b;flex-shrink:0;margin:0 4px">│</span>'
+            + '<div style="display:flex;flex:1;justify-content:space-between;align-items:center">'
+            + "".join(_sect_parts)
+            + '</div></div>'
         )
     else:
         _sect_live_html = ""
@@ -1781,7 +1787,7 @@ def _market_pulse_header():
         _spk = (f'<div style="opacity:0.9">{spark_svg}</div>' if spark_svg else "")
         return (
             f'<div style="display:flex;flex-direction:column;padding:4px 12px 6px 12px;'
-            f'border-left:1px solid #1e293b;min-width:76px;flex-shrink:0">'
+            f'border-left:1px solid #1e293b;min-width:76px;flex:1">'
             f'<div style="font-size:9px;color:#475569;text-transform:uppercase;'
             f'letter-spacing:0.06em;margin-bottom:2px;white-space:nowrap">'
             f'{_gfl}&nbsp;{label}{_closed_badge}</div>'
