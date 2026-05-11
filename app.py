@@ -8137,21 +8137,19 @@ def _ticker_banner():
             _cache_age = _time_mod.time() - st.session_state.get("_banner_rest_ts", 0)
             if not _cached or _cache_age > 120:
                 try:
-                    # Build symbol list in "EXCHANGE:TRADINGSYMBOL" format — the only
-                    # format kite.ltp() reliably returns with matching response keys.
+                    # Use get_ohlc_batch() — already rate-limited, returns last_price.
+                    # Response: {"NSE:NIFTY 50": {"last_price": 24500, "ohlc": {...}}, ...}
                     _sym_list = ["NSE:NIFTY 50", "NSE:NIFTY BANK"]
                     _sbase = st.session_state.get("_signals_base_df")
                     if _sbase is not None and not _sbase.empty and "tradingsymbol" in _sbase.columns:
-                        for _ts in _sbase["tradingsymbol"].dropna().astype(str).tolist():
+                        for _ts in _sbase["tradingsymbol"].dropna().astype(str).unique().tolist():
                             _sym_list.append(f"NSE:{_ts}")
-                    # Kite ltp() returns {"NSE:NIFTY 50": {"last_price": 24500.0, ...}, ...}
-                    _ltp_r   = _kc_chk.kite.ltp(_sym_list)
+                    _ohlc_r  = _kc_chk.get_ohlc_batch(_sym_list)
                     _fetched = {}
-                    for _full_sym, _data in _ltp_r.items():
+                    for _full_sym, _data in _ohlc_r.items():
                         _lp = (_data or {}).get("last_price")
                         if _lp:
-                            # Strip exchange prefix for display ("NSE:RELIANCE" → "RELIANCE")
-                            _disp = _full_sym.split(":", 1)[-1]
+                            _disp = _full_sym.split(":", 1)[-1]   # "NSE:RELIANCE" → "RELIANCE"
                             _fetched[_disp] = float(_lp)
                     if _fetched:
                         st.session_state["_banner_rest_ltp"] = _fetched
