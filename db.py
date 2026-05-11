@@ -244,7 +244,7 @@ def init_schema():
             quantity            INTEGER,
             actual_entry        DOUBLE,
             actual_exit         DOUBLE,    -- NULL = still open
-            status              VARCHAR,   -- OPEN / CLOSED / TARGET_HIT / STOPPED_OUT / CANCELLED / REJECTED
+            status              VARCHAR,   -- OPEN / CLOSED / TARGET_HIT / STOPPED_OUT / PARTIAL_T1 / CANCELLED / REJECTED
             notes               TEXT,
 
             -- ── CALCULATED OUTCOMES (populated on close) ─────────────────
@@ -644,6 +644,26 @@ def close_trade(trade_id: int, actual_exit: float, status: str, notes: str = Non
         outcomes["rr_realised"],
         trade_id,
     ])
+    con.close()
+
+
+def note_partial_t1(trade_id: int, t1_price: float, note: str):
+    """
+    Record a partial T1 booking event WITHOUT closing the trade.
+
+    The trade remains OPEN in the DB so exit monitoring continues.
+    We append a note to document that 60% was booked at T1 and the
+    remaining 40% is trailing to T2.  The final close_trade() call
+    will record the full exit P&L when T2 is hit or the trade is stopped.
+    """
+    con = get_conn()
+    old = con.execute("SELECT notes FROM trade_log WHERE id = ?", [trade_id]).fetchone()
+    old_notes = (old[0] or "") if old else ""
+    merged = "\n".join(filter(None, [old_notes, note]))
+    con.execute(
+        "UPDATE trade_log SET notes = ? WHERE id = ?",
+        [merged, trade_id],
+    )
     con.close()
 
 

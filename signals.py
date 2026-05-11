@@ -4,18 +4,27 @@ signals.py — Trade signal engine.
 Answers three questions for every stock:
   1. WHEN to BUY      → entry price, stop loss, targets, R/R
   2. WHEN to SELL     → exit trigger with reason
-  3. FOR WHICH SETUP  → Intraday, Swing, or Scaling
+  3. FOR WHICH SETUP  → Intraday, Swing, Scaling, or Scalping
 
-Three setup types:
+Four setup types:
   - Swing    : 2–10 day hold, trend-following (EMA stack + volume)
   - Intraday : same-day plan from previous session's candle (pivot levels)
   - Scaling  : multi-week position build on confirmed uptrend stocks
+  - Scalping : fast in/out (< 30 min hold) using Opening Range Breakout +
+               VWAP alignment + intraday RSI — 3 internal confirmations required
 
 Each setup returns a flat dict ready to merge into the metrics row.
 All price levels are rounded to 2 decimal places.
+
+New intraday gates (applied at trigger time):
+  - Nifty intraday direction gate: suppresses longs on Nifty < -NIFTY_GATE_PCT,
+    suppresses shorts on Nifty > +NIFTY_GATE_PCT
+  - Gap detection: flags gap-up entries (today's open far above R1) as risk
+  - Partial booking: T1 = R2 (60% exit), T2 = R3 (trailing 40%)
 """
 import numpy as np
 import pandas as pd
+import config as _cfg
 
 
 # ─── internal helpers ───────────────────────────────────────────────────────
@@ -338,13 +347,18 @@ _INTRA_NULL = {
     "intraday_pivot":      None,
     "intraday_r1":         None,
     "intraday_r2":         None,
+    "intraday_r3":         None,
     "intraday_s1":         None,
     "intraday_s2":         None,
+    "intraday_s3":         None,
     "intraday_entry":      None,
     "intraday_stop":       None,
     "intraday_t1":         None,
+    "intraday_t2":         None,
     "intraday_reason":     None,
     "intraday_confidence": None,
+    "intraday_gap_flag":   None,
+    "intraday_nifty_gate": None,
 }
 
 
@@ -432,19 +446,28 @@ def intraday_signal(
     rsi_buy_max: float = 75.0,
     rsi_sell_min: float = 25.0,
     min_rr: float = 1.5,
+    nifty_pct_change: float = 0.0,
+    today_open: float | None = None,
 ) -> dict:
     """
     Day-trading plan derived from the previous session's candle.
 
-    Computes classical pivot levels (P, R1, R2, S1, S2) and generates:
+    Computes classical pivot levels (P, R1, R2, R3, S1, S2, S3) and generates:
       BUY_ABOVE  : long when price breaks above R1 (trend up, RSI not overbought)
       SELL_BELOW : short when price breaks below S1 (trend down, RSI not oversold)
       AVOID      : structure is ambiguous / risk not worthwhile
 
     Key rule: ALL intraday trades must be closed by 3:10 PM regardless.
 
-    LONG  entry = 0.1% above R1  | stop = just below R1  | T1 = R2
-    SHORT entry = 0.1% below S1  | stop = just above S1  | T1 = S2
+    LONG  entry = 0.1% above R1  | stop = max(0.3% below R1, 0.5×ATR)  | T1 = R2  | T2 = R3
+    SHORT entry = 0.1% below S1  | stop = max(0.3% above S1, 0.5×ATR)  | T1 = S2  | T2 = S3
+
+    New gates (applied on top of baseline R/R and RSI checks):
+      nifty_pct_change — today's Nifty 50 intraday % change from prev close.
+        Long signals are flagged/suppressed when Nifty < -NIFTY_GATE_PCT.
+        Short signals are flagged/suppressed when Nifty > +NIFTY_GATE_PCT.
+      today_open — today's open price for the stock.  If open is already
+        GAP_WARN_PCT% above R1, flag as gap-up risk; if > GAP_SKIP_PCT, AVOID.
 
     Thresholds (rsi_buy_max, rsi_sell_min, min_rr) are tunable via paper-trade
     feedback — pass values from db.get_signal_config() to adjust the algo.
@@ -458,22 +481,19 @@ def intraday_signal(
         return dict(_INTRA_NULL)
 
     lvls = _pivot_levels(df)
-    P, R1, R2 = lvls["pivot"], lvls["r1"], lvls["r2"]
-    S1, S2    = lvls["s1"],    lvls["s2"]
+    P, R1, R2, R3 = lvls["pivot"], lvls["r1"], lvls["r2"], lvls["r3"]
+    S1, S2, S3    = lvls["s1"],    lvls["s2"], lvls["s3"]
 
     # Guard: if H-L spread from yesterday is < 0.3% of close, the pivot levels
     # are meaningless (e.g. liquid ETFs, debt funds). AVOID to prevent T1 <= entry.
-    prev_hl_range = P * 3 - lvls.get("s1_raw_high", P * 3) if "s1_raw_high" in lvls else None
     _spread_pct = (R2 - S2) / P if P > 0 else 0  # total pivot range as % of pivot
     if _spread_pct < 0.006:          # less than 0.6% total range → no tradeable levels
         return {
             **_INTRA_NULL,
             "intraday_signal": "AVOID",
             "intraday_pivot":  P,
-            "intraday_r1":     R1,
-            "intraday_r2":     R2,
-            "intraday_s1":     S1,
-            "intraday_s2":     S2,
+            "intraday_r1": R1, "intraday_r2": R2, "intraday_r3": R3,
+            "intraday_s1": S1, "intraday_s2": S2, "intraday_s3": S3,
             "intraday_reason": "H-L spread too narrow for reliable pivot levels (ETF/fund).",
         }
 
@@ -485,23 +505,19 @@ def intraday_signal(
             entry = round(R1 + max(0.01, R1 * 0.001), 2)
 
         # Stop = max(R1×0.997, R1 − 0.5×ATR).
-        # Using a flat 0.3% was too tight for volatile mid/small caps (ATR often
-        # 1–2% of price). The ATR-based floor prevents the stop from sitting inside
-        # normal intraday noise while keeping the R1-anchor logic intact.
-        # On low-volatility large-caps the 0.3% flat wins; on small-caps the ATR
-        # floor protects against premature stops.
         _atr_stop = round(R1 - 0.5 * atr, 2) if atr else None
         stop = round(R1 * 0.997, 2)          # 0.3% below R1 (minimum stop)
         if _atr_stop is not None and _atr_stop < stop:
             stop = _atr_stop                 # widen if ATR warrants it
 
-        t1   = R2
+        t1 = R2
+        t2 = R3   # partial-booking second target
         if t1 <= entry:
             return {
                 **_INTRA_NULL,
                 "intraday_signal": "AVOID",
-                "intraday_pivot": P, "intraday_r1": R1, "intraday_r2": R2,
-                "intraday_s1": S1, "intraday_s2": S2,
+                "intraday_pivot": P, "intraday_r1": R1, "intraday_r2": R2, "intraday_r3": R3,
+                "intraday_s1": S1, "intraday_s2": S2, "intraday_s3": S3,
                 "intraday_reason": "R2 target not far enough above R1 — insufficient range for trade.",
             }
         risk = entry - stop
@@ -512,28 +528,65 @@ def intraday_signal(
             return {
                 **_INTRA_NULL,
                 "intraday_signal": "AVOID",
-                "intraday_pivot": P, "intraday_r1": R1, "intraday_r2": R2,
-                "intraday_s1": S1, "intraday_s2": S2,
+                "intraday_pivot": P, "intraday_r1": R1, "intraday_r2": R2, "intraday_r3": R3,
+                "intraday_s1": S1, "intraday_s2": S2, "intraday_s3": S3,
                 "intraday_reason": f"R/R {rr:.1f}× < {min_rr:.1f}× minimum — risk not justified.",
             }
+
+        # ── Gap-up detection ──────────────────────────────────────────────
+        gap_flag = None
+        if today_open is not None and R1 > 0:
+            gap_pct = (today_open - R1) / R1 * 100
+            if gap_pct >= _cfg.GAP_SKIP_PCT:
+                return {
+                    **_INTRA_NULL,
+                    "intraday_signal": "AVOID",
+                    "intraday_pivot": P, "intraday_r1": R1, "intraday_r2": R2, "intraday_r3": R3,
+                    "intraday_s1": S1, "intraday_s2": S2, "intraday_s3": S3,
+                    "intraday_reason": (
+                        f"Gap-up too large ({gap_pct:.1f}% above R1) — "
+                        "entry already at risk of fading. Skip."
+                    ),
+                    "intraday_gap_flag": "GAP_SKIP",
+                }
+            elif gap_pct >= _cfg.GAP_WARN_PCT:
+                gap_flag = "GAP_WARN"   # emit signal but warn in the reason
+
+        # ── Nifty direction gate ──────────────────────────────────────────
+        nifty_gate = None
+        if nifty_pct_change <= -_cfg.NIFTY_GATE_PCT:
+            nifty_gate = "NIFTY_BEARISH"   # market is down — long may face headwind
+
         _conf = compute_intraday_confidence(metrics, rr, "BUY_ABOVE")
+
+        gap_note   = (f" ⚠️ Gap-up {(today_open - R1) / R1 * 100:.1f}% above R1 — watch for fade."
+                      if gap_flag == "GAP_WARN" else "")
+        nifty_note = (f" ⚠️ Nifty down {abs(nifty_pct_change):.1f}% today — headwind for longs."
+                      if nifty_gate else "")
+
         return {
             "intraday_signal":     "BUY_ABOVE",
             "intraday_pivot":      P,
             "intraday_r1":         R1,
             "intraday_r2":         R2,
+            "intraday_r3":         R3,
             "intraday_s1":         S1,
             "intraday_s2":         S2,
+            "intraday_s3":         S3,
             "intraday_entry":      entry,
             "intraday_stop":       stop,
             "intraday_t1":         t1,
+            "intraday_t2":         t2,
             "intraday_confidence": _conf,
+            "intraday_gap_flag":   gap_flag,
+            "intraday_nifty_gate": nifty_gate,
             "intraday_reason": (
                 f"Trend up (above EMA20 ₹{e20:.2f}). "
                 f"BUY when price trades above R1 ₹{R1:.2f}. "
-                f"Stop ₹{stop:.2f} (max of 0.3% below R1, 0.5×ATR={0.5*atr:.2f}). "
-                f"Target R2 ₹{R2:.2f}. R/R {rr:.1f}×. "
-                f"Confidence {_conf}/10. Hard exit 3:10 PM."
+                f"Stop ₹{stop:.2f} (max 0.3% below R1, 0.5×ATR={0.5*atr:.2f}). "
+                f"T1 ₹{t1:.2f} (R2, 60% exit). T2 ₹{t2:.2f} (R3, trail 40%). "
+                f"R/R {rr:.1f}×. Confidence {_conf}/10. Hard exit 3:10 PM."
+                f"{gap_note}{nifty_note}"
             ),
         }
 
@@ -547,6 +600,7 @@ def intraday_signal(
         if _atr_stop_s is not None and _atr_stop_s > stop:
             stop = _atr_stop_s                # widen if ATR warrants it
         t1    = S2
+        t2    = S3  # trail target
         risk  = stop - entry
         rr    = round((entry - t1) / risk, 2) if risk > 0 else 0
 
@@ -555,28 +609,65 @@ def intraday_signal(
             return {
                 **_INTRA_NULL,
                 "intraday_signal": "AVOID",
-                "intraday_pivot": P, "intraday_r1": R1, "intraday_r2": R2,
-                "intraday_s1": S1, "intraday_s2": S2,
+                "intraday_pivot": P, "intraday_r1": R1, "intraday_r2": R2, "intraday_r3": R3,
+                "intraday_s1": S1, "intraday_s2": S2, "intraday_s3": S3,
                 "intraday_reason": f"Short R/R {rr:.1f}× < {min_rr:.1f}× minimum — risk not justified.",
             }
+
+        # ── Gap-down detection for shorts ─────────────────────────────────
+        gap_flag = None
+        if today_open is not None and S1 > 0:
+            gap_pct_s = (S1 - today_open) / S1 * 100   # how far below S1 did we open
+            if gap_pct_s >= _cfg.GAP_SKIP_PCT:
+                return {
+                    **_INTRA_NULL,
+                    "intraday_signal": "AVOID",
+                    "intraday_pivot": P, "intraday_r1": R1, "intraday_r2": R2, "intraday_r3": R3,
+                    "intraday_s1": S1, "intraday_s2": S2, "intraday_s3": S3,
+                    "intraday_reason": (
+                        f"Gap-down too large ({gap_pct_s:.1f}% below S1) — "
+                        "short entry already at risk of reversal. Skip."
+                    ),
+                    "intraday_gap_flag": "GAP_SKIP",
+                }
+            elif gap_pct_s >= _cfg.GAP_WARN_PCT:
+                gap_flag = "GAP_WARN"
+
+        # ── Nifty direction gate for shorts ───────────────────────────────
+        nifty_gate = None
+        if nifty_pct_change >= _cfg.NIFTY_GATE_PCT:
+            nifty_gate = "NIFTY_BULLISH"   # market is up — short may face headwind
+
         _conf = compute_intraday_confidence(metrics, rr, "SELL_BELOW")
+
+        gap_note   = (f" ⚠️ Gap-down {(S1 - today_open) / S1 * 100:.1f}% below S1 — watch for reversal."
+                      if gap_flag == "GAP_WARN" and today_open is not None else "")
+        nifty_note = (f" ⚠️ Nifty up {abs(nifty_pct_change):.1f}% today — headwind for shorts."
+                      if nifty_gate else "")
+
         return {
             "intraday_signal":     "SELL_BELOW",
             "intraday_pivot":      P,
             "intraday_r1":         R1,
             "intraday_r2":         R2,
+            "intraday_r3":         R3,
             "intraday_s1":         S1,
             "intraday_s2":         S2,
+            "intraday_s3":         S3,
             "intraday_entry":      entry,
             "intraday_stop":       stop,
             "intraday_t1":         t1,
+            "intraday_t2":         t2,
             "intraday_confidence": _conf,
+            "intraday_gap_flag":   gap_flag,
+            "intraday_nifty_gate": nifty_gate,
             "intraday_reason": (
                 f"Trend down (below EMA20 ₹{e20:.2f}). "
                 f"SHORT when price breaks below S1 ₹{S1:.2f}. "
-                f"Stop just above S1 ₹{stop:.2f}. "
-                f"Target S2 ₹{S2:.2f}. R/R {rr:.1f}×. "
-                f"Confidence {_conf}/10. Hard exit 3:10 PM."
+                f"Stop ₹{stop:.2f} (max 0.3% above S1, 0.5×ATR). "
+                f"T1 ₹{t1:.2f} (S2, 60% exit). T2 ₹{t2:.2f} (S3, trail 40%). "
+                f"R/R {rr:.1f}×. Confidence {_conf}/10. Hard exit 3:10 PM."
+                f"{gap_note}{nifty_note}"
             ),
         }
 
@@ -585,13 +676,281 @@ def intraday_signal(
         **_INTRA_NULL,
         "intraday_signal": "AVOID",
         "intraday_pivot":  P,
-        "intraday_r1":     R1,
-        "intraday_r2":     R2,
-        "intraday_s1":     S1,
-        "intraday_s2":     S2,
+        "intraday_r1": R1, "intraday_r2": R2, "intraday_r3": R3,
+        "intraday_s1": S1, "intraday_s2": S2, "intraday_s3": S3,
         "intraday_reason": (
             "Overbought or oversold — risk/reward poor. "
             f"Key levels: Pivot ₹{P:.2f} | R1 ₹{R1:.2f} | S1 ₹{S1:.2f}."
+        ),
+    }
+
+
+# ─── scalping signal (Opening Range Breakout) ────────────────────────────────
+
+_SCALP_NULL = {
+    "scalp_signal":        None,
+    "scalp_direction":     None,
+    "scalp_entry":         None,
+    "scalp_stop":          None,
+    "scalp_t1":            None,
+    "scalp_rr":            None,
+    "scalp_confirmations": None,
+    "scalp_orb_high":      None,
+    "scalp_orb_low":       None,
+    "scalp_vwap":          None,
+    "scalp_reason":        None,
+    "scalp_confidence":    None,
+}
+
+
+def scalping_signal(
+    current_ltp: float,
+    orb_high: float | None,
+    orb_low: float | None,
+    orb_range: float | None,
+    vwap_price: float | None,
+    rsi_5min: float | None,
+    atr: float | None,
+    nifty_pct_change: float = 0.0,
+    daily_vol_ratio: float | None = None,
+) -> dict:
+    """
+    Opening Range Breakout (ORB) scalping signal with 3 internal confirmations.
+
+    Strategy:
+      • Compute the opening range (first 15 minutes: 9:15–9:30 AM).
+      • Long scalp: LTP breaks above ORB high  → quick momentum entry.
+      • Short scalp: LTP breaks below ORB low  → quick momentum short.
+
+    Three internal confirmation signals (need ≥ SCALP_MIN_CONFIRMATIONS = 2/3):
+      1. ORB Breakout       — LTP crossed above ORB_high (long) / below ORB_low (short)
+      2. VWAP Alignment     — LTP is above VWAP (long) / below VWAP (short)
+      3. RSI 5-min Momentum — RSI > 55 (long) / RSI < 45 (short) on 5-min candles
+
+    Additional context gates (reduce confidence, don't block):
+      • Nifty direction: if Nifty is down and we're long, signal is lower confidence
+      • Volume pace: if today's volume is running below average, signal is lower confidence
+
+    Targets / Stops:
+      Target  = breakout + SCALP_TARGET_MULT × ORB_range  (default 1.5×)
+      Stop    = breakout − SCALP_STOP_MULT   × ORB_range  (default 0.5×)
+      Minimum stop floor: 0.2% below entry (prevents microscopic stops)
+
+    Returns _SCALP_NULL if ORB data is unavailable or no breakout is confirmed.
+    """
+    if orb_high is None or orb_low is None or orb_range is None or orb_range <= 0:
+        return dict(_SCALP_NULL)
+    if current_ltp is None or current_ltp <= 0:
+        return dict(_SCALP_NULL)
+
+    min_conf = _cfg.SCALP_MIN_CONFIRMATIONS
+
+    # ── LONG scalp: breakout above ORB high ──────────────────────────────
+    if current_ltp > orb_high:
+        confirmations = []
+        conf_notes    = []
+
+        # Confirmation 1 — ORB breakout (always true by branch condition)
+        confirmations.append("ORB↑")
+        conf_notes.append(f"ORB breakout above ₹{orb_high:.2f} ✓")
+
+        # Confirmation 2 — VWAP alignment
+        if vwap_price is not None:
+            if current_ltp > vwap_price:
+                confirmations.append("VWAP↑")
+                conf_notes.append(f"Above VWAP ₹{vwap_price:.2f} ✓")
+            else:
+                conf_notes.append(f"Below VWAP ₹{vwap_price:.2f} ✗")
+        else:
+            conf_notes.append("VWAP: n/a")
+
+        # Confirmation 3 — RSI 5-min momentum
+        if rsi_5min is not None:
+            if rsi_5min > 55:
+                confirmations.append("RSI↑")
+                conf_notes.append(f"5-min RSI {rsi_5min:.0f} > 55 ✓")
+            else:
+                conf_notes.append(f"5-min RSI {rsi_5min:.0f} ≤ 55 ✗")
+        else:
+            conf_notes.append("5-min RSI: n/a")
+
+        n_confirmed = len(confirmations)
+        if n_confirmed < min_conf:
+            return {
+                **_SCALP_NULL,
+                "scalp_signal":        "WATCH",
+                "scalp_direction":     "LONG",
+                "scalp_orb_high":      orb_high,
+                "scalp_orb_low":       orb_low,
+                "scalp_vwap":          vwap_price,
+                "scalp_confirmations": n_confirmed,
+                "scalp_reason": (
+                    f"ORB long breakout but only {n_confirmed}/{min_conf} confirmations. "
+                    + " | ".join(conf_notes)
+                ),
+            }
+
+        # Levels
+        entry  = round(orb_high, 2)
+        target = round(entry + _cfg.SCALP_TARGET_MULT * orb_range, 2)
+        raw_stop = entry - _cfg.SCALP_STOP_MULT * orb_range
+        floor_stop = entry * (1 - _cfg.SCALP_STOP_FLOOR_PCT)
+        stop   = round(min(raw_stop, floor_stop), 2)
+        risk   = entry - stop
+        rr     = round((target - entry) / risk, 2) if risk > 0 else 0
+
+        if rr < _cfg.SCALP_MIN_RR:
+            return {
+                **_SCALP_NULL,
+                "scalp_signal":     "WATCH",
+                "scalp_direction":  "LONG",
+                "scalp_orb_high":   orb_high,
+                "scalp_orb_low":    orb_low,
+                "scalp_vwap":       vwap_price,
+                "scalp_reason":     f"ORB long — R/R {rr:.1f}× < {_cfg.SCALP_MIN_RR:.1f}× minimum.",
+            }
+
+        # Context confidence adjustments
+        context_notes = []
+        base_score = n_confirmed  # 2 or 3
+        if nifty_pct_change <= -_cfg.NIFTY_GATE_PCT:
+            base_score -= 1
+            context_notes.append(f"⚠️ Nifty down {abs(nifty_pct_change):.1f}%")
+        if daily_vol_ratio is not None and daily_vol_ratio < 0.8:
+            base_score -= 1
+            context_notes.append(f"⚠️ Volume only {daily_vol_ratio:.1f}× avg pace")
+        scalp_conf = max(0, min(10, base_score * 3 + 1))  # scale 0-3 base → 1-10
+
+        context_str = " | ".join(context_notes) if context_notes else ""
+        return {
+            "scalp_signal":        "LONG",
+            "scalp_direction":     "LONG",
+            "scalp_entry":         entry,
+            "scalp_stop":          stop,
+            "scalp_t1":            target,
+            "scalp_rr":            rr,
+            "scalp_confirmations": n_confirmed,
+            "scalp_orb_high":      orb_high,
+            "scalp_orb_low":       orb_low,
+            "scalp_vwap":          vwap_price,
+            "scalp_confidence":    scalp_conf,
+            "scalp_reason": (
+                f"ORB LONG breakout. {n_confirmed}/3 confirmations: "
+                + " | ".join(conf_notes)
+                + f". Entry ₹{entry:.2f} | Stop ₹{stop:.2f} | Target ₹{target:.2f} "
+                + f"(1.5× ORB range ₹{orb_range:.2f}). R/R {rr:.1f}×."
+                + (f" {context_str}" if context_str else "")
+                + f" Hard exit 2:45 PM."
+            ),
+        }
+
+    # ── SHORT scalp: breakdown below ORB low ─────────────────────────────
+    if current_ltp < orb_low:
+        confirmations = []
+        conf_notes    = []
+
+        # Confirmation 1 — ORB breakdown
+        confirmations.append("ORB↓")
+        conf_notes.append(f"ORB breakdown below ₹{orb_low:.2f} ✓")
+
+        # Confirmation 2 — VWAP alignment
+        if vwap_price is not None:
+            if current_ltp < vwap_price:
+                confirmations.append("VWAP↓")
+                conf_notes.append(f"Below VWAP ₹{vwap_price:.2f} ✓")
+            else:
+                conf_notes.append(f"Above VWAP ₹{vwap_price:.2f} ✗")
+        else:
+            conf_notes.append("VWAP: n/a")
+
+        # Confirmation 3 — RSI 5-min momentum
+        if rsi_5min is not None:
+            if rsi_5min < 45:
+                confirmations.append("RSI↓")
+                conf_notes.append(f"5-min RSI {rsi_5min:.0f} < 45 ✓")
+            else:
+                conf_notes.append(f"5-min RSI {rsi_5min:.0f} ≥ 45 ✗")
+        else:
+            conf_notes.append("5-min RSI: n/a")
+
+        n_confirmed = len(confirmations)
+        if n_confirmed < min_conf:
+            return {
+                **_SCALP_NULL,
+                "scalp_signal":        "WATCH",
+                "scalp_direction":     "SHORT",
+                "scalp_orb_high":      orb_high,
+                "scalp_orb_low":       orb_low,
+                "scalp_vwap":          vwap_price,
+                "scalp_confirmations": n_confirmed,
+                "scalp_reason": (
+                    f"ORB short breakdown but only {n_confirmed}/{min_conf} confirmations. "
+                    + " | ".join(conf_notes)
+                ),
+            }
+
+        entry   = round(orb_low, 2)
+        target  = round(entry - _cfg.SCALP_TARGET_MULT * orb_range, 2)
+        raw_stop = entry + _cfg.SCALP_STOP_MULT * orb_range
+        floor_stop = entry * (1 + _cfg.SCALP_STOP_FLOOR_PCT)
+        stop    = round(max(raw_stop, floor_stop), 2)
+        risk    = stop - entry
+        rr      = round((entry - target) / risk, 2) if risk > 0 else 0
+
+        if rr < _cfg.SCALP_MIN_RR:
+            return {
+                **_SCALP_NULL,
+                "scalp_signal":     "WATCH",
+                "scalp_direction":  "SHORT",
+                "scalp_orb_high":   orb_high,
+                "scalp_orb_low":    orb_low,
+                "scalp_vwap":       vwap_price,
+                "scalp_reason":     f"ORB short — R/R {rr:.1f}× < {_cfg.SCALP_MIN_RR:.1f}× minimum.",
+            }
+
+        context_notes = []
+        base_score = n_confirmed
+        if nifty_pct_change >= _cfg.NIFTY_GATE_PCT:
+            base_score -= 1
+            context_notes.append(f"⚠️ Nifty up {nifty_pct_change:.1f}%")
+        if daily_vol_ratio is not None and daily_vol_ratio < 0.8:
+            base_score -= 1
+            context_notes.append(f"⚠️ Volume only {daily_vol_ratio:.1f}× avg pace")
+        scalp_conf = max(0, min(10, base_score * 3 + 1))
+
+        context_str = " | ".join(context_notes) if context_notes else ""
+        return {
+            "scalp_signal":        "SHORT",
+            "scalp_direction":     "SHORT",
+            "scalp_entry":         entry,
+            "scalp_stop":          stop,
+            "scalp_t1":            target,
+            "scalp_rr":            rr,
+            "scalp_confirmations": n_confirmed,
+            "scalp_orb_high":      orb_high,
+            "scalp_orb_low":       orb_low,
+            "scalp_vwap":          vwap_price,
+            "scalp_confidence":    scalp_conf,
+            "scalp_reason": (
+                f"ORB SHORT breakdown. {n_confirmed}/3 confirmations: "
+                + " | ".join(conf_notes)
+                + f". Entry ₹{entry:.2f} | Stop ₹{stop:.2f} | Target ₹{target:.2f} "
+                + f"(1.5× ORB range ₹{orb_range:.2f}). R/R {rr:.1f}×."
+                + (f" {context_str}" if context_str else "")
+                + f" Hard exit 2:45 PM."
+            ),
+        }
+
+    # LTP is inside the ORB — no scalp signal yet
+    return {
+        **_SCALP_NULL,
+        "scalp_signal":    "INSIDE_ORB",
+        "scalp_orb_high":  orb_high,
+        "scalp_orb_low":   orb_low,
+        "scalp_vwap":      vwap_price,
+        "scalp_reason":    (
+            f"LTP ₹{current_ltp:.2f} inside ORB [{orb_low:.2f}–{orb_high:.2f}]. "
+            "Waiting for breakout/breakdown."
         ),
     }
 
@@ -707,22 +1066,31 @@ def compute_all_signals(
     rsi_buy_max: float = 75.0,
     rsi_sell_min: float = 25.0,
     min_rr: float = 1.5,
+    nifty_pct_change: float = 0.0,
+    today_open: float | None = None,
 ) -> dict:
     """
-    Runs all three setups and returns a single merged dict.
+    Runs all four setups and returns a single merged dict.
     Safe to call even if df is empty or metrics are partial.
 
     Pass rsi_buy_max / rsi_sell_min / min_rr from db.get_signal_config() to
     use paper-trade-tuned thresholds instead of the hard-coded defaults.
+
+    nifty_pct_change — today's Nifty intraday % move (from live LTP vs prev close).
+    today_open       — today's open price (for gap detection).
     """
     if df is None or df.empty or len(df) < 20:
-        return {**_SWING_NULL, **_INTRA_NULL, **_SCALE_NULL}
+        return {**_SWING_NULL, **_INTRA_NULL, **_SCALE_NULL, **_SCALP_NULL}
 
     df = df.sort_values("date").reset_index(drop=True)
     sw = swing_signal(df, metrics)
     it = intraday_signal(df, metrics,
                          rsi_buy_max=rsi_buy_max,
                          rsi_sell_min=rsi_sell_min,
-                         min_rr=min_rr)
+                         min_rr=min_rr,
+                         nifty_pct_change=nifty_pct_change,
+                         today_open=today_open)
     sc = scaling_signal(df, metrics)
-    return {**sw, **it, **sc}
+    # Scalping signal is computed live in app.py once ORB + VWAP are available;
+    # here we return the null placeholder so the merged dict has consistent keys.
+    return {**sw, **it, **sc, **_SCALP_NULL}

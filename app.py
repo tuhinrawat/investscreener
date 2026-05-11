@@ -538,6 +538,25 @@ if st.session_state.get("_day_gate_date") != _today_str:
     st.session_state["real_day_hwm_pct"]   = 0.0
     st.session_state["real_day_blocked"]   = False
     st.session_state["_day_gate_date"]     = _today_str
+    # Reset intraday Nifty tracking on new day
+    st.session_state.pop("_nifty_intraday_pct", None)
+    st.session_state.pop("_nifty_live_ltp",     None)
+    st.session_state.pop("_nifty_prev_close",   None)
+    st.session_state.pop("_scalp_candle_cache", None)
+
+# Initialise Nifty prev-close from base_df once computed_metrics are loaded
+if "_nifty_prev_close" not in st.session_state:
+    try:
+        _bdf = st.session_state.get("_signals_base_df", pd.DataFrame())
+        if not _bdf.empty and "ema_20" in _bdf.columns:
+            # Use the most recent Nifty 50 LTP from stored metrics as a proxy for
+            # yesterday's close — a rough but reliable bootstrap for the first fetch.
+            # The real Nifty prev close is the last daily close from the benchmarks data.
+            # We'll rely on the first live LTP fetch to set a more accurate reference;
+            # for now, zero = "not yet set" so gate is neutral until first fetch.
+            pass
+    except Exception:
+        pass
 
 # On first load (or after page refresh), re-sync paper_triggered + paper_open
 # from the DB so we never double-create paper trades.
@@ -891,6 +910,18 @@ df = db.load_metrics()
 # Keep df in session_state so the live-signal fragment always sees the latest
 # base data (entry/stop/pivot levels) even across fragment-only reruns.
 st.session_state["_signals_base_df"] = df
+
+# ── Nifty prev-close bootstrap ────────────────────────────────────────────
+# Extract Nifty 50's previous close from the benchmark data stored in DB so
+# the intraday direction gate can compute today's % change on the first LTP fetch.
+# We look for a row with tradingsymbol = "NIFTY 50" in the metrics DF; if missing,
+# we'll use the first authenticated LTP fetch to set a rough reference.
+if "_nifty_prev_close" not in st.session_state and not df.empty:
+    _nf_row = df[df["tradingsymbol"].astype(str).str.upper() == "NIFTY 50"] if "tradingsymbol" in df.columns else pd.DataFrame()
+    if not _nf_row.empty and "ltp" in _nf_row.columns:
+        _nf_prev_val = float(_nf_row["ltp"].iloc[0] or 0)
+        if _nf_prev_val > 0:
+            st.session_state["_nifty_prev_close"] = _nf_prev_val
 
 if df.empty:
     st.warning("⚠ No data yet. Click 'Full Rescan' in the sidebar to bootstrap.")
@@ -3231,6 +3262,32 @@ def _live_signals_header():
                     k.split(":", 1)[-1]: v for k, v in fresh.items()
                 }
                 st.session_state["_live_ltp_ts"] = datetime.now(_IST)
+
+                # ── Nifty 50 intraday direction gate ─────────────────────────
+                # Fetch Nifty 50 LTP separately and compute today's % change vs
+                # the previous close stored in computed_metrics.
+                try:
+                    _nf_raw = _fc.get_ltp_batch(["NSE:NIFTY 50"])
+                    _nifty_ltp = _nf_raw.get("NSE:NIFTY 50") or _nf_raw.get("NIFTY 50")
+                    if _nifty_ltp:
+                        _nifty_ltp_f = float(_nifty_ltp)
+                        st.session_state["_nifty_live_ltp"] = _nifty_ltp_f
+                        _nf_prev = st.session_state.get("_nifty_prev_close")
+                        if not _nf_prev or _nf_prev <= 0:
+                            # Bootstrap: use OHLC to get today's open as prev-close proxy
+                            try:
+                                _nf_ohlc = _fc.get_today_open(["NSE:NIFTY 50"])
+                                _nf_open  = _nf_ohlc.get("NSE:NIFTY 50") or _nf_ohlc.get("NIFTY 50")
+                                if _nf_open and _nf_open > 0:
+                                    st.session_state["_nifty_prev_close"] = float(_nf_open)
+                                    _nf_prev = float(_nf_open)
+                            except Exception:
+                                pass
+                        if _nf_prev and _nf_prev > 0:
+                            _nifty_pct = (_nifty_ltp_f - _nf_prev) / _nf_prev * 100
+                            st.session_state["_nifty_intraday_pct"] = round(_nifty_pct, 3)
+                except Exception:
+                    pass
         except Exception as exc:
             _ltp_err = str(exc)[:80]
 
@@ -3305,12 +3362,30 @@ def _live_signals_header():
     st.session_state["_n_intra_long"]  = _n_il
     st.session_state["_n_intra_short"] = _n_is
 
-    _pc1, _pc2, _pc3, _pc4, _pc5 = st.columns(5)
+    _pc1, _pc2, _pc3, _pc4, _pc5, _pc6 = st.columns(6)
     _pc1.metric("Swing Buy",       _n_sb,  help="Stocks with a BUY signal (PULLBACK / BREAKOUT / NR7)")
     _pc2.metric("Exit signals",    _n_ss,  help="Existing longs where trend has broken — consider exiting")
     _pc3.metric("Intraday Long",   _n_il,  help="BUY_ABOVE R1 setups for today's session")
     _pc4.metric("Intraday Short",  _n_is,  help="SELL_BELOW S1 setups — short sell opportunities")
     _pc5.metric("Scaling entries", _n_sc,  help="Stocks in full EMA stack at EMA50 pullback — position build")
+    # ── Nifty 50 intraday direction pill ──
+    _nifty_pct_disp = st.session_state.get("_nifty_intraday_pct")
+    _nifty_ltp_disp = st.session_state.get("_nifty_live_ltp")
+    if _nifty_ltp_disp:
+        _nifty_pct_str = f"{_nifty_pct_disp:+.2f}%" if _nifty_pct_disp is not None else "—"
+        _pc6.metric(
+            "Nifty 50",
+            f"₹{_nifty_ltp_disp:,.0f}",
+            delta=_nifty_pct_str,
+            help=(
+                "Nifty 50 live LTP and today's % change vs prev close.\n\n"
+                f"Gate threshold: ±{config.NIFTY_GATE_PCT}%\n"
+                "🔴 Down > 0.6%: long signals flagged with headwind warning\n"
+                "🟢 Up > 0.6%: short signals flagged with headwind warning"
+            ),
+        )
+    else:
+        _pc6.metric("Nifty 50", "—", help="Nifty 50 live price (fetches when authenticated)")
 
     # ── Global paper trade exit monitor ──────────────────────────────────────
     # Runs here (in the header fragment) so exits are detected regardless of
@@ -3318,41 +3393,75 @@ def _live_signals_header():
     if _market_open and st.session_state.get("paper_open"):
         _live_ltp_now = st.session_state.get("_live_ltp", {})
 
-        # ── Pass 1: T1 / stop-loss exits ─────────────────────────────────────
+        # ── Pass 1: T1 / T2 / stop-loss exits ───────────────────────────────
         # Stop is triggered at planned stop price OR if LTP has blown >0.2% past
         # it (fast-exit: don't wait for the next 2-second tick, exit at actual LTP).
+        # T1 hit → partial booking: close 60% at T1, move stop to break-even, trail to T2.
         _STOP_OVERSHOOT_PCT = 0.002   # 0.2% past planned stop = fast-exit at LTP
-        _exits = []
+        _exits   = []   # (pid, sym, outcome, exit_price) — full close
+        _partials = []  # (pid, sym, exit_price) — partial T1 exit, trail to T2
         for _pid, _pt in list(st.session_state["paper_open"].items()):
             _pt_ltp = _live_ltp_now.get(_pt.get("sym", ""), 0)
             if not _pt_ltp:
                 continue
-            _sig  = _pt.get("signal_type", "")
-            _t1   = _pt.get("t1", 0)
-            _stop = _pt.get("stop", 0)
-            _entry = _pt.get("entry", 0)
+            _sig    = _pt.get("signal_type", "")
+            _t1     = _pt.get("t1", 0)
+            _t2     = _pt.get("t2", 0)
+            _stop   = _pt.get("stop", 0)
+            _entry  = _pt.get("entry", 0)
+            _partial_done = _pt.get("partial_booked", False)
+
             if _sig == "BUY_ABOVE":
                 if _t1 and _pt_ltp >= _t1:
-                    _exits.append((_pid, _pt["sym"], "TARGET_HIT", _t1))
+                    if _t2 and not _partial_done:
+                        # Partial booking: 60% exit at T1, trail 40% to T2
+                        _partials.append((_pid, _pt["sym"], _t1))
+                    else:
+                        # No T2, or already partial-booked and now hit T2 → full exit
+                        _exits.append((_pid, _pt["sym"], "TARGET_HIT", _t1 if not _partial_done else _pt_ltp))
                 elif _stop and _pt_ltp <= _stop:
-                    # Exit at actual LTP (may be below planned stop on fast moves)
-                    _exit_px = _pt_ltp
-                    _exits.append((_pid, _pt["sym"], "STOPPED_OUT", _exit_px))
+                    _exits.append((_pid, _pt["sym"], "STOPPED_OUT", _pt_ltp))
                 elif _stop and _entry and _pt_ltp < _stop * (1 - _STOP_OVERSHOOT_PCT):
-                    # Emergency fast-exit: LTP has blown >0.2% below planned stop
                     _exits.append((_pid, _pt["sym"], "STOPPED_OUT", _pt_ltp))
             elif _sig == "SELL_BELOW":
                 if _t1 and _pt_ltp <= _t1:
-                    _exits.append((_pid, _pt["sym"], "TARGET_HIT", _t1))
+                    if _t2 and not _partial_done:
+                        _partials.append((_pid, _pt["sym"], _t1))
+                    else:
+                        _exits.append((_pid, _pt["sym"], "TARGET_HIT", _t1 if not _partial_done else _pt_ltp))
                 elif _stop and _pt_ltp >= _stop:
-                    _exit_px = _pt_ltp
-                    _exits.append((_pid, _pt["sym"], "STOPPED_OUT", _exit_px))
-                elif _stop and _pt_ltp > _stop * (1 + _STOP_OVERSHOOT_PCT):
-                    # Emergency fast-exit for short: LTP >0.2% above planned stop
                     _exits.append((_pid, _pt["sym"], "STOPPED_OUT", _pt_ltp))
+                elif _stop and _pt_ltp > _stop * (1 + _STOP_OVERSHOOT_PCT):
+                    _exits.append((_pid, _pt["sym"], "STOPPED_OUT", _pt_ltp))
+
+        # Apply partial bookings — 60% at T1, trail 40% to T2 (trade stays OPEN in DB)
+        for _pid, _sym_e, _t1_px in _partials:
+            try:
+                _pt_ref = st.session_state["paper_open"].get(_pid, {})
+                _orig_entry = _pt_ref.get("entry", _t1_px)
+                _t2_val     = _pt_ref.get("t2", 0)
+                _note_partial = (
+                    f"📊 Partial T1: 60% booked at ₹{_t1_px:.2f}. "
+                    f"Stop → break-even ₹{_orig_entry:.2f}. "
+                    f"Trailing 40% to T2 ₹{_t2_val:.2f}."
+                )
+                # Note on DB but keep trade OPEN — final close happens at T2 or stop
+                db.note_partial_t1(_pid, _t1_px, _note_partial)
+                # Update in-memory monitoring: new stop = break-even, new target = T2
+                st.session_state["paper_open"][_pid]["stop"]           = _orig_entry
+                st.session_state["paper_open"][_pid]["t1"]             = _t2_val
+                st.session_state["paper_open"][_pid]["t2"]             = 0
+                st.session_state["paper_open"][_pid]["partial_booked"] = True
+                st.toast(f"📊 Partial T1: {_sym_e} — 60% @ ₹{_t1_px:.2f}, trailing 40% → T2 ₹{_t2_val:.2f}", icon="📊")
+            except Exception:
+                pass
+
+        # Apply full exits
         for _pid, _sym_e, _outcome, _ep in _exits:
             try:
-                _note = f"📄 Paper trade auto-{'closed at T1' if _outcome == 'TARGET_HIT' else 'stopped'}"
+                _was_partial = st.session_state.get("paper_open", {}).get(_pid, {}).get("partial_booked", False)
+                _label = "T2 hit" if _was_partial else ("closed at T1" if _outcome == "TARGET_HIT" else "stopped")
+                _note = f"📄 Paper trade auto-{_label}"
                 db.close_trade(_pid, _ep, _outcome, _note)
                 st.session_state["paper_open"].pop(_pid, None)
                 _icon = "✅" if _outcome == "TARGET_HIT" else "🛑"
@@ -3769,6 +3878,233 @@ def _intraday_paper_banner():
         )
 
 
+# ── FRAGMENT 2d: scalping signals (ORB — Opening Range Breakout) ─────────────
+# Refreshes every 5 s (slower than intraday because candle fetches are heavier).
+# ORB is valid only after 9:30 AM (need 15-min opening range to be complete).
+@st.fragment(run_every=5)
+def _intraday_scalp_live():
+    """
+    Scalp signal tab — Opening Range Breakout with 3 confirmations:
+      1. ORB breakout (LTP > ORB_high / LTP < ORB_low)
+      2. VWAP alignment (above/below VWAP)
+      3. 5-min RSI momentum (>55 long / <45 short)
+
+    Needs Kite auth to fetch 5-min candles. Falls back to a static info card
+    during market-closed hours or when not authenticated.
+    """
+    if not _is_market_open():
+        st.info(
+            "Scalping signals are only active during market hours (9:15–15:30 IST). "
+            "ORB is computed after 9:30 AM once the first 15 minutes have completed.",
+            icon="⏸",
+        )
+        return
+
+    _now_ist = datetime.now(_IST)
+    if _now_ist.hour == 9 and _now_ist.minute < 30:
+        st.info(
+            "⏳ Opening Range not ready yet. ORB scalp signals activate at 9:30 AM "
+            "once the first 15 minutes close.",
+            icon="⏳",
+        )
+        return
+
+    base_df = st.session_state.get("_signals_base_df", pd.DataFrame())
+    if base_df.empty:
+        st.info("Run a scan first to populate the watchlist.", icon="ℹ️")
+        return
+
+    _kc_scalp = st.session_state.get("kite_client")
+    if not _kc_scalp or not getattr(_kc_scalp, "authenticated", False):
+        st.warning("Connect Kite to enable ORB scalp signals (5-min candle data required).", icon="🔑")
+        return
+
+    # ── Build candidate list ──────────────────────────────────────────────────
+    # Use intraday signal stocks as ORB candidates (they already passed pivot + RSI + R/R gates)
+    _scalp_mask = base_df["intraday_signal"].isin(["BUY_ABOVE", "SELL_BELOW"])
+    _scalp_cands = base_df.loc[_scalp_mask].copy()
+    if _scalp_cands.empty:
+        st.info("No intraday signal stocks available for ORB scalping today.", icon="ℹ️")
+        return
+
+    # Limit to top 15 by composite score to stay within API rate limits
+    _scalp_cands = (
+        _scalp_cands
+        .sort_values("composite_score", ascending=False, na_position="last")
+        .head(15)
+    )
+
+    _nifty_pct = st.session_state.get("_nifty_intraday_pct", 0.0) or 0.0
+    _scalp_results = []
+    _live_ltp_now  = st.session_state.get("_live_ltp", {})
+
+    st.caption(
+        f"Scanning {len(_scalp_cands)} stocks for ORB breakouts. "
+        "Requires 2/3 confirmations: **ORB break + VWAP + 5-min RSI**. "
+        f"Hard exit: 2:45 PM. Capital per scalp: ₹{config.SCALP_CAP_PER_TRADE:,}. "
+        f"Nifty: {_nifty_pct:+.2f}%"
+    )
+
+    _scalp_sym_q = st.text_input(
+        "🔍 Search symbol", placeholder="type to filter…",
+        key="scalp_sym_search", label_visibility="collapsed",
+    )
+
+    import indicators as _ind  # noqa: PLC0415
+    import signals as _sig_mod  # noqa: PLC0415
+
+    for _, _row in _scalp_cands.iterrows():
+        _sym = str(_row.get("tradingsymbol", ""))
+        _tok = int(_row.get("instrument_token") or 0)
+        if not _tok:
+            continue
+        if _scalp_sym_q and _scalp_sym_q.strip().lower() not in _sym.lower():
+            continue
+
+        _ltp_now = _live_ltp_now.get(_sym, 0) or float(_row.get("ltp") or 0)
+        if not _ltp_now:
+            continue
+
+        try:
+            # Fetch today's 5-min candles (rate-limited, cached per session via dict)
+            _candle_cache = st.session_state.setdefault("_scalp_candle_cache", {})
+            _cache_ts_key = f"_scalp_ts_{_sym}"
+            _last_fetch   = st.session_state.get(_cache_ts_key)
+            _candles_df   = _candle_cache.get(_sym, pd.DataFrame())
+
+            # Re-fetch every 5 minutes to stay fresh without hammering the API
+            if (_last_fetch is None or
+                    (datetime.now(_IST) - _last_fetch).total_seconds() > 300
+                    or _candles_df.empty):
+                _candles_df = _kc_scalp.get_today_candles(_tok, interval="5minute")
+                _candle_cache[_sym] = _candles_df
+                st.session_state[_cache_ts_key] = datetime.now(_IST)
+        except Exception:
+            _candles_df = pd.DataFrame()
+
+        if _candles_df.empty:
+            continue
+
+        # Compute intraday indicators
+        _orb_data    = _ind.opening_range(_candles_df, minutes=config.SCALP_ORB_MINUTES)
+        _vwap_price  = _ind.vwap(_candles_df)
+        _rsi_5m      = _ind.rsi_intraday(_candles_df)
+        _avg_vol     = float(_row.get("avg_volume") or 0)
+        _vol_ratio   = _ind.intraday_volume_ratio(_candles_df, _avg_vol) if _avg_vol > 0 else None
+
+        if not _orb_data:
+            continue
+
+        _scalp_sig = _sig_mod.scalping_signal(
+            current_ltp      = _ltp_now,
+            orb_high         = _orb_data["orb_high"],
+            orb_low          = _orb_data["orb_low"],
+            orb_range        = _orb_data["orb_range"],
+            vwap_price       = _vwap_price,
+            rsi_5min         = _rsi_5m,
+            atr              = float(_row.get("atr_14") or 0) or None,
+            nifty_pct_change = _nifty_pct,
+            daily_vol_ratio  = _vol_ratio,
+        )
+
+        _status = _scalp_sig.get("scalp_signal") or "INSIDE_ORB"
+        _dir    = _scalp_sig.get("scalp_direction") or ""
+        _confs  = _scalp_sig.get("scalp_confirmations") or 0
+
+        # Colour-code status
+        if _status in ("LONG", "SHORT"):
+            _status_label = f"🚀 {_status}"
+        elif _status == "WATCH":
+            _status_label = "👁 WATCH"
+        else:
+            _status_label = "⬜ INSIDE"
+
+        _scalp_results.append({
+            "Status":     _status_label,
+            "Symbol":     _sym,
+            "LTP":        f"₹{_ltp_now:,.2f}",
+            "Direction":  _dir or "—",
+            "Confirms":   f"{_confs}/3" if _confs else "—",
+            "Conf Score": f"{_scalp_sig.get('scalp_confidence') or 0}/10",
+            "ORB High":   f"₹{_orb_data['orb_high']:,.2f}",
+            "ORB Low":    f"₹{_orb_data['orb_low']:,.2f}",
+            "VWAP":       f"₹{_vwap_price:,.2f}" if _vwap_price else "—",
+            "5m RSI":     f"{_rsi_5m:.0f}" if _rsi_5m else "—",
+            "Entry":      f"₹{_scalp_sig['scalp_entry']:,.2f}" if _scalp_sig.get("scalp_entry") else "—",
+            "Stop":       f"₹{_scalp_sig['scalp_stop']:,.2f}"  if _scalp_sig.get("scalp_stop")  else "—",
+            "Target":     f"₹{_scalp_sig['scalp_t1']:,.2f}"    if _scalp_sig.get("scalp_t1")    else "—",
+            "R/R":        f"{_scalp_sig['scalp_rr']:.1f}×"     if _scalp_sig.get("scalp_rr")    else "—",
+        })
+
+    if not _scalp_results:
+        if _scalp_sym_q:
+            st.info(f"No ORB results for '{_scalp_sym_q}'.", icon="🔍")
+        else:
+            st.info(
+                "No ORB breakouts active yet. LTP is inside the opening range for all stocks. "
+                "Watch for breakouts above ORB_high or breakdowns below ORB_low.",
+                icon="⏳",
+            )
+        return
+
+    _scalp_df = pd.DataFrame(_scalp_results)
+
+    # Sort: LONG/SHORT first, then WATCH, then INSIDE
+    _order = {"🚀 LONG": 0, "🚀 SHORT": 1, "👁 WATCH": 2, "⬜ INSIDE": 3}
+    _scalp_df["_sort"] = _scalp_df["Status"].map(lambda x: _order.get(x, 9))
+    _scalp_df = _scalp_df.sort_values("_sort").drop(columns=["_sort"]).reset_index(drop=True)
+
+    st.dataframe(
+        _scalp_df,
+        use_container_width=True,
+        height=min(500, 50 + len(_scalp_results) * 38),
+        hide_index=True,
+        column_config={
+            "Status":     st.column_config.TextColumn("Status", help="ORB signal state. 🚀 = live breakout, 👁 = only 1/3 confirmations, ⬜ = inside opening range"),
+            "Confirms":   st.column_config.TextColumn("Confirms", help="Number of internal confirmations (max 3): ORB break + VWAP + 5-min RSI. Need ≥2 to act."),
+            "Conf Score": st.column_config.TextColumn("Score", help="Scalp confidence 0–10. Adjusted down if Nifty is against direction or volume is below average."),
+            "5m RSI":     st.column_config.TextColumn("5m RSI", help="RSI computed on today's 5-min candles. >55 favours longs, <45 favours shorts."),
+        },
+    )
+
+    # ── Scalp strategy explainer ──────────────────────────────────────────────
+    st.markdown(
+        f"""
+<div style="background:#0f172a;border:1px solid #1e293b;border-radius:10px;padding:14px 18px;margin-top:8px">
+<div style="font-size:0.78rem;font-weight:700;color:#94a3b8;letter-spacing:0.08em;margin-bottom:8px">
+⚡ ORB SCALP STRATEGY GUIDE
+</div>
+<table style="width:100%;border-collapse:collapse;font-size:0.8rem">
+<tr>
+  <td style="padding:4px 14px 4px 0;color:#38bdf8;font-weight:700;white-space:nowrap">Entry</td>
+  <td style="color:#cbd5e1">LTP crosses above ORB_high (long) / below ORB_low (short) with ≥2/3 confirmations.</td>
+</tr>
+<tr>
+  <td style="padding:4px 14px 4px 0;color:#f59e0b;font-weight:700;white-space:nowrap">Target</td>
+  <td style="color:#cbd5e1">Breakout + {config.SCALP_TARGET_MULT}× ORB range. Typical: 0.5–1.2% move.</td>
+</tr>
+<tr>
+  <td style="padding:4px 14px 4px 0;color:#ef4444;font-weight:700;white-space:nowrap">Stop</td>
+  <td style="color:#cbd5e1">Breakout − {config.SCALP_STOP_MULT}× ORB range (tight). If price re-enters ORB → exit immediately.</td>
+</tr>
+<tr>
+  <td style="padding:4px 14px 4px 0;color:#a78bfa;font-weight:700;white-space:nowrap">Hard Exit</td>
+  <td style="color:#cbd5e1"><b>2:45 PM IST</b> — earlier than intraday (3:10 PM) because scalps need liquidity window.</td>
+</tr>
+<tr>
+  <td style="padding:4px 14px 4px 0;color:#22c55e;font-weight:700;white-space:nowrap">Capital</td>
+  <td style="color:#cbd5e1">₹{config.SCALP_CAP_PER_TRADE:,} per scalp trade. Max {config.SCALP_MAX_POSITIONS} concurrent scalp positions.</td>
+</tr>
+</table>
+<div style="margin-top:8px;padding-top:6px;border-top:1px solid #1e293b;color:#64748b;font-size:0.74rem">
+3 Confirmations: <b>①</b> ORB breakout (price outside range) · <b>②</b> VWAP alignment (above/below) · <b>③</b> 5-min RSI momentum (&gt;55 long / &lt;45 short)
+</div>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 # ── FRAGMENT 2a: intraday LONG table (live status column) ────────────────────
 # Runs every 2 s inside the Long sub-tab. No st.tabs() here — the sub-tabs
 # that contain this fragment are created OUTSIDE in _signals_main().
@@ -3800,7 +4136,23 @@ def _intraday_long_live():
     if _ltp_stale:
         st.warning("⚠ LTP prices are stale (>10 s old) — auto-trading paused until fresh data arrives.")
 
-    st.caption("Watch for price to trade **above R1**. Enter with stop just below Pivot.")
+    st.caption("Watch for price to trade **above R1**. Enter with stop just below Pivot. T1=R2 (60% exit), T2=R3 (trail 40%).")
+
+    # ── Nifty direction gate banner ──────────────────────────────────────────
+    _nifty_pct = st.session_state.get("_nifty_intraday_pct", 0.0) or 0.0
+    if _nifty_pct <= -config.NIFTY_GATE_PCT:
+        st.warning(
+            f"⚠️ **Nifty headwind:** Nifty 50 is down **{abs(_nifty_pct):.2f}%** today "
+            f"(threshold: −{config.NIFTY_GATE_PCT}%). Long signals have headwind — "
+            "consider reducing position size or waiting for Nifty stabilisation.",
+            icon="🔴",
+        )
+    elif _nifty_pct >= config.NIFTY_GATE_PCT:
+        st.success(
+            f"✅ **Nifty tailwind:** Nifty 50 is up **{_nifty_pct:.2f}%** today — "
+            "market breadth favours long positions.",
+            icon="🟢",
+        )
 
     _long_sym_q = st.text_input(
         "🔍 Search symbol", placeholder="type to filter…",
@@ -3896,6 +4248,7 @@ def _intraday_long_live():
                     and not st.session_state.get("paper_day_blocked", False)
                     and _paper_key not in st.session_state.get("paper_triggered", {})):
                 try:
+                    _t2_val = float(r.get("intraday_t2") or r.get("intraday_r3") or 0)
                     _pid = db.log_trade({
                         "trade_date":          _dt.date.today(),
                         "tradingsymbol":       sym,
@@ -3905,6 +4258,7 @@ def _intraday_long_live():
                         "rec_entry":           entry_val,
                         "rec_stop":            float(r.get("intraday_stop") or 0),
                         "rec_t1":              float(r.get("intraday_t1") or 0),
+                        "rec_t2":              _t2_val,
                         "rec_rr":              None,
                         "rec_reason":          str(r.get("intraday_reason") or "")[:200],
                         "rec_composite_score": r.get("composite_score"),
@@ -3919,8 +4273,10 @@ def _intraday_long_live():
                     st.session_state["paper_open"][_pid] = {
                         "sym": sym, "stop": float(r.get("intraday_stop") or 0),
                         "t1": float(r.get("intraday_t1") or 0),
+                        "t2": _t2_val,
                         "signal_type": "BUY_ABOVE", "entry": _trigger_price,
                         "cap": _cap_this_trade,
+                        "partial_booked": False,
                     }
                     _confirm_map.pop(sym, None)  # reset timer after firing
                     st.toast(f"📄 Paper BUY [{_conf_tier}]: {sym} @ ₹{_trigger_price:.2f} × {_pqty} (confirmed {_ENTRY_CONFIRM_SECS}s)", icon="📄")
@@ -4002,6 +4358,13 @@ def _intraday_long_live():
             _rr_str = "—"
 
         _conf_str = f"{confidence}/10" if confidence else "—"
+        _gap_flag = r.get("intraday_gap_flag") or ""
+        _nifty_gate = r.get("intraday_nifty_gate") or ""
+        _flags = []
+        if _gap_flag == "GAP_WARN":    _flags.append("⚠️GAP")
+        if _nifty_gate:                _flags.append("🔴NF")
+        _flag_str = " ".join(_flags) if _flags else "✓"
+
         _si_rows.append([
             live_status,
             sym,
@@ -4009,12 +4372,14 @@ def _intraday_long_live():
             _fmt(ltp_now,                  "₹{:,.2f}"),
             _delta_str(sym),
             _conf_str,
+            _flag_str,
             _gain_pct(r.get("intraday_entry"), r.get("intraday_t1")),
             _risk_pct(r.get("intraday_entry"), r.get("intraday_stop")),
             _rr_str,
             _fmt(r.get("intraday_entry"),  "₹{:,.2f}"),
             _fmt(r.get("intraday_stop"),   "₹{:,.2f}"),
             _fmt(r.get("intraday_t1"),     "₹{:,.2f}"),
+            _fmt(r.get("intraday_t2") or r.get("intraday_r3"), "₹{:,.2f}"),
             _fmt(r.get("intraday_pivot"),  "₹{:,.2f}"),
             _fmt(r.get("intraday_r1"),     "₹{:,.2f}"),
             _fmt(r.get("intraday_r2"),     "₹{:,.2f}"),
@@ -4023,8 +4388,8 @@ def _intraday_long_live():
 
     _si_df = pd.DataFrame(_si_rows, columns=[
         "Status", "Symbol", "Company", "LTP", "Δ",
-        "Conf", "Gain %", "Risk %", "R/R",
-        "Buy Above", "Stop", "T1 (R2)", "Pivot", "R1", "R2", "S1",
+        "Conf", "Flags", "Gain %", "Risk %", "R/R",
+        "Buy Above", "Stop", "T1 (R2)", "T2 (R3)", "Pivot", "R1", "R2", "S1",
     ])
     st.dataframe(
         _si_df.style
@@ -4064,6 +4429,15 @@ def _intraday_long_live():
                     "🟠 5   MARGINAL  → auto-trade ₹1,00,000/slot (if capital available)\n"
                     "🔴 <5  LOW       → shown only, NOT auto-traded"
                 )),
+            "Flags":     st.column_config.TextColumn("Flags",
+                help=(
+                    "Context warnings for this signal:\n\n"
+                    "⚠️GAP — Today's open is 0.8–1.5% above R1 (gap-up risk: "
+                    "price may fade after open gap). Reduce size.\n"
+                    "🔴NF — Nifty 50 is down >0.6% today (market headwind for longs). "
+                    "Consider skipping or waiting for Nifty to stabilise.\n"
+                    "✓ — No flags, all context signals are favourable."
+                )),
             "Gain %":    st.column_config.TextColumn("Gain %",
                 help="Potential upside from Buy-Above entry to T1 (R2) target. "
                      "Typical range: 0.8%–3%."),
@@ -4081,14 +4455,17 @@ def _intraday_long_live():
                 help="Hard intraday stop-loss, set just below Pivot. "
                      "If price closes below Pivot after you enter, exit immediately."),
             "T1 (R2)":  st.column_config.TextColumn("T1 (R2)",
-                help="First (and only) intraday target = R2 pivot level. "
-                     "Exit your full position here."),
+                help="First target = R2. On auto-trade: 60% of position exits here. "
+                     "Stop moves to break-even. Remaining 40% trails to T2."),
+            "T2 (R3)":  st.column_config.TextColumn("T2 (R3)",
+                help="Second target = R3. Remaining 40% trails here after T1 is hit. "
+                     "Hard exit at 3:10 PM regardless."),
             "Pivot":     st.column_config.TextColumn("Pivot",
                 help="(Prev H + L + C) / 3. Above Pivot = bullish bias."),
             "R1":        st.column_config.TextColumn("R1",
                 help="Resistance 1. Break above = intraday long trigger."),
             "R2":        st.column_config.TextColumn("R2",
-                help="Resistance 2. Intraday profit target."),
+                help="Resistance 2. T1 intraday target."),
             "S1":        st.column_config.TextColumn("S1",
                 help="Support 1. Break below invalidates the long setup."),
         },
@@ -4234,8 +4611,25 @@ def _intraday_short_live():
     st.caption(
         "Watch for price to break **below S1**. "
         "Short with cover-stop just above Pivot. "
+        "T1=S2 (60% exit), T2=S3 (trail 40%). "
         "**Only for stocks eligible for intraday short selling (check Kite margin).**"
     )
+
+    # ── Nifty direction gate banner ──────────────────────────────────────────
+    _nifty_pct_s = st.session_state.get("_nifty_intraday_pct", 0.0) or 0.0
+    if _nifty_pct_s >= config.NIFTY_GATE_PCT:
+        st.warning(
+            f"⚠️ **Nifty headwind for shorts:** Nifty 50 is up **{_nifty_pct_s:.2f}%** today "
+            f"(threshold: +{config.NIFTY_GATE_PCT}%). Short signals have headwind — "
+            "consider reducing size or waiting for market reversal.",
+            icon="🔴",
+        )
+    elif _nifty_pct_s <= -config.NIFTY_GATE_PCT:
+        st.success(
+            f"✅ **Nifty tailwind for shorts:** Nifty 50 is down **{abs(_nifty_pct_s):.2f}%** today — "
+            "market breadth favours short positions.",
+            icon="🟢",
+        )
 
     _ss_rows = []
     for _, r in _ss.iterrows():
@@ -4320,6 +4714,7 @@ def _intraday_short_live():
                     and not st.session_state.get("paper_day_blocked", False)
                     and _paper_key not in st.session_state.get("paper_triggered", {})):
                 try:
+                    _t2_val_s = float(r.get("intraday_t2") or r.get("intraday_s3") or 0)
                     _pid = db.log_trade({
                         "trade_date":          _dt.date.today(),
                         "tradingsymbol":       sym,
@@ -4329,6 +4724,7 @@ def _intraday_short_live():
                         "rec_entry":           entry_val,
                         "rec_stop":            float(r.get("intraday_stop") or 0),
                         "rec_t1":              float(r.get("intraday_t1") or 0),
+                        "rec_t2":              _t2_val_s,
                         "rec_rr":              None,
                         "rec_reason":          str(r.get("intraday_reason") or "")[:200],
                         "rec_composite_score": r.get("composite_score"),
@@ -4343,8 +4739,10 @@ def _intraday_short_live():
                     st.session_state["paper_open"][_pid] = {
                         "sym": sym, "stop": float(r.get("intraday_stop") or 0),
                         "t1": float(r.get("intraday_t1") or 0),
+                        "t2": _t2_val_s,
                         "signal_type": "SELL_BELOW", "entry": _trigger_price,
                         "cap": _cap_this_trade,
+                        "partial_booked": False,
                     }
                     _confirm_map_s.pop(_short_key, None)
                     st.toast(f"📄 Paper SHORT [{_conf_tier}]: {sym} @ ₹{_trigger_price:.2f} × {_pqty} (confirmed {_ENTRY_CONFIRM_SECS}s)", icon="📄")
@@ -4875,14 +5273,17 @@ def _signals_main():
 
         _n_il = st.session_state.get("_n_intra_long",  0)
         _n_is = st.session_state.get("_n_intra_short", 0)
-        _it_long_tab, _it_short_tab = st.tabs([
+        _it_long_tab, _it_short_tab, _it_scalp_tab = st.tabs([
             f"📈 Long (BUY_ABOVE)  {_n_il}",
             f"📉 Short (SELL_BELOW)  {_n_is}",
+            "⚡ Scalp (ORB)",
         ])
         with _it_long_tab:
             _intraday_long_live()   # fragment: live status, runs every 2 s
         with _it_short_tab:
             _intraday_short_live()  # fragment: live status, runs every 2 s
+        with _it_scalp_tab:
+            _intraday_scalp_live()  # fragment: ORB scalp signals, runs every 5 s
 
     # ── SCALING ───────────────────────────────────────────────────
     with _sig_t4:

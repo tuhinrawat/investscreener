@@ -350,3 +350,80 @@ class KiteClient:
             for key, val in raw.items():
                 result[key] = float(val["last_price"])
         return result
+
+    # ----------------------------------------------------------
+    # INTRADAY CANDLES — today's 5-min (or other interval) candles
+    # ----------------------------------------------------------
+    def get_today_candles(
+        self,
+        instrument_token: int,
+        interval: str = "5minute",
+    ) -> "pd.DataFrame":
+        """
+        Fetch today's intraday candles for one instrument.
+
+        Returns a DataFrame with columns:
+          date, open, high, low, close, volume
+        sorted ascending by time.  Returns an empty DataFrame on error or
+        if the market hasn't opened yet.
+
+        interval choices (Kite):
+          "minute"   — 1-min candles (up to 60 days of history)
+          "3minute"  — 3-min candles
+          "5minute"  — 5-min candles  ← default for ORB/VWAP
+          "15minute" — 15-min candles
+          "30minute" — 30-min candles
+          "60minute" — 60-min candles
+
+        Rate-limited to 3 req/sec (shared hist_limiter).
+        """
+        import pandas as pd  # noqa: PLC0415
+        if not self.authenticated:
+            return pd.DataFrame()
+        try:
+            from datetime import datetime, timezone, timedelta  # noqa: PLC0415
+            _IST = timezone(timedelta(hours=5, minutes=30))
+            now_ist    = datetime.now(_IST)
+            from_dt    = now_ist.replace(hour=9, minute=0, second=0, microsecond=0)
+            to_dt      = now_ist
+            self.hist_limiter.wait()
+            candles = self.kite.historical_data(
+                instrument_token=instrument_token,
+                from_date=from_dt,
+                to_date=to_dt,
+                interval=interval,
+                continuous=False,
+                oi=False,
+            )
+            if not candles:
+                return pd.DataFrame()
+            df = pd.DataFrame(candles)
+            df = df.rename(columns={"date": "date"})
+            for col in ("open", "high", "low", "close", "volume"):
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            df = df.sort_values("date").reset_index(drop=True)
+            return df
+        except Exception:
+            return pd.DataFrame()
+
+    def get_today_open(self, instruments: list[str]) -> dict[str, float]:
+        """
+        Returns today's open price for a list of instruments using the OHLC API.
+        Format: {"NSE:RELIANCE": 2440.0, ...}
+        This is used for gap-up / gap-down detection at signal trigger time.
+        """
+        result = {}
+        chunk_size = config.QUOTE_BATCH_SIZE
+        for i in range(0, len(instruments), chunk_size):
+            chunk = instruments[i:i + chunk_size]
+            self.quote_limiter.wait()
+            try:
+                raw = self.kite.ohlc(chunk)
+                for key, val in raw.items():
+                    ohlc = val.get("ohlc", {})
+                    if "open" in ohlc:
+                        result[key] = float(ohlc["open"])
+            except Exception:
+                pass
+        return result

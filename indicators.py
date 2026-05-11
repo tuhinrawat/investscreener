@@ -7,6 +7,11 @@ takes a DataFrame, returns a value or Series.
 
 Mental model: this file is your "math layer" — same philosophy as
 HyperTrader. Math decides, narration happens elsewhere.
+
+Intraday additions (5-min candle functions):
+  vwap()           — cumulative Volume Weighted Average Price from 5-min OHLCV
+  opening_range()  — first-N-minute high/low/mid (ORB basis for scalping)
+  rsi_intraday()   — RSI computed on 5-min close series (faster momentum gauge)
 """
 import numpy as np
 import pandas as pd
@@ -275,3 +280,136 @@ def compute_all(df: pd.DataFrame, nifty_3m_return: float = None) -> dict:
         "trend_score": trend_sc,
         "composite_score": comp,
     }
+
+
+# ============================================================
+# INTRADAY (5-MIN CANDLE) FUNCTIONS
+# These take a DataFrame of today's 5-min OHLCV candles
+# (columns: date, open, high, low, close, volume) sorted ascending.
+# ============================================================
+
+def vwap(df_5min: pd.DataFrame) -> float | None:
+    """
+    Cumulative VWAP from today's 5-min candles.
+
+    Formula: Σ(typical_price × volume) / Σ(volume)
+    Typical price = (H + L + C) / 3 per candle.
+
+    VWAP resets every trading day — always pass only today's candles.
+    Returns the VWAP at the latest completed candle, or None if no data.
+    """
+    if df_5min is None or df_5min.empty:
+        return None
+    df = df_5min.copy()
+    df["typical"] = (df["high"] + df["low"] + df["close"]) / 3.0
+    df["tp_vol"]  = df["typical"] * df["volume"]
+    cumvol = df["volume"].cumsum()
+    if cumvol.iloc[-1] == 0:
+        return None
+    vwap_series = df["tp_vol"].cumsum() / cumvol
+    val = vwap_series.iloc[-1]
+    return float(val) if pd.notna(val) else None
+
+
+def vwap_std(df_5min: pd.DataFrame, multiplier: float = 1.0) -> dict | None:
+    """
+    VWAP ± N×σ bands.  σ = std deviation of (typical_price − VWAP) weighted by volume.
+
+    Returns {"vwap": v, "upper": v+m*std, "lower": v-m*std} or None if no data.
+    These bands act as dynamic intraday support/resistance.
+    """
+    if df_5min is None or df_5min.empty:
+        return None
+    df = df_5min.copy()
+    df["typical"] = (df["high"] + df["low"] + df["close"]) / 3.0
+    df["tp_vol"]  = df["typical"] * df["volume"]
+    cumvol = df["volume"].cumsum()
+    if cumvol.iloc[-1] == 0:
+        return None
+    vwap_series = df["tp_vol"].cumsum() / cumvol
+
+    # Variance: Σ(volume × (tp − vwap)²) / Σ(volume)
+    vwap_now  = float(vwap_series.iloc[-1])
+    dev_sq    = (df["typical"] - vwap_now) ** 2
+    weighted_var = (dev_sq * df["volume"]).sum() / df["volume"].sum()
+    std = float(np.sqrt(weighted_var)) if weighted_var >= 0 else 0.0
+    return {
+        "vwap":  round(vwap_now, 2),
+        "upper": round(vwap_now + multiplier * std, 2),
+        "lower": round(vwap_now - multiplier * std, 2),
+    }
+
+
+def opening_range(df_5min: pd.DataFrame, minutes: int = 15) -> dict | None:
+    """
+    Opening Range = the high and low of the first `minutes` after market open (9:15 AM).
+
+    For a standard 5-min candle feed:
+      minutes=15 → first 3 candles (9:15, 9:20, 9:25)
+
+    Returns {"orb_high": H, "orb_low": L, "orb_mid": M, "orb_range": R}
+    or None if fewer candles exist than the window requires.
+
+    Why ORB matters: institutional desks set their bias in the first 15 min.
+    A break above ORB_high with volume = long setup (momentum confirmed).
+    A break below ORB_low with volume = short setup.
+    """
+    if df_5min is None or df_5min.empty:
+        return None
+    candles_needed = minutes // 5
+    if len(df_5min) < candles_needed:
+        return None
+    window = df_5min.head(candles_needed)
+    orb_high  = float(window["high"].max())
+    orb_low   = float(window["low"].min())
+    orb_range = orb_high - orb_low
+    orb_mid   = round((orb_high + orb_low) / 2, 2)
+    return {
+        "orb_high":  round(orb_high,  2),
+        "orb_low":   round(orb_low,   2),
+        "orb_mid":   orb_mid,
+        "orb_range": round(orb_range, 2),
+    }
+
+
+def rsi_intraday(df_5min: pd.DataFrame, period: int = 14) -> float | None:
+    """
+    RSI computed on the close series of today's 5-min candles.
+
+    Identical algorithm to the daily RSI but on intraday data — gives a
+    "right-now" momentum reading rather than the previous-day close's RSI.
+    Returns None if not enough candles.
+    """
+    if df_5min is None or len(df_5min) < period + 1:
+        return None
+    delta    = df_5min["close"].diff()
+    gain     = delta.clip(lower=0)
+    loss     = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+    rs       = avg_gain / avg_loss.replace(0, np.nan)
+    rsi_s    = 100 - (100 / (1 + rs))
+    val      = rsi_s.iloc[-1]
+    return float(val) if pd.notna(val) else None
+
+
+def intraday_volume_ratio(df_5min: pd.DataFrame, daily_avg_volume: float) -> float | None:
+    """
+    Today's volume pace vs the daily average.
+
+    Computes how many 5-min candles have elapsed and projects the full-day
+    volume at the current run rate, then divides by daily_avg_volume.
+
+    ratio > 1.3 = strong participation today (confirms breakout)
+    ratio < 0.7 = quiet day (lower conviction on ORB signals)
+    """
+    if df_5min is None or df_5min.empty or not daily_avg_volume:
+        return None
+    total_5min_candles_per_day = 75   # 9:15 AM – 3:30 PM = 375 min / 5 = 75 candles
+    elapsed = len(df_5min)
+    if elapsed == 0:
+        return None
+    today_vol   = float(df_5min["volume"].sum())
+    pace_factor = total_5min_candles_per_day / elapsed   # scale to full day
+    projected   = today_vol * pace_factor
+    return round(projected / daily_avg_volume, 3)

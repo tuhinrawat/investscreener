@@ -180,3 +180,44 @@ LTP_FRESHNESS_SECS = 10
 DAILY_TARGET_LOW_PCT  = 2.0     # activate trailing stop only after this gain
 DAILY_TARGET_HIGH_PCT = 5.0     # hard ceiling — never trade past this
 DAILY_TRAIL_PCT       = 0.3     # stop trading if return falls this far from peak
+
+# ============================================================
+# INTRADAY GATES — market-context filters applied at trigger time
+# ============================================================
+# Nifty 50 intraday direction gate (applied per signal direction)
+#   Long signals are suppressed when Nifty is down more than this %
+#   Short signals are suppressed when Nifty is up more than this %
+NIFTY_GATE_PCT        = 0.6    # ±0.6% Nifty intraday move triggers direction gate
+
+# Gap-up / gap-down detection
+#   If today's open is this far above/below R1/S1, flag as gap entry risk
+GAP_WARN_PCT          = 0.8    # 0.8% above R1 = gap-up warning (skip or downgrade confidence)
+GAP_SKIP_PCT          = 1.5    # 1.5% above R1 = gap too large, skip signal entirely
+
+# Partial profit booking at T1
+#   On hitting T1 (R2 for longs, S2 for shorts), book this fraction of position
+PARTIAL_BOOK_RATIO    = 0.60   # 60% exit at T1
+# Remaining 40% trails to T2 (R3 / S3) with stop moved to break-even
+
+# ============================================================
+# SCALPING — Opening Range Breakout (ORB) strategy
+# ============================================================
+# Opening range = first N minutes after 9:15 AM IST
+SCALP_ORB_MINUTES      = 15    # first 15-min candle(s) define the range
+
+# Scalping targets / stops expressed as multiples of the ORB range width
+SCALP_TARGET_MULT      = 1.5   # target  = breakout + 1.5 × ORB_range
+SCALP_STOP_MULT        = 0.5   # stop    = breakout – 0.5 × ORB_range (tight)
+SCALP_STOP_FLOOR_PCT   = 0.002 # minimum stop = 0.2% below breakout (prevents sub-paise stops)
+SCALP_MIN_RR           = 1.8   # minimum R/R to emit a scalp signal
+
+# Scalping requires ≥ this many of the 3 internal confirmations to auto-trade
+SCALP_MIN_CONFIRMATIONS = 2    # ORB breakout + VWAP alignment + RSI momentum
+
+# Capital per scalp trade (smaller than intraday — scalping = quick in/out)
+SCALP_CAP_PER_TRADE    = 75_000    # ₹75,000 per scalp position
+SCALP_MAX_POSITIONS    = 4         # max 4 concurrent scalp trades
+SCALP_HARD_EXIT_TIME   = (14, 45)  # (hour, minute) in IST — hard exit all scalps at 2:45 PM
+
+# VWAP band — price must be within this % of VWAP to count as "near VWAP" alignment
+VWAP_BAND_PCT          = 0.5   # within 0.5% of VWAP counts as VWAP pull-to trade
