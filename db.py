@@ -1,22 +1,30 @@
 """
-db.py — DuckDB schema and helpers.
+db.py — PostgreSQL (Neon) schema and helpers.
 
-Why DuckDB and not SQLite?
-  - DuckDB is columnar — analytical queries (window functions, aggregates
-    over 252-day series) are 10-100x faster
-  - Native pandas integration via .df()
-  - Single-file like SQLite, no server
-  - Trade-off: single-writer (fine for us, screener is single-user)
+Previously used DuckDB (local file). Migrated to Neon serverless Postgres so
+that trade history, signals and activity log survive Streamlit Cloud re-deploys
+and support multiple concurrent users.
+
+Connection:
+  DATABASE_URL env var (set in .env locally, Streamlit secrets in cloud).
+  Falls back to a local SQLite-style warning if not set.
 
 Tables:
-  - instruments:      changes weekly, ~2K rows
-  - daily_ohlcv:      changes daily, ~500K rows after 252 days × 2K stocks
-  - computed_metrics: derived, recomputed on full rescan, ~2K rows
-  - trade_log:        user trade journal — recommendation vs actual outcome
+  instruments      - weekly refresh, ~2K rows
+  daily_ohlcv      - daily candles, ~500K rows
+  computed_metrics - derived screener output, ~2K rows
+  trade_log        - paper + real trade journal
+  signal_config    - per-user algo-tuning overrides
+  market_intel_log - AI market intel run log
+  market_intel_stocks - stocks returned by market intel
+  _db_meta         - one-time migration flags
 """
-import duckdb
+
+import os
+import psycopg2
+import psycopg2.extras
+import psycopg2.pool
 import pandas as pd
-from pathlib import Path
 from datetime import datetime as _dt_cls, timezone as _tz, timedelta as _td
 import config
 
@@ -24,307 +32,298 @@ _IST = _tz(_td(hours=5, minutes=30))
 
 
 def _now_ist() -> _dt_cls:
-    """Current datetime in IST, timezone-naive (safe for DuckDB TIMESTAMP columns)."""
+    """Current datetime in IST, timezone-naive (safe for TIMESTAMP columns)."""
     return _dt_cls.now(_IST).replace(tzinfo=None)
 
 
-def get_conn():
-    """Returns a fresh connection. DuckDB is single-process; reopen each time."""
-    Path(config.DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    return duckdb.connect(str(config.DB_PATH))
+# ── Connection pool ───────────────────────────────────────────────────────────
+# ThreadedConnectionPool is safe for Streamlit's multi-threaded execution model.
+# Neon's built-in PgBouncer absorbs rapid connect/disconnect cycles.
+
+_DATABASE_URL: str = (
+    os.environ.get("DATABASE_URL")
+    or os.environ.get("NEON_DATABASE_URL")
+    or ""
+)
+
+_pool: psycopg2.pool.ThreadedConnectionPool | None = None
 
 
-def _migrate_trade_log_columns(con):
-    """
-    Idempotent migration — adds columns introduced after the initial schema.
-    Safe to call on both new and existing databases.
-    """
-    extra_cols = [
-        ("kite_user_id",     "VARCHAR"),   # per-user isolation
-        ("kite_order_id",    "VARCHAR"),
-        ("kite_sl_order_id", "VARCHAR"),
-        ("kite_status",      "VARCHAR"),
-        ("is_paper_trade",   "BOOLEAN"),   # True = virtual paper trade, False/NULL = real
-    ]
-    for col, dtype in extra_cols:
+def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
+    global _pool, _DATABASE_URL
+    if not _DATABASE_URL:
+        # Try loading from .env at runtime (local dev)
         try:
-            con.execute(
-                f"ALTER TABLE trade_log ADD COLUMN IF NOT EXISTS {col} {dtype}"
-            )
+            from dotenv import load_dotenv
+            load_dotenv(override=False)
+            _DATABASE_URL = os.environ.get("DATABASE_URL", "")
+        except ImportError:
+            pass
+    if not _DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL is not set. Add it to .env or Streamlit secrets."
+        )
+    if _pool is None or _pool.closed:
+        _pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=1, maxconn=8, dsn=_DATABASE_URL
+        )
+    return _pool
+
+
+def get_conn() -> psycopg2.extensions.connection:
+    """Borrow a connection from the pool. Caller MUST call release_conn() or close()."""
+    return _get_pool().getconn()
+
+
+def release_conn(conn) -> None:
+    """Return a connection to the pool (preferred over conn.close())."""
+    try:
+        _get_pool().putconn(conn)
+    except Exception:
+        try:
+            conn.close()
         except Exception:
             pass
 
 
-def _migrate_signal_columns(con):
-    """
-    Adds trade-signal columns to computed_metrics for DBs that pre-date this
-    feature. DuckDB supports ADD COLUMN IF NOT EXISTS so this is idempotent.
-    """
-    new_cols = [
-        ("swing_signal",        "VARCHAR"),
-        ("swing_setup",         "VARCHAR"),
-        ("swing_entry",         "DOUBLE"),
-        ("swing_stop",          "DOUBLE"),
-        ("swing_t1",            "DOUBLE"),
-        ("swing_t2",            "DOUBLE"),
-        ("swing_rr",            "DOUBLE"),
-        ("swing_quality",       "INTEGER"),
-        ("swing_reason",        "VARCHAR"),
-        ("intraday_signal",     "VARCHAR"),
-        ("intraday_pivot",      "DOUBLE"),
-        ("intraday_r1",         "DOUBLE"),
-        ("intraday_r2",         "DOUBLE"),
-        ("intraday_s1",         "DOUBLE"),
-        ("intraday_s2",         "DOUBLE"),
-        ("intraday_entry",      "DOUBLE"),
-        ("intraday_stop",       "DOUBLE"),
-        ("intraday_t1",         "DOUBLE"),
-        ("intraday_reason",     "VARCHAR"),
-        ("intraday_confidence", "INTEGER"),
-        ("scale_signal",        "VARCHAR"),
-        ("scale_setup",         "VARCHAR"),
-        ("scale_entry_1",       "DOUBLE"),
-        ("scale_stop",          "DOUBLE"),
-        ("scale_trailing_stop", "DOUBLE"),
-        ("scale_target",        "DOUBLE"),
-        ("scale_quality",       "INTEGER"),
-        ("scale_reason",        "VARCHAR"),
-        # AI analysis columns
-        ("ai_score",            "DOUBLE"),
-        ("ai_verdict",          "VARCHAR"),
-        ("ai_confidence",       "VARCHAR"),
-        ("ai_brief",            "TEXT"),
-        ("ai_analyzed_at",      "TIMESTAMP"),
-    ]
-    for col, dtype in new_cols:
-        try:
-            con.execute(
-                f"ALTER TABLE computed_metrics ADD COLUMN IF NOT EXISTS {col} {dtype}"
-            )
-        except Exception:
-            pass   # column already exists or table doesn't exist yet — both fine
+def _df_from_cursor(cur) -> pd.DataFrame:
+    """Build a DataFrame from an executed psycopg2 cursor."""
+    if cur.description is None:
+        return pd.DataFrame()
+    cols = [d.name for d in cur.description]
+    return pd.DataFrame(cur.fetchall(), columns=cols)
 
+
+# ── Schema ────────────────────────────────────────────────────────────────────
 
 def init_schema():
-    """Creates tables if not exist. Idempotent — safe to call every run."""
-    con = get_conn()
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS instruments (
-            instrument_token  BIGINT PRIMARY KEY,
-            tradingsymbol     VARCHAR,
-            name              VARCHAR,
-            exchange          VARCHAR,
-            segment           VARCHAR,
-            instrument_type   VARCHAR,
-            tick_size         DOUBLE,
-            lot_size          INTEGER,
-            last_updated      TIMESTAMP
-        );
-    """)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS daily_ohlcv (
-            instrument_token  BIGINT,
-            date              DATE,
-            open              DOUBLE,
-            high              DOUBLE,
-            low               DOUBLE,
-            close             DOUBLE,
-            volume            BIGINT,
-            PRIMARY KEY (instrument_token, date)
-        );
-    """)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS computed_metrics (
-            instrument_token        BIGINT PRIMARY KEY,
-            tradingsymbol           VARCHAR,
-            ltp                     DOUBLE,
-            -- Liquidity
-            avg_turnover_cr         DOUBLE,
-            avg_volume              BIGINT,
-            -- Trends (% returns)
-            ret_5d                  DOUBLE,
-            ret_1m                  DOUBLE,
-            ret_3m                  DOUBLE,
-            ret_6m                  DOUBLE,
-            ret_1y                  DOUBLE,
-            -- Relative strength vs Nifty (3M)
-            rs_vs_nifty_3m          DOUBLE,
-            -- Volume expansion
-            vol_expansion_ratio     DOUBLE,
-            -- Technicals
-            rsi_14                  DOUBLE,
-            ema_20                  DOUBLE,
-            ema_50                  DOUBLE,
-            ema_200                 DOUBLE,
-            atr_14                  DOUBLE,
-            high_52w                DOUBLE,
-            low_52w                 DOUBLE,
-            dist_from_52w_high_pct  DOUBLE,
-            dist_from_50ema_pct     DOUBLE,
-            support_20d             DOUBLE,
-            resistance_20d          DOUBLE,
-            -- Composite
-            trend_score             DOUBLE,
-            composite_score         DOUBLE,
-            -- Swing signals
-            swing_signal            VARCHAR,
-            swing_setup             VARCHAR,
-            swing_entry             DOUBLE,
-            swing_stop              DOUBLE,
-            swing_t1                DOUBLE,
-            swing_t2                DOUBLE,
-            swing_rr                DOUBLE,
-            swing_quality           INTEGER,
-            swing_reason            VARCHAR,
-            -- Intraday signals (pivot-based day plan)
-            intraday_signal         VARCHAR,
-            intraday_pivot          DOUBLE,
-            intraday_r1             DOUBLE,
-            intraday_r2             DOUBLE,
-            intraday_s1             DOUBLE,
-            intraday_s2             DOUBLE,
-            intraday_entry          DOUBLE,
-            intraday_stop           DOUBLE,
-            intraday_t1             DOUBLE,
-            intraday_reason         VARCHAR,
-            intraday_confidence     INTEGER,
-            -- Scaling signals (multi-week position build)
-            scale_signal            VARCHAR,
-            scale_setup             VARCHAR,
-            scale_entry_1           DOUBLE,
-            scale_stop              DOUBLE,
-            scale_trailing_stop     DOUBLE,
-            scale_target            DOUBLE,
-            scale_quality           INTEGER,
-            scale_reason            VARCHAR,
-            -- AI Analysis (STOCKLENS)
-            ai_score                DOUBLE,
-            ai_verdict              VARCHAR,
-            ai_confidence           VARCHAR,
-            ai_brief                TEXT,
-            ai_analyzed_at          TIMESTAMP,
-            -- Meta
-            last_updated            TIMESTAMP
-        );
-    """)
-    _migrate_signal_columns(con)
-    # trade_log — must always be created (safe: IF NOT EXISTS)
-    con.execute("""
-        CREATE SEQUENCE IF NOT EXISTS trade_log_id_seq START 1;
-    """)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS trade_log (
-            id                  BIGINT DEFAULT nextval('trade_log_id_seq') PRIMARY KEY,
-            logged_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            trade_date          DATE,
-            tradingsymbol       VARCHAR,
-            instrument_token    BIGINT,
-            setup_type          VARCHAR,   -- SWING / INTRADAY / SCALING
-            signal_type         VARCHAR,   -- BUY / SELL / BUY_ABOVE / SELL_BELOW
-
-            -- ── ORIGINAL RECOMMENDATION snapshot ──────────────────────────
-            rec_entry           DOUBLE,
-            rec_stop            DOUBLE,
-            rec_t1              DOUBLE,
-            rec_t2              DOUBLE,
-            rec_rr              DOUBLE,
-            rec_reason          VARCHAR,
-            rec_composite_score DOUBLE,
-            rec_ai_score        DOUBLE,
-
-            -- ── WHO placed this trade (per-user isolation) ───────────────
-            kite_user_id        VARCHAR,   -- Kite user_id (e.g. "ZY1234")
-
-            -- ── KITE ORDER IDs (set when order placed via Kite API) ───────
-            kite_order_id       VARCHAR,   -- entry order id returned by Kite
-            kite_sl_order_id    VARCHAR,   -- stop-loss order id (optional)
-            kite_status         VARCHAR,   -- last known Kite order status
-
-            -- ── ACTUAL TRADE (what user did / Kite filled) ────────────────
-            quantity            INTEGER,
-            actual_entry        DOUBLE,
-            actual_exit         DOUBLE,    -- NULL = still open
-            status              VARCHAR,   -- OPEN / CLOSED / TARGET_HIT / STOPPED_OUT / PARTIAL_T1 / CANCELLED / REJECTED
-            notes               TEXT,
-
-            -- ── CALCULATED OUTCOMES (populated on close) ─────────────────
-            pnl_amount          DOUBLE,    -- (exit-entry)*qty, sign-aware for shorts
-            pnl_pct             DOUBLE,    -- (exit-entry)/entry*100
-            slippage_entry_pct  DOUBLE,    -- (actual_entry-rec_entry)/rec_entry*100
-            rr_realised         DOUBLE     -- actual_gain/actual_risk
-        );
-    """)
-    _migrate_trade_log_columns(con)
-    # signal_config — persists algo-tuning overrides derived from paper trade feedback
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS signal_config (
-            config_key   VARCHAR NOT NULL,
-            kite_user_id VARCHAR NOT NULL DEFAULT '',
-            value        DOUBLE  NOT NULL,
-            updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (config_key, kite_user_id)
-        );
-    """)
-    # _db_meta — tracks one-time data migrations
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS _db_meta (
-            key   VARCHAR PRIMARY KEY,
-            value VARCHAR
-        );
-    """)
-    # ── Market Intel tables ───────────────────────────────────────────────────
-    con.execute("""
-        CREATE SEQUENCE IF NOT EXISTS market_intel_log_id_seq START 1;
-    """)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS market_intel_log (
-            id                BIGINT DEFAULT nextval('market_intel_log_id_seq') PRIMARY KEY,
-            kite_user_id      VARCHAR DEFAULT '',
-            created_at        TIMESTAMP,
-            raw_output        TEXT,
-            overall_bias      VARCHAR,
-            overall_confidence VARCHAR
-        );
-    """)
-    con.execute("""
-        CREATE SEQUENCE IF NOT EXISTS market_intel_stocks_id_seq START 1;
-    """)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS market_intel_stocks (
-            id                   BIGINT DEFAULT nextval('market_intel_stocks_id_seq') PRIMARY KEY,
-            intel_id             BIGINT,
-            kite_user_id         VARCHAR DEFAULT '',
-            created_at           TIMESTAMP,
-            tradingsymbol        VARCHAR,
-            stance               VARCHAR,   -- BUY | SHORT | AVOID | BUY_ON_COND
-            sector               VARCHAR,
-            fundamental_reason   TEXT,
-            entry_trigger        TEXT,
-            stop_loss            VARCHAR,
-            conviction           VARCHAR,   -- HIGH | MED
-            condition_required   TEXT,
-            alert_level          VARCHAR,
-            expected_move        VARCHAR
-        );
-    """)
-
-    # One-time migration: shift any logged_at values stored in UTC to IST.
-    # Prior to this fix, CURRENT_TIMESTAMP (UTC on cloud) was used. Now we
-    # explicitly pass IST datetimes. We shift every row once using the +5:30
-    # offset and mark the migration complete so it never runs again.
-    already_done = con.execute(
-        "SELECT value FROM _db_meta WHERE key = 'logged_at_utc_to_ist_done'"
-    ).fetchone()
-    if not already_done:
-        con.execute("""
-            UPDATE trade_log
-            SET logged_at = logged_at + INTERVAL '5 hours 30 minutes'
+    """Creates all tables if they don't exist. Idempotent — safe every run."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS instruments (
+                instrument_token  BIGINT PRIMARY KEY,
+                tradingsymbol     VARCHAR,
+                name              VARCHAR,
+                exchange          VARCHAR,
+                segment           VARCHAR,
+                instrument_type   VARCHAR,
+                tick_size         DOUBLE PRECISION,
+                lot_size          INTEGER,
+                last_updated      TIMESTAMP
+            );
         """)
-        con.execute("""
-            INSERT INTO _db_meta (key, value) VALUES ('logged_at_utc_to_ist_done', '1')
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS daily_ohlcv (
+                instrument_token  BIGINT,
+                date              DATE,
+                open              DOUBLE PRECISION,
+                high              DOUBLE PRECISION,
+                low               DOUBLE PRECISION,
+                close             DOUBLE PRECISION,
+                volume            BIGINT,
+                PRIMARY KEY (instrument_token, date)
+            );
         """)
-    con.close()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS computed_metrics (
+                instrument_token        BIGINT PRIMARY KEY,
+                tradingsymbol           VARCHAR,
+                ltp                     DOUBLE PRECISION,
+                avg_turnover_cr         DOUBLE PRECISION,
+                avg_volume              BIGINT,
+                ret_5d                  DOUBLE PRECISION,
+                ret_1m                  DOUBLE PRECISION,
+                ret_3m                  DOUBLE PRECISION,
+                ret_6m                  DOUBLE PRECISION,
+                ret_1y                  DOUBLE PRECISION,
+                rs_vs_nifty_3m          DOUBLE PRECISION,
+                vol_expansion_ratio     DOUBLE PRECISION,
+                rsi_14                  DOUBLE PRECISION,
+                ema_20                  DOUBLE PRECISION,
+                ema_50                  DOUBLE PRECISION,
+                ema_200                 DOUBLE PRECISION,
+                atr_14                  DOUBLE PRECISION,
+                high_52w                DOUBLE PRECISION,
+                low_52w                 DOUBLE PRECISION,
+                dist_from_52w_high_pct  DOUBLE PRECISION,
+                dist_from_50ema_pct     DOUBLE PRECISION,
+                support_20d             DOUBLE PRECISION,
+                resistance_20d          DOUBLE PRECISION,
+                trend_score             DOUBLE PRECISION,
+                composite_score         DOUBLE PRECISION,
+                -- Swing
+                swing_signal            VARCHAR,
+                swing_setup             VARCHAR,
+                swing_entry             DOUBLE PRECISION,
+                swing_stop              DOUBLE PRECISION,
+                swing_t1                DOUBLE PRECISION,
+                swing_t2                DOUBLE PRECISION,
+                swing_rr                DOUBLE PRECISION,
+                swing_quality           INTEGER,
+                swing_reason            VARCHAR,
+                -- Intraday
+                intraday_signal         VARCHAR,
+                intraday_pivot          DOUBLE PRECISION,
+                intraday_r1             DOUBLE PRECISION,
+                intraday_r2             DOUBLE PRECISION,
+                intraday_r3             DOUBLE PRECISION,
+                intraday_s1             DOUBLE PRECISION,
+                intraday_s2             DOUBLE PRECISION,
+                intraday_s3             DOUBLE PRECISION,
+                intraday_entry          DOUBLE PRECISION,
+                intraday_stop           DOUBLE PRECISION,
+                intraday_t1             DOUBLE PRECISION,
+                intraday_t2             DOUBLE PRECISION,
+                intraday_reason         VARCHAR,
+                intraday_confidence     INTEGER,
+                intraday_gap_flag       VARCHAR,
+                intraday_nifty_gate     VARCHAR,
+                -- Scaling
+                scale_signal            VARCHAR,
+                scale_setup             VARCHAR,
+                scale_entry_1           DOUBLE PRECISION,
+                scale_stop              DOUBLE PRECISION,
+                scale_trailing_stop     DOUBLE PRECISION,
+                scale_target            DOUBLE PRECISION,
+                scale_quality           INTEGER,
+                scale_reason            VARCHAR,
+                -- AI analysis
+                ai_score                DOUBLE PRECISION,
+                ai_verdict              VARCHAR,
+                ai_confidence           VARCHAR,
+                ai_brief                TEXT,
+                ai_analyzed_at          TIMESTAMP,
+                last_updated            TIMESTAMP
+            );
+        """)
 
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS trade_log (
+                id                  BIGSERIAL PRIMARY KEY,
+                logged_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                trade_date          DATE,
+                tradingsymbol       VARCHAR,
+                instrument_token    BIGINT,
+                setup_type          VARCHAR,
+                signal_type         VARCHAR,
+                rec_entry           DOUBLE PRECISION,
+                rec_stop            DOUBLE PRECISION,
+                rec_t1              DOUBLE PRECISION,
+                rec_t2              DOUBLE PRECISION,
+                rec_rr              DOUBLE PRECISION,
+                rec_reason          VARCHAR,
+                rec_composite_score DOUBLE PRECISION,
+                rec_ai_score        DOUBLE PRECISION,
+                kite_user_id        VARCHAR,
+                kite_order_id       VARCHAR,
+                kite_sl_order_id    VARCHAR,
+                kite_status         VARCHAR,
+                quantity            INTEGER,
+                actual_entry        DOUBLE PRECISION,
+                actual_exit         DOUBLE PRECISION,
+                status              VARCHAR,
+                notes               TEXT,
+                pnl_amount          DOUBLE PRECISION,
+                pnl_pct             DOUBLE PRECISION,
+                slippage_entry_pct  DOUBLE PRECISION,
+                rr_realised         DOUBLE PRECISION,
+                is_paper_trade      BOOLEAN,
+                intraday_confidence INTEGER
+            );
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS signal_config (
+                config_key   VARCHAR     NOT NULL,
+                kite_user_id VARCHAR     NOT NULL DEFAULT '',
+                value        DOUBLE PRECISION NOT NULL,
+                updated_at   TIMESTAMP   DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (config_key, kite_user_id)
+            );
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS _db_meta (
+                key   VARCHAR PRIMARY KEY,
+                value VARCHAR
+            );
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS market_intel_log (
+                id                  BIGSERIAL PRIMARY KEY,
+                kite_user_id        VARCHAR DEFAULT '',
+                created_at          TIMESTAMP,
+                raw_output          TEXT,
+                overall_bias        VARCHAR,
+                overall_confidence  VARCHAR
+            );
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS market_intel_stocks (
+                id                   BIGSERIAL PRIMARY KEY,
+                intel_id             BIGINT,
+                kite_user_id         VARCHAR DEFAULT '',
+                created_at           TIMESTAMP,
+                tradingsymbol        VARCHAR,
+                stance               VARCHAR,
+                sector               VARCHAR,
+                fundamental_reason   TEXT,
+                entry_trigger        TEXT,
+                stop_loss            VARCHAR,
+                conviction           VARCHAR,
+                condition_required   TEXT,
+                alert_level          VARCHAR,
+                expected_move        VARCHAR
+            );
+        """)
+
+        # ── Idempotent column additions for older DBs ──────────────────────────
+        _add_column_if_missing(cur, "computed_metrics", "intraday_r3",       "DOUBLE PRECISION")
+        _add_column_if_missing(cur, "computed_metrics", "intraday_s3",       "DOUBLE PRECISION")
+        _add_column_if_missing(cur, "computed_metrics", "intraday_t2",       "DOUBLE PRECISION")
+        _add_column_if_missing(cur, "computed_metrics", "intraday_gap_flag", "VARCHAR")
+        _add_column_if_missing(cur, "computed_metrics", "intraday_nifty_gate","VARCHAR")
+        _add_column_if_missing(cur, "trade_log",        "intraday_confidence","INTEGER")
+        _add_column_if_missing(cur, "trade_log",        "rec_t2",            "DOUBLE PRECISION")
+
+        # One-time migration: UTC → IST shift on logged_at
+        cur.execute("SELECT value FROM _db_meta WHERE key = 'logged_at_utc_to_ist_done'")
+        if not cur.fetchone():
+            cur.execute("""
+                UPDATE trade_log
+                SET logged_at = logged_at + INTERVAL '5 hours 30 minutes'
+                WHERE logged_at IS NOT NULL
+            """)
+            cur.execute(
+                "INSERT INTO _db_meta (key, value) VALUES ('logged_at_utc_to_ist_done', '1') "
+                "ON CONFLICT (key) DO NOTHING"
+            )
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        release_conn(conn)
+
+
+def _add_column_if_missing(cur, table: str, col: str, dtype: str) -> None:
+    """Postgres-compatible idempotent column add."""
+    cur.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_name = %s AND column_name = %s",
+        [table, col],
+    )
+    if not cur.fetchone():
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {dtype}")
+
+
+# ── Pure math helpers ─────────────────────────────────────────────────────────
 
 def compute_trade_charges(
     entry: float,
@@ -334,28 +333,8 @@ def compute_trade_charges(
     exchange: str = "NSE",
 ) -> dict:
     """
-    Compute all Zerodha/exchange statutory charges for one completed equity trade.
-
-    Rates sourced from https://zerodha.com/charges/ (as of May 2026):
-
-    Intraday (MIS/BO/CO) on NSE Equity:
-      Brokerage     : min(₹20, 0.03%) per executed order — 2 orders (buy + sell)
-      STT           : 0.025% on sell-side only
-      NSE txn       : 0.00307% on total turnover (buy+sell)
-      SEBI turnover : ₹10/crore  = 0.000001 per ₹
-      GST           : 18% on (brokerage + txn + SEBI)
-      Stamp         : 0.003% on buy value
-
-    Swing / Delivery on NSE Equity:
-      Brokerage     : ₹0 (Zerodha free delivery)
-      STT           : 0.1% on both buy and sell sides
-      NSE txn       : 0.00307% on total turnover
-      SEBI turnover : ₹10/crore
-      GST           : 18% on (brokerage + txn + SEBI)
-      Stamp         : 0.015% on buy value
-      DP charge     : ₹15.34 per scrip on sell (CDSL + Zerodha + GST)
-
-    Returns dict: {brokerage, stt, txn_charges, sebi, gst, stamp, dp, total}
+    Zerodha/exchange statutory charges for one completed equity trade.
+    Rates: https://zerodha.com/charges/ (May 2026).
     """
     zero = {k: 0.0 for k in ["brokerage", "stt", "txn_charges", "sebi", "gst", "stamp", "dp", "total"]}
     if not (entry > 0 and exit_price > 0 and qty > 0):
@@ -365,25 +344,24 @@ def compute_trade_charges(
     sell_val = float(exit_price) * int(qty)
     turnover = buy_val + sell_val
 
-    is_intraday = str(setup_type).upper() in ("INTRADAY",)
+    is_intraday = str(setup_type).upper() in ("INTRADAY", "SCALP")
 
     if is_intraday:
         brokerage = min(20.0, 0.0003 * buy_val) + min(20.0, 0.0003 * sell_val)
-        stt       = 0.00025  * sell_val   # 0.025% sell side only
-        stamp     = 0.00003  * buy_val    # 0.003% buy side
-        dp        = 0.0                   # no DP charge for intraday (no demat debit)
+        stt   = 0.00025 * sell_val
+        stamp = 0.00003 * buy_val
+        dp    = 0.0
     else:
-        brokerage = 0.0                   # free delivery at Zerodha
-        stt       = 0.001    * turnover   # 0.1% both sides
-        stamp     = 0.00015  * buy_val    # 0.015% buy side
-        dp        = 15.34                 # ₹15.34 per scrip per sell demat debit
+        brokerage = 0.0
+        stt   = 0.001   * turnover
+        stamp = 0.00015 * buy_val
+        dp    = 15.34
 
     txn_rate    = 0.0000307 if exchange.upper() == "NSE" else 0.0000375
-    txn_charges = txn_rate  * turnover
-    sebi        = 0.000001  * turnover   # ₹10/crore
-
-    gst   = 0.18 * (brokerage + txn_charges + sebi)
-    total = brokerage + stt + txn_charges + sebi + gst + stamp + dp
+    txn_charges = txn_rate * turnover
+    sebi        = 0.000001 * turnover
+    gst         = 0.18 * (brokerage + txn_charges + sebi)
+    total       = brokerage + stt + txn_charges + sebi + gst + stamp + dp
 
     return {
         "brokerage":   round(brokerage,   2),
@@ -397,13 +375,10 @@ def compute_trade_charges(
     }
 
 
-def _compute_outcomes(quantity: int, actual_entry: float, actual_exit: float,
-                      rec_entry: float, rec_stop: float, signal_type: str) -> dict:
-    """Compute pnl_amount, pnl_pct, slippage_entry_pct, rr_realised from trade data."""
-    direction = -1 if signal_type in ("SELL", "SELL_BELOW") else 1
-    pnl_amount = None
-    pnl_pct    = None
-    rr_realised = None
+def _compute_outcomes(quantity, actual_entry, actual_exit,
+                      rec_entry, rec_stop, signal_type) -> dict:
+    direction = -1 if signal_type in ("SELL", "SELL_BELOW", "SELL_ORB") else 1
+    pnl_amount = pnl_pct = rr_realised = slippage = None
     if actual_exit is not None and actual_entry:
         pnl_amount  = direction * (actual_exit - actual_entry) * (quantity or 1)
         pnl_pct     = direction * (actual_exit - actual_entry) / actual_entry * 100
@@ -411,7 +386,6 @@ def _compute_outcomes(quantity: int, actual_entry: float, actual_exit: float,
         actual_gain = direction * (actual_exit - actual_entry)
         if risk and risk > 0:
             rr_realised = actual_gain / risk
-    slippage = None
     if rec_entry and actual_entry:
         slippage = (actual_entry - rec_entry) / rec_entry * 100
     return {
@@ -422,139 +396,212 @@ def _compute_outcomes(quantity: int, actual_entry: float, actual_exit: float,
     }
 
 
+# ── Instrument / OHLCV / Metrics ──────────────────────────────────────────────
+
 def upsert_instruments(df: pd.DataFrame):
-    """Replaces full instruments table (it's small and we re-pull weekly)."""
-    con = get_conn()
-    con.execute("DELETE FROM instruments;")
-    con.register("incoming", df)
-    con.execute("INSERT INTO instruments SELECT * FROM incoming;")
-    con.close()
+    """Replace full instruments table (small, weekly refresh)."""
+    if df.empty:
+        return
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute("DELETE FROM instruments")
+        cols = ["instrument_token", "tradingsymbol", "name", "exchange",
+                "segment", "instrument_type", "tick_size", "lot_size", "last_updated"]
+        rows = [tuple(row[c] for c in cols) for _, row in df[cols].iterrows()]
+        psycopg2.extras.execute_values(
+            cur,
+            "INSERT INTO instruments (instrument_token, tradingsymbol, name, exchange, "
+            "segment, instrument_type, tick_size, lot_size, last_updated) VALUES %s",
+            rows,
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        release_conn(conn)
 
 
 def upsert_ohlcv(df: pd.DataFrame):
-    """Append-or-replace daily candles. Uses DuckDB's INSERT OR REPLACE."""
+    """Append-or-replace daily candles using ON CONFLICT UPDATE."""
     if df.empty:
         return
-    con = get_conn()
-    con.register("incoming", df)
-    con.execute("""
-        INSERT OR REPLACE INTO daily_ohlcv
-        SELECT instrument_token, date, open, high, low, close, volume
-        FROM incoming;
-    """)
-    con.close()
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cols  = ["instrument_token", "date", "open", "high", "low", "close", "volume"]
+        avail = [c for c in cols if c in df.columns]
+        rows  = [tuple(row[c] for c in avail) for _, row in df[avail].iterrows()]
+        psycopg2.extras.execute_values(
+            cur,
+            """INSERT INTO daily_ohlcv (instrument_token, date, open, high, low, close, volume)
+               VALUES %s
+               ON CONFLICT (instrument_token, date) DO UPDATE SET
+                   open   = EXCLUDED.open,
+                   high   = EXCLUDED.high,
+                   low    = EXCLUDED.low,
+                   close  = EXCLUDED.close,
+                   volume = EXCLUDED.volume""",
+            rows,
+            page_size=1000,
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        release_conn(conn)
 
 
 def replace_metrics(df: pd.DataFrame):
     """Full table replace — metrics are always recomputed end-to-end."""
-    con = get_conn()
-    # Fetch the actual column names defined in the DB table so we can match
-    # by name, not by position.  This is critical when signal columns were added
-    # via ALTER TABLE migration (appended at the end) while the DataFrame may
-    # have them in a different order — positional SELECT * would map VARCHAR
-    # values into TIMESTAMP columns and trigger a ConversionError.
-    table_cols = {
-        row[0]
-        for row in con.execute(
+    if df.empty:
+        return
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        # Get actual table columns from Postgres catalog
+        cur.execute(
             "SELECT column_name FROM information_schema.columns "
-            "WHERE table_name = 'computed_metrics'"
-        ).fetchall()
-    }
-    # Only keep DataFrame columns that exist in the table (drop extras silently)
-    keep = [c for c in df.columns if c in table_cols]
-    df_clean = df[keep]
-    con.execute("DELETE FROM computed_metrics;")
-    con.register("incoming", df_clean)
-    # BY NAME matches columns by name, not position — safe across schema versions
-    con.execute("INSERT INTO computed_metrics BY NAME SELECT * FROM incoming;")
-    con.close()
+            "WHERE table_name = 'computed_metrics' ORDER BY ordinal_position"
+        )
+        table_cols = [r[0] for r in cur.fetchall()]
+        keep = [c for c in df.columns if c in table_cols]
+        df_clean = df[keep].copy()
+
+        cur.execute("DELETE FROM computed_metrics")
+
+        if df_clean.empty:
+            conn.commit()
+            return
+
+        col_list  = ", ".join(keep)
+        placeholders = ", ".join(["%s"] * len(keep))
+        rows = [
+            tuple(None if pd.isna(v) else v for v in row)
+            for row in df_clean.itertuples(index=False, name=None)
+        ]
+        psycopg2.extras.execute_values(
+            cur,
+            f"INSERT INTO computed_metrics ({col_list}) VALUES %s",
+            rows,
+            page_size=500,
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        release_conn(conn)
 
 
 def load_metrics() -> pd.DataFrame:
-    """Returns current screener output, joined with instrument names."""
-    con = get_conn()
-    df = con.execute("""
-        SELECT m.*, i.name AS company_name
-        FROM computed_metrics m
-        LEFT JOIN instruments i USING (instrument_token)
-        ORDER BY composite_score DESC NULLS LAST
-    """).df()
-    con.close()
-    return df
+    """Returns current screener output joined with instrument names."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT m.*, i.name AS company_name
+            FROM computed_metrics m
+            LEFT JOIN instruments i USING (instrument_token)
+            ORDER BY composite_score DESC NULLS LAST
+        """)
+        return _df_from_cursor(cur)
+    finally:
+        cur.close()
+        release_conn(conn)
 
 
 def load_ohlcv(instrument_token: int) -> pd.DataFrame:
-    """For chart panel — returns all cached daily candles for one stock."""
-    con = get_conn()
-    df = con.execute("""
-        SELECT date, open, high, low, close, volume
-        FROM daily_ohlcv
-        WHERE instrument_token = ?
-        ORDER BY date
-    """, [instrument_token]).df()
-    con.close()
-    return df
+    """All cached daily candles for one stock (for chart panel)."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT date, open, high, low, close, volume FROM daily_ohlcv "
+            "WHERE instrument_token = %s ORDER BY date",
+            [instrument_token],
+        )
+        return _df_from_cursor(cur)
+    finally:
+        cur.close()
+        release_conn(conn)
 
 
 def save_ai_result(instrument_token: int, result: dict):
     """Persist STOCKLENS AI analysis for one stock."""
-    con = get_conn()
-    con.execute("""
-        UPDATE computed_metrics
-        SET ai_score       = ?,
-            ai_verdict     = ?,
-            ai_confidence  = ?,
-            ai_brief       = ?,
-            ai_analyzed_at = ?
-        WHERE instrument_token = ?
-    """, [
-        result.get("ai_score"),
-        result.get("ai_verdict"),
-        result.get("ai_confidence"),
-        result.get("ai_brief"),
-        result.get("ai_analyzed_at"),
-        instrument_token,
-    ])
-    con.close()
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute("""
+            UPDATE computed_metrics
+            SET ai_score      = %s,
+                ai_verdict    = %s,
+                ai_confidence = %s,
+                ai_brief      = %s,
+                ai_analyzed_at= %s
+            WHERE instrument_token = %s
+        """, [
+            result.get("ai_score"),
+            result.get("ai_verdict"),
+            result.get("ai_confidence"),
+            result.get("ai_brief"),
+            result.get("ai_analyzed_at"),
+            instrument_token,
+        ])
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        release_conn(conn)
 
 
 def get_instruments_age_days() -> int:
-    """Returns days since instruments table was last refreshed (-1 if empty)."""
-    con = get_conn()
-    result = con.execute("""
-        SELECT EXTRACT(DAY FROM (CURRENT_TIMESTAMP - MAX(last_updated)))
-        FROM instruments
-    """).fetchone()
-    con.close()
-    if result is None or result[0] is None:
-        return -1
-    return int(result[0])
+    """Days since instruments table was last refreshed (-1 if empty)."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT EXTRACT(DAY FROM (NOW() - MAX(last_updated))) FROM instruments"
+        )
+        row = cur.fetchone()
+        if row is None or row[0] is None:
+            return -1
+        return int(row[0])
+    finally:
+        cur.close()
+        release_conn(conn)
 
 
 def get_last_metrics_update() -> str:
-    """Returns ISO timestamp of last full rescan, or 'never'."""
-    con = get_conn()
-    result = con.execute("SELECT MAX(last_updated) FROM computed_metrics").fetchone()
-    con.close()
-    if result is None or result[0] is None:
-        return "never"
-    return result[0].strftime("%Y-%m-%d %H:%M:%S")
+    """ISO timestamp of last full rescan, or 'never'."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute("SELECT MAX(last_updated) FROM computed_metrics")
+        row = cur.fetchone()
+        if row is None or row[0] is None:
+            return "never"
+        return row[0].strftime("%Y-%m-%d %H:%M:%S")
+    finally:
+        cur.close()
+        release_conn(conn)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# TRADE LOG — journal of recommendations vs actual outcomes
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# TRADE LOG
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def log_trade(trade: dict) -> int:
     """
     Insert a new trade log entry. Returns the new row id.
-
-    trade dict keys (all optional unless marked *required*):
-      *tradingsymbol, instrument_token, setup_type, signal_type,
-      trade_date, rec_entry, rec_stop, rec_t1, rec_t2, rec_rr, rec_reason,
-      rec_composite_score, rec_ai_score,
-      quantity, actual_entry, actual_exit, status, notes,
-      kite_order_id, kite_sl_order_id, kite_status.
+    Accepts all keys from the trade dict; unknown keys are ignored.
     """
     outcomes = _compute_outcomes(
         trade.get("quantity") or 1,
@@ -564,481 +611,525 @@ def log_trade(trade: dict) -> int:
         trade.get("rec_stop"),
         trade.get("signal_type", ""),
     )
-    con = get_conn()
-    con.execute("""
-        INSERT INTO trade_log (
-            trade_date, tradingsymbol, instrument_token,
-            setup_type, signal_type,
-            rec_entry, rec_stop, rec_t1, rec_t2, rec_rr, rec_reason,
-            rec_composite_score, rec_ai_score,
-            kite_user_id, kite_order_id, kite_sl_order_id, kite_status,
-            quantity, actual_entry, actual_exit, status, notes,
-            pnl_amount, pnl_pct, slippage_entry_pct, rr_realised,
-            is_paper_trade, logged_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, [
-        trade.get("trade_date"),
-        trade.get("tradingsymbol"),
-        trade.get("instrument_token"),
-        trade.get("setup_type"),
-        trade.get("signal_type"),
-        trade.get("rec_entry"),
-        trade.get("rec_stop"),
-        trade.get("rec_t1"),
-        trade.get("rec_t2"),
-        trade.get("rec_rr"),
-        trade.get("rec_reason"),
-        trade.get("rec_composite_score"),
-        trade.get("rec_ai_score"),
-        trade.get("kite_user_id"),
-        trade.get("kite_order_id"),
-        trade.get("kite_sl_order_id"),
-        trade.get("kite_status"),
-        trade.get("quantity"),
-        trade.get("actual_entry"),
-        trade.get("actual_exit"),
-        trade.get("status", "OPEN"),
-        trade.get("notes"),
-        outcomes["pnl_amount"],
-        outcomes["pnl_pct"],
-        outcomes["slippage_entry_pct"],
-        outcomes["rr_realised"],
-        bool(trade.get("is_paper_trade", False)),
-        trade.get("logged_at") or _now_ist(),
-    ])
-    row_id = con.execute("SELECT max(id) FROM trade_log").fetchone()[0]
-    con.close()
-    return row_id
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO trade_log (
+                trade_date, tradingsymbol, instrument_token,
+                setup_type, signal_type,
+                rec_entry, rec_stop, rec_t1, rec_t2, rec_rr, rec_reason,
+                rec_composite_score, rec_ai_score,
+                kite_user_id, kite_order_id, kite_sl_order_id, kite_status,
+                quantity, actual_entry, actual_exit, status, notes,
+                pnl_amount, pnl_pct, slippage_entry_pct, rr_realised,
+                is_paper_trade, intraday_confidence, logged_at
+            ) VALUES (
+                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+            ) RETURNING id
+        """, [
+            trade.get("trade_date"),
+            trade.get("tradingsymbol"),
+            trade.get("instrument_token"),
+            trade.get("setup_type"),
+            trade.get("signal_type"),
+            trade.get("rec_entry"),
+            trade.get("rec_stop"),
+            trade.get("rec_t1"),
+            trade.get("rec_t2"),
+            trade.get("rec_rr"),
+            trade.get("rec_reason"),
+            trade.get("rec_composite_score"),
+            trade.get("rec_ai_score"),
+            trade.get("kite_user_id"),
+            trade.get("kite_order_id"),
+            trade.get("kite_sl_order_id"),
+            trade.get("kite_status"),
+            trade.get("quantity"),
+            trade.get("actual_entry"),
+            trade.get("actual_exit"),
+            trade.get("status", "OPEN"),
+            trade.get("notes"),
+            outcomes["pnl_amount"],
+            outcomes["pnl_pct"],
+            outcomes["slippage_entry_pct"],
+            outcomes["rr_realised"],
+            bool(trade.get("is_paper_trade", False)),
+            trade.get("intraday_confidence"),
+            trade.get("logged_at") or _now_ist(),
+        ])
+        row_id = cur.fetchone()[0]
+        conn.commit()
+        return row_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        release_conn(conn)
 
 
 def close_trade(trade_id: int, actual_exit: float, status: str, notes: str = None):
-    """Update an OPEN trade with exit price and final status, recompute outcomes."""
-    con = get_conn()
-    row = con.execute(
-        "SELECT quantity, actual_entry, rec_entry, rec_stop, signal_type, notes "
-        "FROM trade_log WHERE id = ?", [trade_id]
-    ).fetchone()
-    if not row:
-        con.close()
-        return
-    qty, ae, re, rs, sig, old_notes = row
-    outcomes = _compute_outcomes(qty or 1, ae, actual_exit, re, rs, sig or "")
-    merged_notes = "\n".join(filter(None, [old_notes, notes]))
-    con.execute("""
-        UPDATE trade_log
-        SET actual_exit         = ?,
-            status              = ?,
-            notes               = ?,
-            pnl_amount          = ?,
-            pnl_pct             = ?,
-            slippage_entry_pct  = ?,
-            rr_realised         = ?
-        WHERE id = ?
-    """, [
-        actual_exit,
-        status,
-        merged_notes,
-        outcomes["pnl_amount"],
-        outcomes["pnl_pct"],
-        outcomes["slippage_entry_pct"],
-        outcomes["rr_realised"],
-        trade_id,
-    ])
-    con.close()
+    """Update an OPEN trade with exit price and final status, recompute P&L."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT quantity, actual_entry, rec_entry, rec_stop, signal_type, notes "
+            "FROM trade_log WHERE id = %s",
+            [trade_id],
+        )
+        row = cur.fetchone()
+        if not row:
+            return
+        qty, ae, re, rs, sig, old_notes = row
+        outcomes = _compute_outcomes(qty or 1, ae, actual_exit, re, rs, sig or "")
+        merged_notes = "\n".join(filter(None, [old_notes, notes]))
+        cur.execute("""
+            UPDATE trade_log
+            SET actual_exit        = %s,
+                status             = %s,
+                notes              = %s,
+                pnl_amount         = %s,
+                pnl_pct            = %s,
+                slippage_entry_pct = %s,
+                rr_realised        = %s
+            WHERE id = %s
+        """, [
+            actual_exit, status, merged_notes,
+            outcomes["pnl_amount"], outcomes["pnl_pct"],
+            outcomes["slippage_entry_pct"], outcomes["rr_realised"],
+            trade_id,
+        ])
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        release_conn(conn)
 
 
 def note_partial_t1(trade_id: int, t1_price: float, note: str):
-    """
-    Record a partial T1 booking event WITHOUT closing the trade.
-
-    The trade remains OPEN in the DB so exit monitoring continues.
-    We append a note to document that 60% was booked at T1 and the
-    remaining 40% is trailing to T2.  The final close_trade() call
-    will record the full exit P&L when T2 is hit or the trade is stopped.
-    """
-    con = get_conn()
-    old = con.execute("SELECT notes FROM trade_log WHERE id = ?", [trade_id]).fetchone()
-    old_notes = (old[0] or "") if old else ""
-    merged = "\n".join(filter(None, [old_notes, note]))
-    con.execute(
-        "UPDATE trade_log SET notes = ? WHERE id = ?",
-        [merged, trade_id],
-    )
-    con.close()
+    """Append a note for a partial T1 booking WITHOUT closing the trade."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute("SELECT notes FROM trade_log WHERE id = %s", [trade_id])
+        row = cur.fetchone()
+        old_notes = (row[0] or "") if row else ""
+        merged = "\n".join(filter(None, [old_notes, note]))
+        cur.execute("UPDATE trade_log SET notes = %s WHERE id = %s", [merged, trade_id])
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        release_conn(conn)
 
 
 def delete_trade(trade_id: int):
-    """Remove a trade log entry (e.g. accidental log)."""
-    con = get_conn()
-    con.execute("DELETE FROM trade_log WHERE id = ?", [trade_id])
-    con.close()
+    """Remove a trade log entry."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute("DELETE FROM trade_log WHERE id = %s", [trade_id])
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        release_conn(conn)
 
 
 def load_trade_log(status_filter: list = None, user_id: str = "") -> pd.DataFrame:
-    """Load trade log entries for a specific user, newest first."""
-    con = get_conn()
-    _uid_clause  = "AND kite_user_id = ?" if user_id else ""
-    _uid_params  = [user_id] if user_id else []
-    if status_filter:
-        placeholders = ",".join(["?"] * len(status_filter))
-        where = f"WHERE status IN ({placeholders}) {_uid_clause}"
-        df = con.execute(
-            f"SELECT * FROM trade_log {where} ORDER BY logged_at DESC",
-            status_filter + _uid_params,
-        ).df()
-    else:
-        where = f"WHERE 1=1 {_uid_clause}" if user_id else ""
-        df = con.execute(
-            f"SELECT * FROM trade_log {where} ORDER BY logged_at DESC",
-            _uid_params,
-        ).df()
-    con.close()
-    return df
+    """Load trade log entries for a user, newest first."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        clauses, params = [], []
+        if user_id:
+            clauses.append("kite_user_id = %s")
+            params.append(user_id)
+        if status_filter:
+            placeholders = ",".join(["%s"] * len(status_filter))
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(status_filter)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        cur.execute(f"SELECT * FROM trade_log {where} ORDER BY logged_at DESC", params)
+        return _df_from_cursor(cur)
+    finally:
+        cur.close()
+        release_conn(conn)
 
 
 def sync_from_kite_orders(orders: list, user_id: str = "") -> int:
-    """
-    Given today's Kite order list (from client.get_orders()), update matching
-    OPEN trade_log entries that have a kite_order_id.
-
-    Rules:
-      - If Kite status is COMPLETE: update actual_entry to filled average_price,
-        keep our status as OPEN (still needs an exit to be "closed").
-      - If Kite status is REJECTED or CANCELLED: set status = that value in DB.
-
-    Returns the number of trade_log rows updated.
-    """
+    """Update OPEN trade_log entries from Kite order status."""
     if not orders:
         return 0
     orders_map = {str(o.get("order_id", "")): o for o in orders}
-    con = get_conn()
-    _uid_clause = "AND kite_user_id = ?" if user_id else ""
-    _uid_param  = [user_id] if user_id else []
-    open_rows = con.execute(
-        "SELECT id, kite_order_id, actual_entry, quantity, signal_type, rec_entry, rec_stop "
-        f"FROM trade_log WHERE status = 'OPEN' AND kite_order_id IS NOT NULL {_uid_clause}",
-        _uid_param,
-    ).fetchall()
-    updated = 0
-    for row in open_rows:
-        tid, kid, ae, qty, sig, re, rs = row
-        if not kid:
-            continue
-        k = orders_map.get(str(kid))
-        if not k:
-            continue
-        kstat = k.get("status", "")
-        filled_price = k.get("average_price") or ae
-        if kstat == "COMPLETE":
-            # Update kite_status + actual_entry (fill price); keep trade OPEN
-            # until user records an exit price
-            con.execute(
-                "UPDATE trade_log SET kite_status=?, actual_entry=? WHERE id=?",
-                [kstat, float(filled_price) if filled_price else ae, tid],
-            )
-            updated += 1
-        elif kstat in ("REJECTED", "CANCELLED"):
-            con.execute(
-                "UPDATE trade_log SET status=?, kite_status=? WHERE id=?",
-                [kstat, kstat, tid],
-            )
-            updated += 1
-    con.close()
-    return updated
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        clauses = ["status = 'OPEN'", "kite_order_id IS NOT NULL"]
+        params  = []
+        if user_id:
+            clauses.append("kite_user_id = %s")
+            params.append(user_id)
+        cur.execute(
+            "SELECT id, kite_order_id, actual_entry, quantity, signal_type, rec_entry, rec_stop "
+            "FROM trade_log WHERE " + " AND ".join(clauses),
+            params,
+        )
+        open_rows = cur.fetchall()
+        updated = 0
+        for tid, kid, ae, qty, sig, re, rs in open_rows:
+            if not kid:
+                continue
+            k = orders_map.get(str(kid))
+            if not k:
+                continue
+            kstat       = k.get("status", "")
+            filled_price = k.get("average_price") or ae
+            if kstat == "COMPLETE":
+                cur.execute(
+                    "UPDATE trade_log SET kite_status=%s, actual_entry=%s WHERE id=%s",
+                    [kstat, float(filled_price) if filled_price else ae, tid],
+                )
+                updated += 1
+            elif kstat in ("REJECTED", "CANCELLED"):
+                cur.execute(
+                    "UPDATE trade_log SET status=%s, kite_status=%s WHERE id=%s",
+                    [kstat, kstat, tid],
+                )
+                updated += 1
+        conn.commit()
+        return updated
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        release_conn(conn)
 
 
 def get_trade_stats(user_id: str = "", is_paper: bool | None = None) -> dict:
-    """
-    Aggregate stats for the Activity Log summary header, scoped to user.
-
-    Parameters
-    ----------
-    user_id  : Kite user ID filter ('' = all users).
-    is_paper : True → paper trades only | False → real trades only | None → all.
-    """
-    con = get_conn()
-    clauses: list[str] = []
-    params: list = []
-    if user_id:
-        clauses.append("kite_user_id = ?")
-        params.append(user_id)
-    if is_paper is True:
-        clauses.append("is_paper_trade = TRUE")
-    elif is_paper is False:
-        clauses.append("(is_paper_trade = FALSE OR is_paper_trade IS NULL)")
-    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-    row = con.execute(f"""
-        SELECT
-            COUNT(*)                                             AS total,
-            SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END)   AS open_count,
-            SUM(CASE WHEN pnl_amount > 0   THEN 1 ELSE 0 END)  AS wins,
-            SUM(CASE WHEN pnl_amount <= 0 AND status != 'OPEN' THEN 1 ELSE 0 END) AS losses,
-            COALESCE(SUM(pnl_amount), 0)                        AS total_pnl,
-            AVG(CASE WHEN rr_realised IS NOT NULL THEN rr_realised END) AS avg_rr,
-            MAX(pnl_amount)                                      AS best_trade,
-            MIN(pnl_amount)                                      AS worst_trade
-        FROM trade_log {where}
-    """, params).fetchone()
-    con.close()
-    if row is None:
-        return {}
-    total, open_c, wins, losses, tot_pnl, avg_rr, best, worst = row
-    closed = (total or 0) - (open_c or 0)
-    win_rate = (wins / closed * 100) if closed > 0 else 0.0
-    return {
-        "total":      total or 0,
-        "open":       open_c or 0,
-        "closed":     closed,
-        "wins":       wins or 0,
-        "losses":     losses or 0,
-        "win_rate":   win_rate,
-        "total_pnl":  tot_pnl or 0.0,
-        "avg_rr":     avg_rr,
-        "best_trade": best,
-        "worst_trade": worst,
-    }
+    """Aggregate stats for Activity Log header, scoped to user."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        clauses, params = [], []
+        if user_id:
+            clauses.append("kite_user_id = %s")
+            params.append(user_id)
+        if is_paper is True:
+            clauses.append("is_paper_trade = TRUE")
+        elif is_paper is False:
+            clauses.append("(is_paper_trade = FALSE OR is_paper_trade IS NULL)")
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        cur.execute(f"""
+            SELECT
+                COUNT(*)                                               AS total,
+                SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END)     AS open_count,
+                SUM(CASE WHEN pnl_amount > 0   THEN 1 ELSE 0 END)    AS wins,
+                SUM(CASE WHEN pnl_amount <= 0 AND status != 'OPEN'
+                         THEN 1 ELSE 0 END)                           AS losses,
+                COALESCE(SUM(pnl_amount), 0)                         AS total_pnl,
+                AVG(CASE WHEN rr_realised IS NOT NULL THEN rr_realised END) AS avg_rr,
+                MAX(pnl_amount)                                        AS best_trade,
+                MIN(pnl_amount)                                        AS worst_trade
+            FROM trade_log {where}
+        """, params)
+        row = cur.fetchone()
+        if row is None:
+            return {}
+        total, open_c, wins, losses, tot_pnl, avg_rr, best, worst = row
+        closed   = (total or 0) - (open_c or 0)
+        win_rate = (wins / closed * 100) if closed > 0 else 0.0
+        return {
+            "total":      total or 0,
+            "open":       open_c or 0,
+            "closed":     closed,
+            "wins":       wins or 0,
+            "losses":     losses or 0,
+            "win_rate":   win_rate,
+            "total_pnl":  tot_pnl or 0.0,
+            "avg_rr":     avg_rr,
+            "best_trade": best,
+            "worst_trade": worst,
+        }
+    finally:
+        cur.close()
+        release_conn(conn)
 
 
 def get_total_charges(user_id: str = "", is_paper: bool | None = None) -> float:
-    """
-    Return the sum of Zerodha statutory charges for all CLOSED trades
-    matching the given user / paper filter.  Open trades are excluded because
-    their exit price (and therefore sell-side charges) is not yet known.
-    """
-    con = get_conn()
-    clauses = ["status != 'OPEN'", "actual_entry IS NOT NULL", "actual_exit IS NOT NULL", "quantity IS NOT NULL"]
-    params: list = []
-    if user_id:
-        clauses.append("kite_user_id = ?")
-        params.append(user_id)
-    if is_paper is True:
-        clauses.append("is_paper_trade = TRUE")
-    elif is_paper is False:
-        clauses.append("(is_paper_trade = FALSE OR is_paper_trade IS NULL)")
-    where = "WHERE " + " AND ".join(clauses)
-    rows = con.execute(
-        f"SELECT actual_entry, actual_exit, quantity, setup_type FROM trade_log {where}",
-        params,
-    ).fetchall()
-    con.close()
-    total = 0.0
-    for entry, exit_p, qty, stype in rows:
-        try:
-            total += compute_trade_charges(
-                float(entry), float(exit_p), int(qty), str(stype or "INTRADAY")
-            ).get("total", 0.0)
-        except Exception:
-            pass
-    return round(total, 2)
+    """Sum of Zerodha statutory charges for all CLOSED trades."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        clauses = [
+            "status != 'OPEN'",
+            "actual_entry IS NOT NULL",
+            "actual_exit IS NOT NULL",
+            "quantity IS NOT NULL",
+        ]
+        params = []
+        if user_id:
+            clauses.append("kite_user_id = %s")
+            params.append(user_id)
+        if is_paper is True:
+            clauses.append("is_paper_trade = TRUE")
+        elif is_paper is False:
+            clauses.append("(is_paper_trade = FALSE OR is_paper_trade IS NULL)")
+        cur.execute(
+            "SELECT actual_entry, actual_exit, quantity, setup_type FROM trade_log "
+            "WHERE " + " AND ".join(clauses),
+            params,
+        )
+        rows  = cur.fetchall()
+        total = 0.0
+        for entry, exit_p, qty, stype in rows:
+            try:
+                total += compute_trade_charges(
+                    float(entry), float(exit_p), int(qty), str(stype or "INTRADAY")
+                ).get("total", 0.0)
+            except Exception:
+                pass
+        return round(total, 2)
+    finally:
+        cur.close()
+        release_conn(conn)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# PAPER TRADING — virtual trade tracking and signal tuning
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAPER TRADING helpers
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def get_open_paper_trades(user_id: str = "", trade_date=None) -> list:
-    """
-    Return open paper trades for a given date (defaults to today) scoped to user.
-    Each row → dict with id, tradingsymbol, signal_type, actual_entry, rec_stop, rec_t1.
-    """
+    """Open paper trades for a given date (defaults to today), scoped to user."""
     import datetime as _dt
     d = trade_date or _dt.date.today()
-    con = get_conn()
-    _uid_clause = "AND kite_user_id = ?" if user_id else ""
-    _params = [str(d)] + ([user_id] if user_id else [])
-    rows = con.execute(
-        f"""SELECT id, tradingsymbol, signal_type, actual_entry, rec_stop, rec_t1
-            FROM trade_log
-            WHERE is_paper_trade = TRUE
-              AND status = 'OPEN'
-              AND trade_date = ?
-              {_uid_clause}""",
-        _params,
-    ).fetchall()
-    con.close()
-    return [
-        {
-            "id":            r[0],
-            "tradingsymbol": r[1],
-            "signal_type":   r[2],
-            "actual_entry":  r[3],
-            "rec_stop":      r[4],
-            "rec_t1":        r[5],
-        }
-        for r in rows
-    ]
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        clauses = ["is_paper_trade = TRUE", "status = 'OPEN'", "trade_date = %s"]
+        params  = [str(d)]
+        if user_id:
+            clauses.append("kite_user_id = %s")
+            params.append(user_id)
+        cur.execute(
+            "SELECT id, tradingsymbol, signal_type, actual_entry, rec_stop, rec_t1 "
+            "FROM trade_log WHERE " + " AND ".join(clauses),
+            params,
+        )
+        return [
+            {"id": r[0], "tradingsymbol": r[1], "signal_type": r[2],
+             "actual_entry": r[3], "rec_stop": r[4], "rec_t1": r[5]}
+            for r in cur.fetchall()
+        ]
+    finally:
+        cur.close()
+        release_conn(conn)
 
 
 def get_all_today_paper_trades(user_id: str = "", trade_date=None) -> list:
     """
-    Return ALL paper trades for today (any status: OPEN, TARGET_HIT, STOPPED_OUT …).
-    Used on startup to rebuild paper_triggered so closed trades can't re-fire after
+    ALL paper trades for today (any status). Used on startup to rebuild
+    paper_triggered / scalp_triggered so closed trades can't re-fire after
     a page refresh.
     """
     import datetime as _dt
     d = trade_date or _dt.date.today()
-    con = get_conn()
-    _uid_clause = "AND kite_user_id = ?" if user_id else ""
-    _params = [str(d)] + ([user_id] if user_id else [])
-    rows = con.execute(
-        f"""SELECT id, tradingsymbol, signal_type, actual_entry, rec_stop, rec_t1, status
-            FROM trade_log
-            WHERE is_paper_trade = TRUE
-              AND trade_date = ?
-              {_uid_clause}
-            ORDER BY id""",
-        _params,
-    ).fetchall()
-    con.close()
-    return [
-        {
-            "id":            r[0],
-            "tradingsymbol": r[1],
-            "signal_type":   r[2],
-            "actual_entry":  r[3],
-            "rec_stop":      r[4],
-            "rec_t1":        r[5],
-            "status":        r[6],
-        }
-        for r in rows
-    ]
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        clauses = ["is_paper_trade = TRUE", "trade_date = %s"]
+        params  = [str(d)]
+        if user_id:
+            clauses.append("kite_user_id = %s")
+            params.append(user_id)
+        cur.execute(
+            "SELECT id, tradingsymbol, signal_type, actual_entry, rec_stop, rec_t1, "
+            "       status, setup_type, rec_t2 "
+            "FROM trade_log WHERE " + " AND ".join(clauses) + " ORDER BY id",
+            params,
+        )
+        return [
+            {
+                "id":            r[0],
+                "tradingsymbol": r[1],
+                "signal_type":   r[2],
+                "actual_entry":  r[3],
+                "rec_stop":      r[4],
+                "rec_t1":        r[5],
+                "status":        r[6],
+                "setup_type":    r[7] or "INTRADAY",
+                "rec_t2":        r[8],
+            }
+            for r in cur.fetchall()
+        ]
+    finally:
+        cur.close()
+        release_conn(conn)
 
 
 def get_today_closed_pnl(user_id: str = "", is_paper: bool | None = None) -> float:
-    """
-    Returns the total realised P&L for trades closed TODAY.
-
-    "Closed today" means the trade has a non-OPEN status AND was either:
-      • opened today (trade_date = today), OR
-      • logged/updated today (logged_at date = today)
-    We use GREATEST(trade_date, DATE(logged_at)) so intraday trades opened and
-    closed on the same day are always captured, even if the exit timestamp
-    rounds to a different date in edge cases.
-
-    Parameters
-    ----------
-    user_id  : Kite user ID filter ('' = all users).
-    is_paper : True → paper trades only | False → real trades only | None → both.
-    """
-    _ensure_connection()
+    """Total realised P&L for trades closed today."""
     import datetime as _dt
     _today = _dt.date.today().isoformat()
-    clauses: list[str] = [
-        "status IN ('CLOSED', 'TARGET_HIT', 'STOPPED_OUT')",
-        "pnl_amount IS NOT NULL",
-        "(trade_date = ? OR CAST(logged_at AS DATE) = ?)",
-    ]
-    params: list = [_today, _today]
-    if user_id:
-        clauses.append("kite_user_id = ?")
-        params.append(user_id)
-    if is_paper is True:
-        clauses.append("is_paper_trade = TRUE")
-    elif is_paper is False:
-        clauses.append("(is_paper_trade = FALSE OR is_paper_trade IS NULL)")
-    where = " AND ".join(clauses)
+    conn = get_conn()
+    cur  = conn.cursor()
     try:
-        row = _conn.execute(
-            f"SELECT COALESCE(SUM(pnl_amount), 0.0) FROM trade_log WHERE {where}",
+        clauses = [
+            "status IN ('CLOSED', 'TARGET_HIT', 'STOPPED_OUT')",
+            "pnl_amount IS NOT NULL",
+            "(trade_date = %s OR logged_at::DATE = %s)",
+        ]
+        params: list = [_today, _today]
+        if user_id:
+            clauses.append("kite_user_id = %s")
+            params.append(user_id)
+        if is_paper is True:
+            clauses.append("is_paper_trade = TRUE")
+        elif is_paper is False:
+            clauses.append("(is_paper_trade = FALSE OR is_paper_trade IS NULL)")
+        cur.execute(
+            "SELECT COALESCE(SUM(pnl_amount), 0.0) FROM trade_log WHERE "
+            + " AND ".join(clauses),
             params,
-        ).fetchone()
+        )
+        row = cur.fetchone()
         return float(row[0]) if row else 0.0
     except Exception:
         return 0.0
+    finally:
+        cur.close()
+        release_conn(conn)
 
 
 def get_paper_trade_perf(user_id: str = "", days: int = 30) -> dict:
     """
     Aggregate paper trade performance over the last `days` calendar days,
-    broken down by signal_type (BUY_ABOVE / SELL_BELOW).
-
-    Returns:
-      {
-        "BUY_ABOVE":  {"total": int, "wins": int, "losses": int, "win_rate": float,
-                       "avg_rr": float, "avg_pnl_pct": float},
-        "SELL_BELOW": {...},
-        "overall":    {"total": int, "win_rate": float, "avg_rr": float},
-      }
-    """
-    con = get_conn()
-    _uid_clause = "AND kite_user_id = ?" if user_id else ""
-    _params = [days] + ([user_id] if user_id else [])
-    rows = con.execute(
-        f"""SELECT signal_type,
-                   COUNT(*)                                              AS total,
-                   SUM(CASE WHEN pnl_amount > 0 THEN 1 ELSE 0 END)     AS wins,
-                   SUM(CASE WHEN pnl_amount <= 0 AND pnl_amount IS NOT NULL
-                            THEN 1 ELSE 0 END)                          AS losses,
-                   AVG(CASE WHEN rr_realised IS NOT NULL
-                            THEN rr_realised END)                       AS avg_rr,
-                   AVG(pnl_pct)                                         AS avg_pnl_pct
-            FROM trade_log
-            WHERE is_paper_trade = TRUE
-              AND status IN ('TARGET_HIT','STOPPED_OUT','CLOSED')
-              AND trade_date >= CURRENT_DATE - INTERVAL (?) DAY
-              {_uid_clause}
-            GROUP BY signal_type""",
-        _params,
-    ).fetchall()
-    con.close()
-
-    result = {}
-    overall_total = overall_wins = 0
-    overall_rr_sum = overall_rr_n = 0
-    for r in rows:
-        sig, total, wins, losses, avg_rr, avg_pnl_pct = r
-        closed = total or 0
-        win_rate = (wins / closed * 100) if closed > 0 else 0.0
-        result[sig] = {
-            "total":       total or 0,
-            "wins":        wins  or 0,
-            "losses":      losses or 0,
-            "win_rate":    round(win_rate, 1),
-            "avg_rr":      round(avg_rr,   2) if avg_rr else None,
-            "avg_pnl_pct": round(avg_pnl_pct, 2) if avg_pnl_pct else None,
-        }
-        overall_total += total or 0
-        overall_wins  += wins  or 0
-        if avg_rr:
-            overall_rr_sum += avg_rr * (total or 0)
-            overall_rr_n   += total or 0
-
-    result["overall"] = {
-        "total":    overall_total,
-        "win_rate": round(overall_wins / overall_total * 100, 1) if overall_total else 0.0,
-        "avg_rr":   round(overall_rr_sum / overall_rr_n, 2) if overall_rr_n else None,
-    }
-    return result
-
-
-def get_archived_paper_trades_for_analysis(user_id: str = "") -> "pd.DataFrame":
-    """
-    Return all closed paper trades from days BEFORE today for algorithm re-tuning.
-    Includes confidence, planned vs actual R/R, stop details.
+    broken down by signal_type.
     """
     import datetime as _dt
+    cutoff = (_dt.date.today() - _td(days=days)).isoformat()
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        clauses = [
+            "is_paper_trade = TRUE",
+            "status IN ('TARGET_HIT','STOPPED_OUT','CLOSED')",
+            "trade_date >= %s",
+        ]
+        params: list = [cutoff]
+        if user_id:
+            clauses.append("kite_user_id = %s")
+            params.append(user_id)
+        cur.execute(
+            "SELECT signal_type, "
+            "COUNT(*) AS total, "
+            "SUM(CASE WHEN pnl_amount > 0 THEN 1 ELSE 0 END) AS wins, "
+            "SUM(CASE WHEN pnl_amount <= 0 AND pnl_amount IS NOT NULL THEN 1 ELSE 0 END) AS losses, "
+            "AVG(CASE WHEN rr_realised IS NOT NULL THEN rr_realised END) AS avg_rr, "
+            "AVG(pnl_pct) AS avg_pnl_pct "
+            "FROM trade_log WHERE " + " AND ".join(clauses) + " GROUP BY signal_type",
+            params,
+        )
+        rows   = cur.fetchall()
+        result = {}
+        overall_total = overall_wins = 0
+        overall_rr_sum = overall_rr_n = 0
+        for sig, total, wins, losses, avg_rr, avg_pnl_pct in rows:
+            closed   = total or 0
+            win_rate = (wins / closed * 100) if closed > 0 else 0.0
+            result[sig] = {
+                "total":       total  or 0,
+                "wins":        wins   or 0,
+                "losses":      losses or 0,
+                "win_rate":    round(win_rate, 1),
+                "avg_rr":      round(avg_rr, 2)      if avg_rr      else None,
+                "avg_pnl_pct": round(avg_pnl_pct, 2) if avg_pnl_pct else None,
+            }
+            overall_total += total or 0
+            overall_wins  += wins  or 0
+            if avg_rr:
+                overall_rr_sum += avg_rr * (total or 0)
+                overall_rr_n   += total or 0
+        result["overall"] = {
+            "total":    overall_total,
+            "win_rate": round(overall_wins / overall_total * 100, 1) if overall_total else 0.0,
+            "avg_rr":   round(overall_rr_sum / overall_rr_n, 2) if overall_rr_n else None,
+        }
+        return result
+    finally:
+        cur.close()
+        release_conn(conn)
+
+
+def get_archived_paper_trades_for_analysis(user_id: str = "") -> pd.DataFrame:
+    """All closed paper trades from days BEFORE today for algorithm re-tuning."""
+    import datetime as _dt
     today = str(_dt.date.today())
-    con = get_conn()
-    _uid_clause = "AND kite_user_id = ?" if user_id else ""
-    _params = [today] + ([user_id] if user_id else [])
-    df = con.execute(
-        f"""SELECT id, tradingsymbol, signal_type, trade_date, logged_at,
-                   actual_entry, actual_exit, rec_entry, rec_stop, rec_t1,
-                   pnl_amount, pnl_pct, rr_realised, intraday_confidence,
-                   intraday_rr, status, quantity
-            FROM trade_log
-            WHERE is_paper_trade = TRUE
-              AND status IN ('TARGET_HIT', 'STOPPED_OUT', 'CLOSED')
-              AND trade_date < ?
-              {_uid_clause}
-            ORDER BY trade_date DESC, id DESC""",
-        _params,
-    ).df()
-    con.close()
-    return df
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        clauses = [
+            "is_paper_trade = TRUE",
+            "status IN ('TARGET_HIT', 'STOPPED_OUT', 'CLOSED')",
+            "trade_date < %s",
+        ]
+        params: list = [today]
+        if user_id:
+            clauses.append("kite_user_id = %s")
+            params.append(user_id)
+        cur.execute(
+            "SELECT id, tradingsymbol, signal_type, trade_date, logged_at, "
+            "       actual_entry, actual_exit, rec_entry, rec_stop, rec_t1, "
+            "       pnl_amount, pnl_pct, rr_realised, intraday_confidence, "
+            "       status, quantity "
+            "FROM trade_log WHERE " + " AND ".join(clauses)
+            + " ORDER BY trade_date DESC, id DESC",
+            params,
+        )
+        return _df_from_cursor(cur)
+    finally:
+        cur.close()
+        release_conn(conn)
 
 
-# ─── Signal config (algo-tuning overrides) ───────────────────────────────────
+def get_open_real_trades(user_id: str = "") -> list:
+    """All real (non-paper) OPEN trades for today — used by 3:20 PM Kite sync."""
+    import datetime as _dt_mod
+    today = str(_dt_mod.date.today())
+    conn  = get_conn()
+    cur   = conn.cursor()
+    try:
+        clauses = ["is_paper_trade = FALSE", "status = 'OPEN'", "trade_date = %s"]
+        params  = [today]
+        if user_id:
+            clauses.append("kite_user_id = %s")
+            params.append(user_id)
+        cur.execute(
+            "SELECT id, tradingsymbol, signal_type, actual_entry, rec_stop "
+            "FROM trade_log WHERE " + " AND ".join(clauses) + " ORDER BY id",
+            params,
+        )
+        return [
+            {"id": r[0], "tradingsymbol": r[1], "signal_type": r[2],
+             "actual_entry": r[3], "rec_stop": r[4]}
+            for r in cur.fetchall()
+        ]
+    finally:
+        cur.close()
+        release_conn(conn)
+
+
+# ─── Signal config ────────────────────────────────────────────────────────────
 
 _SIGNAL_CONFIG_DEFAULTS = {
     "intraday_rsi_buy_max":  75.0,
@@ -1048,65 +1139,56 @@ _SIGNAL_CONFIG_DEFAULTS = {
 
 
 def get_signal_config(user_id: str = "") -> dict:
-    """
-    Load per-user signal tuning overrides from signal_config table.
-    Falls back to defaults from _SIGNAL_CONFIG_DEFAULTS for missing keys.
-    """
-    con = get_conn()
-    uid = user_id or ""
-    rows = con.execute(
-        "SELECT config_key, value FROM signal_config WHERE kite_user_id = ?",
-        [uid],
-    ).fetchall()
-    con.close()
-    cfg = dict(_SIGNAL_CONFIG_DEFAULTS)
-    for key, val in rows:
-        cfg[key] = val
-    return cfg
+    """Per-user signal tuning overrides, with defaults for missing keys."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT config_key, value FROM signal_config WHERE kite_user_id = %s",
+            [user_id or ""],
+        )
+        cfg = dict(_SIGNAL_CONFIG_DEFAULTS)
+        for key, val in cur.fetchall():
+            cfg[key] = val
+        return cfg
+    finally:
+        cur.close()
+        release_conn(conn)
 
 
 def save_signal_config(cfg: dict, user_id: str = "") -> None:
-    """
-    Upsert signal tuning overrides into signal_config table.
-    Only keys present in cfg are written; others are left untouched.
-    """
-    uid = user_id or ""
-    con = get_conn()
-    for key, val in cfg.items():
-        con.execute(
-            """INSERT INTO signal_config (config_key, kite_user_id, value, updated_at)
-               VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-               ON CONFLICT (config_key, kite_user_id)
-               DO UPDATE SET value = excluded.value,
-                             updated_at = excluded.updated_at""",
-            [key, uid, float(val)],
-        )
-    con.close()
+    """Upsert signal tuning overrides."""
+    uid  = user_id or ""
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        for key, val in cfg.items():
+            cur.execute(
+                """INSERT INTO signal_config (config_key, kite_user_id, value, updated_at)
+                   VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+                   ON CONFLICT (config_key, kite_user_id)
+                   DO UPDATE SET value = EXCLUDED.value,
+                                 updated_at = EXCLUDED.updated_at""",
+                [key, uid, float(val)],
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        release_conn(conn)
 
 
 def tune_signal_config_from_paper(user_id: str = "", days: int = 30) -> dict:
-    """
-    Derive updated signal thresholds from recent paper trade performance.
-
-    Tuning rules (conservative — only moves in one direction per call):
-      BUY_ABOVE win rate < 40% → tighten RSI max by 5 (floor 55)
-                                  raise min R/R by 0.5 (cap 3.0)
-      BUY_ABOVE win rate > 65% → relax RSI max by 3 (cap 75)
-                                  lower min R/R by 0.25 (floor 1.5)
-      SELL_BELOW win rate < 40% → tighten RSI min by 5 (cap 45)
-      SELL_BELOW win rate > 65% → relax RSI min by 3 (floor 25)
-
-    Returns a dict of {config_key: new_value, ...} that was changed,
-    or an empty dict if no adjustment was made.
-    """
-    perf = get_paper_trade_perf(user_id=user_id, days=days)
+    """Derive updated signal thresholds from recent paper trade performance."""
+    perf    = get_paper_trade_perf(user_id=user_id, days=days)
     current = get_signal_config(user_id=user_id)
     changes: dict = {}
 
     long_data  = perf.get("BUY_ABOVE",  {})
     short_data = perf.get("SELL_BELOW", {})
 
-    # Only tune when we have at least 5 closed trades to avoid noise
     if long_data.get("total", 0) >= 5:
         wr = long_data["win_rate"]
         cur_rsi = current["intraday_rsi_buy_max"]
@@ -1123,7 +1205,7 @@ def tune_signal_config_from_paper(user_id: str = "", days: int = 30) -> dict:
             if new_rr  != cur_rr:  changes["intraday_min_rr"]      = new_rr
 
     if short_data.get("total", 0) >= 5:
-        wr = short_data["win_rate"]
+        wr      = short_data["win_rate"]
         cur_rsi = current["intraday_rsi_sell_min"]
         if wr < 40.0:
             new_rsi = min(45.0, cur_rsi + 5.0)
@@ -1133,13 +1215,11 @@ def tune_signal_config_from_paper(user_id: str = "", days: int = 30) -> dict:
             if new_rsi != cur_rsi: changes["intraday_rsi_sell_min"] = new_rsi
 
     if changes:
-        merged = {**current, **changes}
-        save_signal_config(merged, user_id=user_id)
-
+        save_signal_config({**current, **changes}, user_id=user_id)
     return changes
 
 
-# ─── Market Intel helpers ─────────────────────────────────────────────────────
+# ─── Market Intel ─────────────────────────────────────────────────────────────
 
 def save_market_intel(
     user_id: str,
@@ -1148,156 +1228,117 @@ def save_market_intel(
     confidence: str,
     stocks: list,
 ) -> int:
-    """
-    Save a market intel run: one log row + N stock rows.
-    Replaces any previous run for this user (deletes old stocks first).
-    Returns the new intel_id.
-    """
-    con = get_conn()
-    uid = user_id or ""
-    now = _now_ist()
-
-    # Delete previous intel stocks for this user (keep only latest run)
-    con.execute(
-        "DELETE FROM market_intel_stocks WHERE kite_user_id = ?",
-        [uid],
-    )
-
-    # Insert new log entry
-    con.execute(
-        """INSERT INTO market_intel_log
-               (kite_user_id, created_at, raw_output, overall_bias, overall_confidence)
-           VALUES (?, ?, ?, ?, ?)""",
-        [uid, now, raw_output[:50_000], bias, confidence],  # cap raw at 50K chars
-    )
-    intel_id = con.execute(
-        "SELECT id FROM market_intel_log WHERE kite_user_id = ? ORDER BY created_at DESC LIMIT 1",
-        [uid],
-    ).fetchone()[0]
-
-    # Insert stock rows
-    for s in stocks:
-        con.execute(
-            """INSERT INTO market_intel_stocks
-                   (intel_id, kite_user_id, created_at, tradingsymbol, stance, sector,
-                    fundamental_reason, entry_trigger, stop_loss, conviction,
-                    condition_required, alert_level, expected_move)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            [
-                intel_id, uid, now,
-                s.get("tradingsymbol", ""),
-                s.get("stance", ""),
-                s.get("sector", "")[:200],
-                s.get("fundamental_reason", "")[:500],
-                s.get("entry_trigger", "")[:500],
-                s.get("stop_loss", "")[:100],
-                s.get("conviction", "")[:20],
-                s.get("condition_required", "")[:500],
-                s.get("alert_level", "")[:200],
-                s.get("expected_move", "")[:200],
-            ],
+    """Save a market intel run (log row + N stock rows). Returns intel_id."""
+    uid  = user_id or ""
+    now  = _now_ist()
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "DELETE FROM market_intel_stocks WHERE kite_user_id = %s", [uid]
         )
-    con.close()
-    return intel_id
+        cur.execute(
+            "INSERT INTO market_intel_log "
+            "(kite_user_id, created_at, raw_output, overall_bias, overall_confidence) "
+            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            [uid, now, raw_output[:50_000], bias, confidence],
+        )
+        intel_id = cur.fetchone()[0]
+
+        for s in stocks:
+            cur.execute(
+                "INSERT INTO market_intel_stocks "
+                "(intel_id, kite_user_id, created_at, tradingsymbol, stance, sector, "
+                " fundamental_reason, entry_trigger, stop_loss, conviction, "
+                " condition_required, alert_level, expected_move) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                [
+                    intel_id, uid, now,
+                    s.get("tradingsymbol", ""),
+                    s.get("stance", ""),
+                    s.get("sector", "")[:200],
+                    s.get("fundamental_reason", "")[:500],
+                    s.get("entry_trigger", "")[:500],
+                    s.get("stop_loss", "")[:100],
+                    s.get("conviction", "")[:20],
+                    s.get("condition_required", "")[:500],
+                    s.get("alert_level", "")[:200],
+                    s.get("expected_move", "")[:200],
+                ],
+            )
+        conn.commit()
+        return intel_id
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        release_conn(conn)
 
 
 def get_latest_market_intel(user_id: str = "") -> dict:
-    """
-    Return the most recent market intel log row for this user as a dict.
-    Returns {} if none found.
-    """
-    con = get_conn()
-    uid = user_id or ""
-    row = con.execute(
-        """SELECT id, created_at, overall_bias, overall_confidence, raw_output
-           FROM market_intel_log
-           WHERE kite_user_id = ?
-           ORDER BY created_at DESC LIMIT 1""",
-        [uid],
-    ).fetchone()
-    con.close()
-    if not row:
-        return {}
-    return {
-        "id":         row[0],
-        "created_at": row[1],
-        "bias":       row[2] or "NEUTRAL",
-        "confidence": row[3] or "MEDIUM",
-        "raw_output": row[4] or "",
-    }
-
-
-def get_open_real_trades(user_id: str = "") -> list:
-    """
-    Return all real (non-paper) trades that are still OPEN for today.
-    Used by the 3:20 PM Kite position sync to close out auto-squared positions.
-    """
-    import datetime as _dt_mod
-    today = str(_dt_mod.date.today())
-    con = get_conn()
-    uid = user_id or ""
-    _uid_clause = "AND kite_user_id = ?" if uid else ""
-    _params = [today] + ([uid] if uid else [])
-    rows = con.execute(
-        f"""SELECT id, tradingsymbol, signal_type, actual_entry, rec_stop
-            FROM trade_log
-            WHERE is_paper_trade = FALSE
-              AND status = 'OPEN'
-              AND trade_date = ?
-              {_uid_clause}
-            ORDER BY id""",
-        _params,
-    ).fetchall()
-    con.close()
-    return [
-        {
-            "id":            r[0],
-            "tradingsymbol": r[1],
-            "signal_type":   r[2],
-            "actual_entry":  r[3],
-            "rec_stop":      r[4],
+    """Most recent market intel log row for this user."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT id, created_at, overall_bias, overall_confidence, raw_output "
+            "FROM market_intel_log WHERE kite_user_id = %s "
+            "ORDER BY created_at DESC LIMIT 1",
+            [user_id or ""],
+        )
+        row = cur.fetchone()
+        if not row:
+            return {}
+        return {
+            "id":         row[0],
+            "created_at": row[1],
+            "bias":       row[2] or "NEUTRAL",
+            "confidence": row[3] or "MEDIUM",
+            "raw_output": row[4] or "",
         }
-        for r in rows
-    ]
+    finally:
+        cur.close()
+        release_conn(conn)
 
 
 def get_market_intel_stocks(user_id: str = "") -> list:
-    """
-    Return all stock rows from the latest market intel run for this user.
-    Each row is a dict with tradingsymbol, stance, sector, entry_trigger, etc.
-    """
-    con = get_conn()
-    uid = user_id or ""
-    rows = con.execute(
-        """SELECT mis.tradingsymbol, mis.stance, mis.sector,
-                  mis.fundamental_reason, mis.entry_trigger, mis.stop_loss,
-                  mis.conviction, mis.condition_required,
-                  mis.alert_level, mis.expected_move, mis.created_at
-           FROM market_intel_stocks mis
-           INNER JOIN market_intel_log mil ON mis.intel_id = mil.id
-           WHERE mis.kite_user_id = ?
-             AND mil.id = (
-                 SELECT id FROM market_intel_log
-                 WHERE kite_user_id = ?
-                 ORDER BY created_at DESC LIMIT 1
-             )
-           ORDER BY mis.stance, mis.id""",
-        [uid, uid],
-    ).fetchall()
-    con.close()
-    return [
-        {
-            "tradingsymbol":      r[0],
-            "stance":             r[1],
-            "sector":             r[2],
-            "fundamental_reason": r[3],
-            "entry_trigger":      r[4],
-            "stop_loss":          r[5],
-            "conviction":         r[6],
-            "condition_required": r[7],
-            "alert_level":        r[8],
-            "expected_move":      r[9],
-            "created_at":         r[10],
-        }
-        for r in rows
-    ]
+    """All stock rows from the latest market intel run for this user."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            """SELECT mis.tradingsymbol, mis.stance, mis.sector,
+                      mis.fundamental_reason, mis.entry_trigger, mis.stop_loss,
+                      mis.conviction, mis.condition_required,
+                      mis.alert_level, mis.expected_move, mis.created_at
+               FROM market_intel_stocks mis
+               INNER JOIN market_intel_log mil ON mis.intel_id = mil.id
+               WHERE mis.kite_user_id = %s
+                 AND mil.id = (
+                     SELECT id FROM market_intel_log
+                     WHERE kite_user_id = %s
+                     ORDER BY created_at DESC LIMIT 1
+                 )
+               ORDER BY mis.stance, mis.id""",
+            [user_id or "", user_id or ""],
+        )
+        return [
+            {
+                "tradingsymbol":      r[0],
+                "stance":             r[1],
+                "sector":             r[2],
+                "fundamental_reason": r[3],
+                "entry_trigger":      r[4],
+                "stop_loss":          r[5],
+                "conviction":         r[6],
+                "condition_required": r[7],
+                "alert_level":        r[8],
+                "expected_move":      r[9],
+                "created_at":         r[10],
+            }
+            for r in cur.fetchall()
+        ]
+    finally:
+        cur.close()
+        release_conn(conn)

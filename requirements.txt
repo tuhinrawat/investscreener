@@ -5,7 +5,9 @@ pillow>=10.4.0
 # Data & analytics
 pandas>=2.2.0
 numpy>=1.26.0
-duckdb>=1.1.0
+
+# PostgreSQL (Neon) — replaces DuckDB
+psycopg2-binary>=2.9.9
 
 # Charting
 plotly>=5.24.0

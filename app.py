@@ -17,6 +17,26 @@ from datetime import datetime, timezone, timedelta, date as date_type
 
 import os as _os
 
+# ── Database URL bootstrap ────────────────────────────────────────────────────
+# Load DATABASE_URL from .env (local dev) or Streamlit secrets (cloud) so that
+# db.get_conn() can build the connection pool before any table function runs.
+# Priority: already in env > Streamlit secrets > .env file.
+if not _os.environ.get("DATABASE_URL"):
+    try:
+        # Streamlit Cloud: secrets are in st.secrets
+        import streamlit as _st_boot
+        _db_url = _st_boot.secrets.get("DATABASE_URL", "")
+        if _db_url:
+            _os.environ["DATABASE_URL"] = _db_url
+    except Exception:
+        pass
+if not _os.environ.get("DATABASE_URL"):
+    try:
+        from dotenv import load_dotenv as _lde
+        _lde(override=False)
+    except ImportError:
+        pass
+
 import config
 import db
 import data_pipeline
