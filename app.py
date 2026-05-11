@@ -1280,45 +1280,65 @@ def _market_pulse_header():
         except Exception:
             pass
 
-    # ── Fetch global index live prices (5-min TTL, Yahoo Finance) ────────
-    # Covers US, Europe, Asia. Uses regularMarketPrice + chartPreviousClose
-    # so % change is correct even when the foreign market is currently closed.
+    # ── Fetch global index live prices (5-min TTL, Yahoo Finance v7 quote) ──
+    # v7/finance/quote is the real-time quote endpoint — single batch call,
+    # returns regularMarketPrice (live tick) + regularMarketChangePercent +
+    # marketState (REGULAR/PRE/POST/CLOSED).  Much more reliable than v8/chart
+    # with interval=1d which often returns yesterday's close during market hours.
     _GLOBAL_META: dict = {
-        # label         yf_symbol     region   flag
-        "S&P 500":  ("^GSPC",    "US",     "🇺🇸"),
-        "NASDAQ":   ("^IXIC",    "US",     "🇺🇸"),
-        "DOW":      ("^DJI",     "US",     "🇺🇸"),
-        "FTSE":     ("^FTSE",    "EU",     "🇬🇧"),
-        "DAX":      ("^GDAXI",   "EU",     "🇩🇪"),
-        "CAC 40":   ("^FCHI",    "EU",     "🇫🇷"),
-        "NIKKEI":   ("^N225",    "ASIA",   "🇯🇵"),
-        "HANG SENG":("^HSI",     "ASIA",   "🇭🇰"),
-        "SHANGHAI": ("000001.SS","ASIA",   "🇨🇳"),
-        "KOSPI":    ("^KS11",    "ASIA",   "🇰🇷"),
-        "ASX 200":  ("^AXJO",    "ASIA",   "🇦🇺"),
-        "SGX":      ("^STI",     "ASIA",   "🇸🇬"),
+        # label          yf_symbol       region   flag
+        "S&P 500":   ("^GSPC",     "US",     "🇺🇸"),
+        "NASDAQ":    ("^IXIC",     "US",     "🇺🇸"),
+        "DOW":       ("^DJI",      "US",     "🇺🇸"),
+        "FTSE":      ("^FTSE",     "EU",     "🇬🇧"),
+        "DAX":       ("^GDAXI",    "EU",     "🇩🇪"),
+        "CAC 40":    ("^FCHI",     "EU",     "🇫🇷"),
+        "NIKKEI":    ("^N225",     "ASIA",   "🇯🇵"),
+        "HANG SENG": ("^HSI",      "ASIA",   "🇭🇰"),
+        "SHANGHAI":  ("000001.SS", "ASIA",   "🇨🇳"),
+        "KOSPI":     ("^KS11",     "ASIA",   "🇰🇷"),
+        "ASX 200":   ("^AXJO",     "ASIA",   "🇦🇺"),
+        "SGX":       ("^STI",      "ASIA",   "🇸🇬"),
     }
+    # Build reverse map: yf_symbol → (label, region, flag)
+    _sym_to_meta = {v[0]: (k, v[1], v[2]) for k, v in _GLOBAL_META.items()}
+
     if _force or (_now_ts - st.session_state.get("_global_idx_ts", 0) > 300):
         _g_data: dict = {}
-        for _gname, (_gsym, _greg, _gflag) in _GLOBAL_META.items():
-            try:
-                _gr = _rqm.get(
-                    f"https://query1.finance.yahoo.com/v8/finance/chart/{_gsym}"
-                    "?interval=1d&range=1d",
-                    headers=_HDRS, timeout=5,
-                )
-                _gm = (_gr.json().get("chart", {}).get("result") or [{}])[0].get("meta", {})
-                _gltp  = _gm.get("regularMarketPrice")
-                _gprev = _gm.get("chartPreviousClose") or _gm.get("previousClose")
-                if _gltp and _gprev and _gprev > 0:
-                    _gpct = (_gltp - _gprev) / _gprev * 100
+        try:
+            _syms_csv = ",".join(v[0] for v in _GLOBAL_META.values())
+            # Use richer headers to avoid Yahoo rate-limiting / CDN stale responses
+            _YF_HDR = {
+                "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                               "Chrome/124.0.0.0 Safari/537.36"),
+                "Accept": "application/json",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://finance.yahoo.com",
+            }
+            _qr = _rqm.get(
+                f"https://query1.finance.yahoo.com/v7/finance/quote"
+                f"?symbols={_syms_csv}&fields=regularMarketPrice,"
+                f"regularMarketChangePercent,marketState,shortName",
+                headers=_YF_HDR, timeout=8,
+            )
+            _quotes = (_qr.json().get("quoteResponse", {}).get("result") or [])
+            for _q in _quotes:
+                _qsym  = _q.get("symbol", "")
+                _qltp  = _q.get("regularMarketPrice")
+                _qpct  = _q.get("regularMarketChangePercent")   # already in %
+                _qstate= _q.get("marketState", "CLOSED")
+                if _qsym in _sym_to_meta and _qltp is not None:
+                    _gname, _greg, _gflag = _sym_to_meta[_qsym]
                     _g_data[_gname] = {
-                        "ltp": float(_gltp), "pct": round(float(_gpct), 2),
-                        "region": _greg, "flag": _gflag,
-                        "mkt_state": _gm.get("marketState", "CLOSED"),
+                        "ltp":      float(_qltp),
+                        "pct":      round(float(_qpct), 2) if _qpct is not None else None,
+                        "region":   _greg,
+                        "flag":     _gflag,
+                        "mkt_state": _qstate,
                     }
-            except Exception:
-                pass
+        except Exception:
+            pass
         if _g_data:
             st.session_state["_global_idx"]    = _g_data
             st.session_state["_global_idx_ts"] = _now_ts
