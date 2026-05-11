@@ -210,21 +210,33 @@ def _load_kite_from_user(user: dict) -> None:
     st.session_state.setdefault("kite_access_date", "")
 
 
-# ── Step 1: try auto-login from localStorage session token ────────────
-# _ls_get returns None on the very first render (JS hasn't fired yet),
-# "" when localStorage is empty, or the stored token string.
-# We always render the component so its JS can fire on the next cycle.
-_ls_session_token = _ls_get("screener_session")
+# ── Step 1: try auto-login ────────────────────────────────────────────
+# Two complementary mechanisms, tried in order:
+#
+#  A) st.query_params["_sid"]  — PRIMARY (native Streamlit, zero JS)
+#     The session token is embedded in the URL.  F5/refresh preserves
+#     the URL so this survives same-tab page refreshes reliably.
+#
+#  B) localStorage component   — SECONDARY (cross-tab / new browser)
+#     Falls back when query params have no token (new tab, direct URL).
+#     _ls_get returns None on the first render (JS not fired yet) and
+#     the real value on the next render — both cases handled below.
 
-if "app_user" not in st.session_state and _ls_session_token:
-    _restored_user = db.get_user_by_session(_ls_session_token)
+_ls_session_token = _ls_get("screener_session")          # render component always
+_qp_token         = st.query_params.get("_sid", "")      # instant, no JS needed
+_try_token        = _qp_token or (_ls_session_token or "")
+
+if "app_user" not in st.session_state and _try_token:
+    _restored_user = db.get_user_by_session(_try_token)
     if _restored_user:
         st.session_state["app_user"]       = _restored_user
-        st.session_state["_session_token"] = _ls_session_token
+        st.session_state["_session_token"] = _try_token
         _load_kite_from_user(_restored_user)
     else:
-        # Token stale/revoked — clear so login page shows cleanly
+        # Token stale/revoked — clear both stores
         _ls_del("screener_session")
+        if "_sid" in st.query_params:
+            del st.query_params["_sid"]
 def _show_auth_page() -> None:
     """Full-screen login / signup. Calls st.stop() so the main app doesn't render."""
     st.markdown(
@@ -276,7 +288,8 @@ def _show_auth_page() -> None:
                         db.update_last_login(_u["id"])
                         st.session_state["app_user"]       = _u
                         st.session_state["_session_token"] = _tok
-                        _ls_set("screener_session", _tok, expires_days=36500)
+                        st.query_params["_sid"] = _tok          # primary: URL param
+                        _ls_set("screener_session", _tok, expires_days=36500)  # backup
                         _load_kite_from_user(_u)
                         st.rerun()
 
@@ -323,7 +336,8 @@ def _show_auth_page() -> None:
                         _new_u = db.get_user_by_username(_su_user.strip())
                         st.session_state["app_user"]       = _new_u
                         st.session_state["_session_token"] = _tok
-                        _ls_set("screener_session", _tok, expires_days=36500)
+                        st.query_params["_sid"] = _tok          # primary: URL param
+                        _ls_set("screener_session", _tok, expires_days=36500)  # backup
                         _load_kite_from_user(_new_u)
                         st.success(f"Welcome, {_su_user.strip()}! Redirecting…")
                         st.rerun()
@@ -673,6 +687,8 @@ with st.sidebar.expander(f"👤 {_app_user.get('username','').upper()}", expande
         if _tok_to_del:
             db.delete_session(_tok_to_del)
         _ls_del("screener_session")
+        if "_sid" in st.query_params:
+            del st.query_params["_sid"]
         for _k in ["app_user", "_session_token", "kite_authenticated", "kite_client",
                    "kite_access_token", "kite_user_id", "kite_user_name"]:
             st.session_state.pop(_k, None)
