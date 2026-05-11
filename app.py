@@ -213,39 +213,36 @@ def _load_kite_from_user(user: dict) -> None:
 # ── Step 1: try auto-login from localStorage session token ────────────
 # ls_get returns:
 #   None  — first render (JS component hasn't responded yet)
-#   ""    — localStorage was checked: no token stored (or expired)
+#   ""    — localStorage was checked: no token stored / expired
 #   str   — a valid session token to look up
 _ls_session_token = _ls_get("screener_session")
 
 if "app_user" not in st.session_state:
     if _ls_session_token is None:
-        # localStorage JS hasn't responded yet.  Wait up to 2 render cycles
-        # before giving up and showing the login page.  Cap via session_state
-        # counter to prevent an infinite rerun loop if the component stalls.
-        _ls_wait = st.session_state.get("_ls_init_wait", 0)
-        if _ls_wait < 2:
-            st.session_state["_ls_init_wait"] = _ls_wait + 1
-            import time as _time
-            _time.sleep(0.3)
-            st.rerun()
+        # JS hasn't fired yet.  Show a minimal loading screen and call
+        # st.stop() — this halts the current render without discarding
+        # any pending widget state (unlike st.rerun()).  The localStorage
+        # component will trigger a new render automatically when its JS
+        # sends back the stored value.
+        st.markdown(
+            "<div style='display:flex;align-items:center;justify-content:center;"
+            "height:80vh;flex-direction:column;gap:16px'>"
+            "<div style='color:#64748b;font-size:1rem'>Restoring your session…</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        st.stop()
+    elif _ls_session_token:
+        # Token returned — validate against DB
+        _restored_user = db.get_user_by_session(_ls_session_token)
+        if _restored_user:
+            st.session_state["app_user"]       = _restored_user
+            st.session_state["_session_token"] = _ls_session_token
+            _load_kite_from_user(_restored_user)
         else:
-            # Still None after 2 waits — component unavailable or no session.
-            # Reset counter so next hard refresh gets a fresh attempt.
-            st.session_state.pop("_ls_init_wait", None)
-            # Fall through to show login page
-    else:
-        st.session_state.pop("_ls_init_wait", None)  # reset on every successful read
-        if _ls_session_token:
-            # Token came back from localStorage — validate it
-            _restored_user = db.get_user_by_session(_ls_session_token)
-            if _restored_user:
-                st.session_state["app_user"]       = _restored_user
-                st.session_state["_session_token"] = _ls_session_token
-                _load_kite_from_user(_restored_user)
-            else:
-                # Token is stale or revoked — wipe it so login page shows cleanly
-                _ls_del("screener_session")
-        # If _ls_session_token == "" → no session in browser → fall through to login
+            # Stale / revoked token — clear it so login page shows cleanly
+            _ls_del("screener_session")
+    # _ls_session_token == "" → no session stored → fall through to login page
 def _show_auth_page() -> None:
     """Full-screen login / signup. Calls st.stop() so the main app doesn't render."""
     st.markdown(
