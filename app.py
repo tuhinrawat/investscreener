@@ -1607,17 +1607,16 @@ def _market_pulse_header():
     _spark_data: dict = st.session_state.get("_spark_data", {})
 
     def _sparkline(values: list, color: str = "#22c55e", uid: str = "s",
-                   invert: bool = False) -> str:
-        """Return a tiny inline SVG trend line (80×26 px).
+                   invert: bool = False, w: int = 80, h: int = 26) -> str:
+        """Return a tiny inline SVG trend line.
 
         invert=True  → rising = red (bad), falling = green (good).
-                       Used for USD/INR, crude, VIX (up hurts India).
         invert=False → rising = color (good), falling = red.
-                       Used for indices (Nifty 50, Nifty Bank).
+        w/h override dimensions (default 80×26; use 64×16 for compact global row).
         """
         if not values or len(values) < 2:
             return ""
-        W, H, PAD = 80, 26, 2
+        W, H, PAD = w, h, 1
         mn, mx = min(values), max(values)
         rng = (mx - mn) or abs(mn) or 1
         n = len(values)
@@ -1634,9 +1633,10 @@ def _market_pulse_header():
         else:
             c = color if _up else "#ef4444"
         gid   = f"sg{uid}"
+        _mt   = "2px" if H <= 18 else "4px"
         return (
             f'<svg width="{W}" height="{H}" viewBox="0 0 {W} {H}" '
-            f'style="display:block;overflow:visible;margin-top:4px">'
+            f'style="display:block;overflow:visible;margin-top:{_mt}">'
             f'<defs><linearGradient id="{gid}" x1="0" y1="0" x2="0" y2="1">'
             f'<stop offset="0%" stop-color="{c}" stop-opacity="0.35"/>'
             f'<stop offset="100%" stop-color="{c}" stop-opacity="0.02"/>'
@@ -1684,17 +1684,17 @@ def _market_pulse_header():
     _sp_brent  = _sparkline(_spark_data.get("brent",  []), "#f97316", "brent",  invert=True)
     _sp_natgas = _sparkline(_spark_data.get("natgas", []), "#a78bfa", "natgas", invert=True)
     # Global indices sparklines (up = good)
-    _sp_sp500  = _sparkline(_spark_data.get("sp500",  []), "#34d399", "sp500")
-    _sp_nasdaq = _sparkline(_spark_data.get("nasdaq", []), "#22d3ee", "nasdaq")
-    _sp_dow    = _sparkline(_spark_data.get("dow",    []), "#a3e635", "dow")
-    _sp_ftse   = _sparkline(_spark_data.get("ftse",   []), "#fb7185", "ftse")
-    _sp_dax    = _sparkline(_spark_data.get("dax",    []), "#fbbf24", "dax")
-    _sp_cac    = _sparkline(_spark_data.get("cac",    []), "#c084fc", "cac")
-    _sp_nikkei = _sparkline(_spark_data.get("nikkei", []), "#f472b6", "nikkei")
-    _sp_hsi    = _sparkline(_spark_data.get("hsi",    []), "#f97316", "hsi")
-    _sp_sse    = _sparkline(_spark_data.get("sse",    []), "#ef4444", "sse")
-    _sp_kospi  = _sparkline(_spark_data.get("kospi",  []), "#38bdf8", "kospi")
-    _sp_asx    = _sparkline(_spark_data.get("asx",    []), "#4ade80", "asx")
+    _sp_sp500  = _sparkline(_spark_data.get("sp500",  []), "#34d399", "sp500",  w=64, h=16)
+    _sp_nasdaq = _sparkline(_spark_data.get("nasdaq", []), "#22d3ee", "nasdaq", w=64, h=16)
+    _sp_dow    = _sparkline(_spark_data.get("dow",    []), "#a3e635", "dow",    w=64, h=16)
+    _sp_ftse   = _sparkline(_spark_data.get("ftse",   []), "#fb7185", "ftse",   w=64, h=16)
+    _sp_dax    = _sparkline(_spark_data.get("dax",    []), "#fbbf24", "dax",    w=64, h=16)
+    _sp_cac    = _sparkline(_spark_data.get("cac",    []), "#c084fc", "cac",    w=64, h=16)
+    _sp_nikkei = _sparkline(_spark_data.get("nikkei", []), "#f472b6", "nikkei", w=64, h=16)
+    _sp_hsi    = _sparkline(_spark_data.get("hsi",    []), "#f97316", "hsi",    w=64, h=16)
+    _sp_sse    = _sparkline(_spark_data.get("sse",    []), "#ef4444", "sse",    w=64, h=16)
+    _sp_kospi  = _sparkline(_spark_data.get("kospi",  []), "#38bdf8", "kospi",  w=64, h=16)
+    _sp_asx    = _sparkline(_spark_data.get("asx",    []), "#4ade80", "asx",    w=64, h=16)
 
     # ── Assemble row ──────────────────────────────────────────────────────
     _nifty_val = f"{_nifty_ltp:,.0f}" if _nifty_ltp else "—"
@@ -1839,37 +1839,35 @@ def _market_pulse_header():
     _gidx: dict = st.session_state.get("_global_idx", {})
 
     def _gcard(label: str, spark_svg: str) -> str:
-        """Slim global index card: flag+name, value, pct change, sparkline."""
-        _gd = _gidx.get(label, {})
+        """Compact global index card — smaller than India cards to save vertical space."""
+        _gd  = _gidx.get(label, {})
         _gl  = _gd.get("ltp")
         _gp  = _gd.get("pct")
         _gfl = _gd.get("flag", "")
         _gmk = _gd.get("mkt_state", "CLOSED")
         _gcl = "#22c55e" if (_gp or 0) >= 0 else "#ef4444"
-        _gvc = "#e2e8f0" if _gmk == "REGULAR" else "#64748b"
+        _gvc = "#cbd5e1" if _gmk == "REGULAR" else "#475569"
         _gv  = (f"{_gl:,.0f}" if _gl and _gl >= 1000 else f"{_gl:,.2f}" if _gl else "—")
         _gs  = (f'{"▲" if (_gp or 0) >= 0 else "▼"}{abs(_gp):.2f}%' if _gp is not None else "—")
-        _is_closed   = _gmk not in ("REGULAR", "PRE", "POST")
-        _closed_badge = ('<span style="font-size:8px;color:#475569">&nbsp;CLOSED</span>'
-                         if _is_closed else "")
-        _src_badge   = ('<span style="font-size:7px;color:#334155">&nbsp;stooq</span>'
-                        if _gd.get("src") == "stooq" else "")
-        _spk = (f'<div style="opacity:0.9">{spark_svg}</div>' if spark_svg else "")
+        _closed_badge = ('<span style="font-size:7px;color:#334155">&nbsp;●</span>'
+                         if _gmk not in ("REGULAR", "PRE", "POST") else
+                         '<span style="font-size:7px;color:#22c55e">&nbsp;●</span>')
+        _spk = (f'<div style="opacity:0.85;line-height:0">{spark_svg}</div>' if spark_svg else "")
         return (
-            f'<div style="display:flex;flex-direction:column;padding:4px 12px 6px 12px;'
-            f'border-left:1px solid #1e293b;min-width:76px;flex:1">'
-            f'<div style="font-size:9px;color:#475569;text-transform:uppercase;'
-            f'letter-spacing:0.06em;margin-bottom:2px;white-space:nowrap">'
-            f'{_gfl}&nbsp;{label}{_closed_badge}{_src_badge}</div>'
-            f'<div style="font-size:12px;font-weight:600;font-family:\'SF Mono\',monospace;'
-            f'color:{_gvc};white-space:nowrap">{_gv}</div>'
-            f'<div style="font-size:10px;color:{_gcl};font-family:\'SF Mono\',monospace">{_gs}</div>'
+            f'<div style="display:flex;flex-direction:column;padding:3px 10px 4px 10px;'
+            f'border-left:1px solid #0f1f3d;min-width:64px;flex:1">'
+            f'<div style="font-size:8px;color:#334155;text-transform:uppercase;'
+            f'letter-spacing:0.05em;white-space:nowrap">'
+            f'{_gfl}&nbsp;{label}{_closed_badge}</div>'
+            f'<div style="font-size:11px;font-weight:600;font-family:\'SF Mono\',monospace;'
+            f'color:{_gvc};white-space:nowrap;line-height:1.3">{_gv}</div>'
+            f'<div style="font-size:9px;color:{_gcl};font-family:\'SF Mono\',monospace;line-height:1.2">{_gs}</div>'
             f'{_spk}</div>'
         )
 
     def _region_label(txt: str) -> str:
-        return (f'<div style="font-size:8px;color:#1e3a5f;text-transform:uppercase;'
-                f'letter-spacing:0.08em;padding:0 6px 0 2px;writing-mode:vertical-lr;'
+        return (f'<div style="font-size:7px;color:#1e3a5f;text-transform:uppercase;'
+                f'letter-spacing:0.07em;padding:0 4px 0 2px;writing-mode:vertical-lr;'
                 f'transform:rotate(180deg);align-self:center;flex-shrink:0">{txt}</div>')
 
     _cards_us   = (_region_label("US")
@@ -1888,8 +1886,8 @@ def _market_pulse_header():
                    + _gcard("ASX 200",   _sp_asx))
 
     _cards_global_row = (
-        '<div style="background:#080e1c;border:1px solid #1a2744;border-radius:8px;'
-        'padding:6px 4px;display:flex;align-items:stretch;gap:0;overflow-x:auto;'
+        '<div style="background:#060b18;border:1px solid #0f1f3d;border-radius:6px;'
+        'padding:3px 4px 4px 4px;display:flex;align-items:stretch;gap:0;overflow-x:auto;'
         'margin-bottom:4px;scrollbar-width:none">'
         + _group_label("GLOBAL")
         + _cards_us + _divider() + _cards_eu + _divider() + _cards_asia
