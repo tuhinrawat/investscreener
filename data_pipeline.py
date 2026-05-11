@@ -46,19 +46,29 @@ def fetch_nse_index_symbols(index_name: str) -> set[str]:
     if not url:
         return set()
 
-    # Try to load from local cache first (refresh if stale > 7 days)
+    # ── Load from local cache ────────────────────────────────────────────────
+    # Fresh cache (< 7 days): use directly without hitting NSE.
+    # Stale cache (≥ 7 days): attempt a refresh, but fall back to the stale
+    # copy rather than blowing up to the full 2700-stock universe.
+    stale_fallback: set[str] = set()
     if cache_path.exists():
         try:
-            cached = json.loads(cache_path.read_text())
+            cached      = json.loads(cache_path.read_text())
             cached_date = date.fromisoformat(cached.get("date", "2000-01-01"))
-            if cached.get("index") == index_name and (date.today() - cached_date).days < 7:
-                print(f"Using cached {index_name} list ({cached_date})")
-                return set(cached["symbols"])
+            if cached.get("index") == index_name and cached.get("symbols"):
+                age_days = (date.today() - cached_date).days
+                if age_days < 7:
+                    print(f"Using cached {index_name} list ({cached_date})")
+                    return set(cached["symbols"])
+                else:
+                    # Keep as fallback — will be used if download fails
+                    stale_fallback = set(cached["symbols"])
+                    print(f"Cache stale ({age_days}d) — attempting refresh of {index_name}")
         except Exception:
             pass
 
-    # Download fresh — NSE requires a prior session hit to set cookies before
-    # it will serve the CSV (anti-scraping). We warm up with the homepage first.
+    # ── Download fresh ───────────────────────────────────────────────────────
+    # NSE requires a warm-up homepage hit to set cookies before it serves CSVs.
     try:
         try:
             from curl_cffi.requests import Session as CurlSession
@@ -74,28 +84,29 @@ def fetch_nse_index_symbols(index_name: str) -> set[str]:
                 )
             })
 
-        # Step 1: warm-up hit to get NSE session cookies
         session.get("https://www.nseindia.com", timeout=10)
-        # Step 2: download the index CSV
         r = session.get(url, headers={"Referer": "https://www.nseindia.com"}, timeout=15)
         r.raise_for_status()
 
         df = pd.read_csv(io.StringIO(r.text))
-        # NSE CSV has a "Symbol" column (sometimes with trailing spaces)
         symbols = set(df["Symbol"].str.strip().tolist())
+        if len(symbols) < 10:
+            raise ValueError(f"Suspiciously small symbol list ({len(symbols)}) — likely a bad response")
 
-        # Cache to disk
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(json.dumps({
-            "index": index_name,
-            "date": date.today().isoformat(),
+            "index":   index_name,
+            "date":    date.today().isoformat(),
             "symbols": sorted(symbols),
         }))
         print(f"✓ Downloaded {index_name}: {len(symbols)} constituents")
         return symbols
 
     except Exception as e:
-        print(f"⚠ Could not fetch {index_name} list ({e}) — using full EQ universe")
+        if stale_fallback:
+            print(f"⚠ NSE download failed ({e}) — using stale cache ({len(stale_fallback)} symbols)")
+            return stale_fallback
+        print(f"⚠ NSE download failed and no cache ({e}) — using full EQ universe")
         return set()
 
 
