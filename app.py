@@ -1312,7 +1312,7 @@ def _market_pulse_header():
             pass
 
     _bias_color = {"BULLISH": "#22c55e", "BEARISH": "#ef4444", "NEUTRAL": "#f59e0b"}.get(
-        (_bias or "").upper().split()[0], "#64748b"
+        ((_bias or "").upper().split() or [""])[0], "#64748b"
     )
     _conf_color = {"HIGH": "#22c55e", "MEDIUM": "#f59e0b", "LOW": "#ef4444"}.get(
         (_conf or "").upper(), "#64748b"
