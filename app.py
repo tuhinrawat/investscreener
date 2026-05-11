@@ -1245,6 +1245,37 @@ def _market_pulse_header():
         except Exception:
             pass
 
+    # ── Fetch 1-year sparkline data (24-hour TTL, fire once per session day) ──
+    _SPARK_TTL = 86400
+    if _force or (_now_ts - st.session_state.get("_spark_ts", 0) > _SPARK_TTL):
+        _SPARK_SYMS = {
+            "n50":    "^NSEI",
+            "nbank":  "^NSEBANK",
+            "vix":    "%5EINDIAVIX",
+            "usdinr": "USDINR%3DX",
+            "wti":    "CL%3DF",
+            "brent":  "BZ%3DF",
+            "natgas": "NG%3DF",
+        }
+        _new_spark: dict = {}
+        for _sk, _sym in _SPARK_SYMS.items():
+            try:
+                _sr = _rqm.get(
+                    f"https://query1.finance.yahoo.com/v8/finance/chart/{_sym}"
+                    "?interval=1d&range=1y",
+                    headers=_HDRS, timeout=6,
+                )
+                _sq = (_sr.json().get("chart", {}).get("result") or [{}])[0]
+                _closes = (_sq.get("indicators", {}).get("quote") or [{}])[0].get("close", [])
+                _closes = [float(c) for c in _closes if c is not None]
+                if len(_closes) >= 5:
+                    _new_spark[_sk] = _closes
+            except Exception:
+                pass
+        if _new_spark:
+            st.session_state["_spark_data"] = _new_spark
+            st.session_state["_spark_ts"]   = _now_ts
+
     # ── Reload AI Intel from DB (5-min TTL) ─────────────────────────────
     if _force or (_now_ts - st.session_state.get("_mph_intel_ts", 0) > 300):
         try:
@@ -1269,9 +1300,10 @@ def _market_pulse_header():
         except Exception:
             pass
 
-    # If force-refresh, also bust FX/commodity cache so banner picks up fresh data
+    # If force-refresh, also bust FX/commodity + sparkline cache
     if _force:
-        for _k in ("_usdinr_ltp", "_crude_usd", "_crude_ltp", "_brent_usd", "_natgas_usd", "_nifty_pcr"):
+        for _k in ("_usdinr_ltp", "_crude_usd", "_crude_ltp", "_brent_usd", "_natgas_usd", "_nifty_pcr",
+                   "_spark_data", "_spark_ts"):
             st.session_state.pop(_k, None)
 
     # ── Read all values from session state ───────────────────────────────
@@ -1364,15 +1396,50 @@ def _market_pulse_header():
             )
         _sector_html = "&nbsp;&nbsp;".join(_parts)
 
+    # ── Sparkline SVG helper ───────────────────────────────────────────────
+    _spark_data: dict = st.session_state.get("_spark_data", {})
+
+    def _sparkline(values: list, color: str = "#22c55e", uid: str = "s") -> str:
+        """Return a tiny inline SVG trend line (80×26 px)."""
+        if not values or len(values) < 2:
+            return ""
+        W, H, PAD = 80, 26, 2
+        mn, mx = min(values), max(values)
+        rng = (mx - mn) or abs(mn) or 1
+        n = len(values)
+        pts = [(round(i / (n - 1) * W, 1),
+                round(H - PAD - (v - mn) / rng * (H - PAD * 2), 1))
+               for i, v in enumerate(values)]
+        poly  = " ".join(f"{x},{y}" for x, y in pts)
+        area  = (f"M{pts[0][0]},{H} "
+                 + " ".join(f"L{x},{y}" for x, y in pts)
+                 + f" L{pts[-1][0]},{H} Z")
+        c     = color if values[-1] >= values[0] else "#ef4444"
+        gid   = f"sg{uid}"
+        return (
+            f'<svg width="{W}" height="{H}" viewBox="0 0 {W} {H}" '
+            f'style="display:block;overflow:visible;margin-top:4px">'
+            f'<defs><linearGradient id="{gid}" x1="0" y1="0" x2="0" y2="1">'
+            f'<stop offset="0%" stop-color="{c}" stop-opacity="0.35"/>'
+            f'<stop offset="100%" stop-color="{c}" stop-opacity="0.02"/>'
+            f'</linearGradient></defs>'
+            f'<path d="{area}" fill="url(#{gid})"/>'
+            f'<polyline points="{poly}" fill="none" stroke="{c}" '
+            f'stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/>'
+            f'</svg>'
+        )
+
     # ── Build metric card HTML helper ─────────────────────────────────────
     def _card(label: str, val: str, sub: str = "", sub_col: str = "#94a3b8",
-              val_col: str = "#e2e8f0", badge: str = "", badge_col: str = "#64748b") -> str:
+              val_col: str = "#e2e8f0", badge: str = "", badge_col: str = "#64748b",
+              spark: str = "") -> str:
         _bdg = (f'&nbsp;<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:{badge_col}22;color:{badge_col};font-weight:600">{badge}</span>' if badge else "")
         _sub = (f'<div style="font-size:10px;color:{sub_col};margin-top:1px">{sub}</div>' if sub else "")
-        return (f'<div style="display:flex;flex-direction:column;padding:4px 14px;border-left:1px solid #1e293b;min-width:70px;flex-shrink:0">'
+        _spk = (f'<div style="opacity:0.9">{spark}</div>' if spark else "")
+        return (f'<div style="display:flex;flex-direction:column;padding:4px 14px 6px 14px;border-left:1px solid #1e293b;min-width:80px;flex-shrink:0">'
                 f'<div style="font-size:9px;color:#475569;text-transform:uppercase;letter-spacing:0.07em;margin-bottom:2px">{label}</div>'
                 f'<div style="font-size:13px;font-weight:600;font-family:\'SF Mono\',\'Fira Code\',monospace;color:{val_col};white-space:nowrap">{val}{_bdg}</div>'
-                f'{_sub}</div>')
+                f'{_sub}{_spk}</div>')
 
     def _divider() -> str:
         return '<div style="width:1px;background:#1e293b;margin:2px 4px;align-self:stretch"></div>'
@@ -1380,23 +1447,32 @@ def _market_pulse_header():
     def _group_label(txt: str) -> str:
         return f'<div style="font-size:9px;color:#334155;text-transform:uppercase;letter-spacing:0.09em;padding:0 10px 0 4px;writing-mode:vertical-lr;transform:rotate(180deg);align-self:center;flex-shrink:0">{txt}</div>'
 
+    # ── Sparklines (pre-generated so card calls are clean) ────────────────
+    _sp_n50    = _sparkline(_spark_data.get("n50",    []), "#60a5fa", "n50")
+    _sp_nbank  = _sparkline(_spark_data.get("nbank",  []), "#818cf8", "nbank")
+    _sp_vix    = _sparkline(_spark_data.get("vix",    []), "#f59e0b", "vix")
+    _sp_usdinr = _sparkline(_spark_data.get("usdinr", []), "#f59e0b", "usdinr")
+    _sp_wti    = _sparkline(_spark_data.get("wti",    []), "#fb923c", "wti")
+    _sp_brent  = _sparkline(_spark_data.get("brent",  []), "#f97316", "brent")
+    _sp_natgas = _sparkline(_spark_data.get("natgas", []), "#a78bfa", "natgas")
+
     # ── Assemble row ──────────────────────────────────────────────────────
     _nifty_val = f"{_nifty_ltp:,.0f}" if _nifty_ltp else "—"
     _nbank_val = f"{_nbank_ltp:,.0f}" if _nbank_ltp else "—"
 
     _cards_g1  = (
         _group_label("MARKET")
-        + _card("NIFTY 50",   _nifty_val, _pct_str(_nifty_pct), _nifty_col, "#e2e8f0")
-        + _card("NIFTY BANK", _nbank_val, _pct_str(_nbank_pct), _nbank_col, "#e2e8f0")
+        + _card("NIFTY 50",   _nifty_val, _pct_str(_nifty_pct), _nifty_col, "#e2e8f0", spark=_sp_n50)
+        + _card("NIFTY BANK", _nbank_val, _pct_str(_nbank_pct), _nbank_col, "#e2e8f0", spark=_sp_nbank)
         + _card("INDIA VIX",  f"{_vix:.1f}" if _vix else "—",
-                badge=_vix_lbl, badge_col=_vix_col)
+                badge=_vix_lbl, badge_col=_vix_col, spark=_sp_vix)
     )
     _cards_g2 = (
         _group_label("MACRO")
-        + _card("USD / INR",  f"₹{_usd_inr:.2f}"    if _usd_inr    else "—", val_col="#f59e0b")
-        + _card("CRUDE WTI",  f"${_crude_usd:.2f}"   if _crude_usd  else "—", val_col="#fb923c")
-        + _card("BRENT",      f"${_brent_usd:.2f}"   if _brent_usd  else "—", val_col="#f97316")
-        + _card("NAT GAS",    f"${_natgas_usd:.3f}"  if _natgas_usd else "—", val_col="#a78bfa")
+        + _card("USD / INR",  f"₹{_usd_inr:.2f}"    if _usd_inr    else "—", val_col="#f59e0b", spark=_sp_usdinr)
+        + _card("CRUDE WTI",  f"${_crude_usd:.2f}"   if _crude_usd  else "—", val_col="#fb923c", spark=_sp_wti)
+        + _card("BRENT",      f"${_brent_usd:.2f}"   if _brent_usd  else "—", val_col="#f97316", spark=_sp_brent)
+        + _card("NAT GAS",    f"${_natgas_usd:.3f}"  if _natgas_usd else "—", val_col="#a78bfa", spark=_sp_natgas)
         + _card("NIFTY PCR",  f"{_pcr:.2f}"          if _pcr        else "—",
                 badge=_pcr_lbl, badge_col=_pcr_col)
     )
