@@ -1335,76 +1335,97 @@ def _market_pulse_header():
         import urllib.parse as _ulp
         from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _asc
 
+        # Stooq symbol map — free, no auth, plain CSV
         _STOOQ_MAP: dict = {
-            "^GSPC": "^spx", "^IXIC": "^ndq", "^DJI": "^dji",
-            "^FTSE": "^ftx", "^GDAXI": "^dax", "^FCHI": "^cac",
+            "^GSPC": "^spx", "^IXIC": "^ndq", "^DJI":      "^dji",
+            "^FTSE": "^ftx", "^GDAXI": "^dax", "^FCHI":     "^cac",
             "^N225": "^nkx", "^HSI":  "^hsi",  "000001.SS": "^shc",
-            "^KS11": "^ksp", "^AXJO": "^asx",  "^STI": "^sti",
+            "^KS11": "^ksp", "^AXJO": "^asx",  "^STI":      "^sti",
         }
-        _v8_hdr = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "application/json",
-        }
-        _stooq_hdr = {"User-Agent": "Mozilla/5.0 (compatible; screener/1.0)"}
 
         def _fetch_one(yfsym: str) -> tuple:
-            """Fetch one global index — Yahoo first, Stooq fallback. Returns (yfsym, dict|None)."""
+            """
+            Fetch one global index price + % change.
+            Strategy (fastest → most reliable):
+              A. Yahoo Finance v8/chart via curl_cffi (Chrome TLS impersonation —
+                 bypasses Yahoo bot-detection that blocks plain requests)
+              B. Stooq real-time quote CSV (no auth, always works)
+            Returns (yfsym, result_dict | None).
+            """
             _gname, _greg, _gflag = _GLOBAL_META[yfsym]
-            # Yahoo v8/chart — same endpoint that works for VIX/crude
+            _state = "REGULAR" if _region_open(_greg) else "CLOSED"
+
+            # ── A: Yahoo via curl_cffi (Chrome fingerprint) ───────────────
             try:
+                from curl_cffi import requests as _cffi_req
                 _enc = _ulp.quote(yfsym, safe="")
-                _r   = _rqm.get(
+                _r   = _cffi_req.get(
                     f"https://query1.finance.yahoo.com/v8/finance/chart/{_enc}"
                     "?interval=1m&range=1d",
-                    headers=_v8_hdr, timeout=3,
+                    impersonate="chrome",
+                    timeout=5,
                 )
                 if _r.status_code == 200:
                     _m = (_r.json().get("chart", {}).get("result") or [{}])[0].get("meta", {})
                     _ltp  = _m.get("regularMarketPrice")
                     _prev = _m.get("chartPreviousClose") or _m.get("previousClose")
-                    if _ltp is not None and _prev:
+                    if _ltp and _prev:
                         return yfsym, {
                             "ltp": float(_ltp),
                             "pct": round((float(_ltp) - float(_prev)) / float(_prev) * 100, 2),
                             "region": _greg, "flag": _gflag,
-                            "mkt_state": "REGULAR" if _region_open(_greg) else "CLOSED",
-                            "src": "yahoo",
+                            "mkt_state": _state, "src": "yahoo",
                         }
             except Exception:
                 pass
-            # Stooq fallback
+
+            # ── B: Stooq real-time quote + daily prev-close ───────────────
             _ssym = _STOOQ_MAP.get(yfsym)
             if _ssym:
                 try:
-                    _sr   = _rqm.get(f"https://stooq.com/q/d/l/?s={_ssym}&i=d",
-                                     headers=_stooq_hdr, timeout=4)
-                    _rows = [r.split(",") for r in _sr.text.strip().splitlines()
-                             if r and not r.startswith("Date")]
-                    if _rows:
-                        _ltp  = float(_rows[0][4])
-                        _prev = float(_rows[1][4]) if len(_rows) >= 2 else None
-                        return yfsym, {
-                            "ltp":  _ltp,
-                            "pct":  round((_ltp - _prev) / _prev * 100, 2) if _prev else None,
-                            "region": _greg, "flag": _gflag,
-                            "mkt_state": "REGULAR" if _region_open(_greg) else "CLOSED",
-                            "src":  "stooq",
-                        }
+                    import requests as _rqs
+                    _hdr = {"User-Agent": "Mozilla/5.0"}
+                    # Real-time quote: current price
+                    _rt  = _rqs.get(
+                        f"https://stooq.com/q/l/?s={_ssym}&f=sd2t2ohlcv&h&e=csv",
+                        headers=_hdr, timeout=4,
+                    )
+                    _rt_rows = [r.split(",") for r in _rt.text.strip().splitlines()
+                                if r and not r.startswith("Symbol")]
+                    if not _rt_rows or len(_rt_rows[0]) < 7:
+                        raise ValueError("bad rt row")
+                    _ltp = float(_rt_rows[0][6])   # Close column in real-time CSV
+
+                    # Daily history: previous close (2nd-to-last row after sort)
+                    _dh  = _rqs.get(
+                        f"https://stooq.com/q/d/l/?s={_ssym}&i=d",
+                        headers=_hdr, timeout=4,
+                    )
+                    _dh_rows = sorted(
+                        [r.split(",") for r in _dh.text.strip().splitlines()
+                         if r and not r.startswith("Date") and len(r.split(",")) >= 5],
+                        key=lambda x: x[0],   # sort by date ascending; last = most recent
+                    )
+                    _prev = float(_dh_rows[-2][4]) if len(_dh_rows) >= 2 else None
+                    return yfsym, {
+                        "ltp":  _ltp,
+                        "pct":  round((_ltp - _prev) / _prev * 100, 2) if _prev else None,
+                        "region": _greg, "flag": _gflag,
+                        "mkt_state": _state, "src": "stooq",
+                    }
                 except Exception:
                     pass
+
             return yfsym, None
 
-        # Fetch all 12 symbols in parallel — caps total wait to ~3-4s instead of 72s
+        # All 12 symbols fetched in parallel — total wall-clock ≤ 5s
         _g_data: dict = {}
         with _TPE(max_workers=12) as _pool:
             _futs = {_pool.submit(_fetch_one, sym): sym for sym in _GLOBAL_META}
-            for _fut in _asc(_futs, timeout=8):
+            for _fut in _asc(_futs, timeout=10):
                 try:
                     _sym, _result = _fut.result()
                     if _result:
-                        # store under display label ("S&P 500") — that's what _gcard looks up
                         _g_data[_GLOBAL_META[_sym][0]] = _result
                 except Exception:
                     pass
