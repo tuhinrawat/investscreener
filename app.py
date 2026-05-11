@@ -842,6 +842,8 @@ if st.sidebar.button("🔄 Full Rescan (~3-5 min)", use_container_width=True,
                 )
         except Exception:
             pass
+        # Reload the main page so the screener table shows fresh data immediately
+        st.rerun()
     except Exception as e:
         st.sidebar.error(f"Failed: {e}")
         import traceback
@@ -1572,7 +1574,7 @@ def _show_market_intel_dialog(uid: str) -> None:
 # ── Market Intel background poller ───────────────────────────────────────────
 # Defined here (before tab_screener renders) so both tabs can call it.
 # Runs every 5 s ONLY while a job is in flight; instant no-op when idle.
-@st.fragment(run_every=5)
+@st.fragment(run_every=8)
 def _intel_poller():
     """Light fragment: check if background market intel job finished."""
     if st.session_state.get("_intel_job_status") != "running":
@@ -3919,6 +3921,8 @@ def _intraday_paper_banner():
       • ≥ 5%                      → hard ceiling, no new entries
       • Return drops to cutoff    → block new entries for the rest of day
     """
+    if not _is_market_open():
+        return   # no-op outside 9:15–15:30 IST — avoids redundant reruns
     _uid = st.session_state.get("kite_user_id", "")
 
     # ── Fetch today's realised paper P&L ─────────────────────────────────────
@@ -4060,6 +4064,7 @@ def _intraday_scalp_live():
             "ORB is computed after 9:30 AM once the first 15 minutes have completed.",
             icon="⏸",
         )
+        return
         return
 
     _now_ist = datetime.now(_IST)
