@@ -519,6 +519,16 @@ if "_entry_confirm_since" not in st.session_state:
     st.session_state["_entry_confirm_since"] = {}
 _ENTRY_CONFIRM_SECS = 30   # require 30 s sustained above entry before firing
 
+# ── Scalp trade tracking ──────────────────────────────────────────────────────
+# scalp_triggered: {(date_str, sym, direction): trade_id} — prevents re-entering
+# scalp_open:      {trade_id: {sym, stop, t1, signal_type, entry, cap, setup_type}}
+#   setup_type = "SCALP" lets the 2:45 PM hard-exit know which trades to close early
+if "scalp_triggered" not in st.session_state:
+    st.session_state["scalp_triggered"] = {}
+if "scalp_open" not in st.session_state:
+    st.session_state["scalp_open"] = {}
+_SCALP_ENTRY_CONFIRM_SECS = 10  # scalps need faster execution: 10 s (vs 30 s intraday)
+
 # ── Market Intel state ────────────────────────────────────────────────────────
 # _intel_job_status : "idle" | "running" | "done" | "error: <msg>"
 # _intel_result     : {"raw": str, "stocks": list, "bias": dict}
@@ -587,13 +597,27 @@ if st.session_state.get("_paper_sync_date") != _today_str:
             st.session_state["paper_triggered"][_k] = _pt["id"]
             # Only add OPEN trades to the exit-monitoring dict
             if _pt["status"] == "OPEN":
-                st.session_state["paper_open"][_pt["id"]] = {
+                _sig_t = _pt.get("signal_type", "")
+                _setup  = _pt.get("setup_type", "INTRADAY")
+                _mon_dict = (
+                    st.session_state["scalp_open"]
+                    if _setup == "SCALP"
+                    else st.session_state["paper_open"]
+                )
+                _mon_dict[_pt["id"]] = {
                     "sym":         _pt["tradingsymbol"],
                     "stop":        float(_pt["rec_stop"] or 0),
                     "t1":          float(_pt["rec_t1"] or 0),
-                    "signal_type": _pt["signal_type"],
+                    "t2":          float(_pt.get("rec_t2") or 0),
+                    "signal_type": _sig_t,
                     "entry":       float(_pt["actual_entry"] or 0),
+                    "setup_type":  _setup,
+                    "partial_booked": False,
                 }
+                # Also mark scalp as triggered so it doesn't re-enter
+                if _setup == "SCALP":
+                    _sk = (_today_str, _pt["tradingsymbol"], _sig_t)
+                    st.session_state["scalp_triggered"][_sk] = _pt["id"]
     except Exception:
         pass
     st.session_state["_paper_sync_date"] = _today_str
@@ -3537,6 +3561,61 @@ def _live_signals_header():
                         except Exception:
                             pass
 
+        # ── Pass 2b: T1 / stop exits for scalp trades (same logic, separate dict) ─
+        _scalp_exits    = []
+        _scalp_partials = []
+        for _scid, _sct in list(st.session_state.get("scalp_open", {}).items()):
+            _sc_ltp = _live_ltp_now.get(_sct.get("sym", ""), 0)
+            if not _sc_ltp:
+                continue
+            _sc_sig  = _sct.get("signal_type", "")
+            _sc_t1   = _sct.get("t1", 0)
+            _sc_stop = _sct.get("stop", 0)
+            _sc_partial = _sct.get("partial_booked", False)
+            if _sc_sig == "BUY_ORB":
+                if _sc_t1 and _sc_ltp >= _sc_t1:
+                    _scalp_exits.append((_scid, _sct["sym"], "TARGET_HIT", _sc_t1))
+                elif _sc_stop and _sc_ltp <= _sc_stop:
+                    _scalp_exits.append((_scid, _sct["sym"], "STOPPED_OUT", _sc_ltp))
+                elif _sc_stop and _sc_ltp < _sc_stop * (1 - _STOP_OVERSHOOT_PCT):
+                    _scalp_exits.append((_scid, _sct["sym"], "STOPPED_OUT", _sc_ltp))
+            elif _sc_sig == "SELL_ORB":
+                if _sc_t1 and _sc_ltp <= _sc_t1:
+                    _scalp_exits.append((_scid, _sct["sym"], "TARGET_HIT", _sc_t1))
+                elif _sc_stop and _sc_ltp >= _sc_stop:
+                    _scalp_exits.append((_scid, _sct["sym"], "STOPPED_OUT", _sc_ltp))
+                elif _sc_stop and _sc_ltp > _sc_stop * (1 + _STOP_OVERSHOOT_PCT):
+                    _scalp_exits.append((_scid, _sct["sym"], "STOPPED_OUT", _sc_ltp))
+        for _scid, _sym_sc, _out_sc, _ep_sc in _scalp_exits:
+            try:
+                _lbl_sc = "at T1" if _out_sc == "TARGET_HIT" else "stopped"
+                db.close_trade(_scid, _ep_sc, _out_sc,
+                               f"⚡ Scalp auto-{_lbl_sc} @ ₹{_ep_sc:.2f}")
+                st.session_state["scalp_open"].pop(_scid, None)
+                _icon_sc = "✅" if _out_sc == "TARGET_HIT" else "🛑"
+                st.toast(f"{_icon_sc} Scalp {_sym_sc}: {_out_sc} @ ₹{_ep_sc:.2f}", icon=_icon_sc)
+            except Exception:
+                pass
+
+        # ── Pass 2c: Scalp hard exit at 2:45 PM ──────────────────────────────
+        _now_sc_exit = datetime.now(_IST)
+        _past_245 = (_now_sc_exit.hour > 14 or
+                     (_now_sc_exit.hour == 14 and _now_sc_exit.minute >= 45))
+        _scalp_exit_key = f"_scalp_hard_exit_{_dt.date.today()}"
+        if _past_245 and st.session_state.get("scalp_open") and not st.session_state.get(_scalp_exit_key):
+            for _schid, _scht in list(st.session_state["scalp_open"].items()):
+                _sch_ltp = _live_ltp_now.get(_scht.get("sym", ""), 0) or _scht.get("entry", 0)
+                try:
+                    db.close_trade(
+                        _schid, _sch_ltp, "CLOSED",
+                        f"⏰ Scalp hard exit 2:45 PM (LTP ₹{_sch_ltp:.2f})"
+                    )
+                    st.session_state["scalp_open"].pop(_schid, None)
+                    st.toast(f"⏰ Scalp exit: {_scht.get('sym', '')} @ ₹{_sch_ltp:.2f}", icon="⏰")
+                except Exception:
+                    pass
+            st.session_state[_scalp_exit_key] = True
+
         # ── Pass 3: Hard exit at 3:10 PM — close ALL remaining paper positions ─
         # Kite auto-squares MIS at 3:20 PM; we enforce 3:10 PM ourselves.
         # The flag is day-scoped so it only fires once per calendar day.
@@ -3748,10 +3827,24 @@ def _trading_mode_control():
             except Exception as _e:
                 _errors.append(f"Real order query failed: {_e}")
 
-        # 3. Switch to Off mode + clear triggered dicts
-        st.session_state["trading_mode"]   = "off"
+        # 3. Close open scalp positions at LTP
+        for _sc_pid, _sc_pt in list(st.session_state.get("scalp_open", {}).items()):
+            _sc_ltp_kill = st.session_state.get("_live_ltp", {}).get(_sc_pt.get("sym", ""), 0)
+            if _sc_ltp_kill:
+                try:
+                    db.close_trade(_sc_pid, _sc_ltp_kill, "CLOSED",
+                                   f"🔴 Kill switch — scalp closed @ ₹{_sc_ltp_kill:.2f}")
+                    st.session_state["scalp_open"].pop(_sc_pid, None)
+                    _closed_paper += 1
+                except Exception:
+                    pass
+
+        # 4. Switch to Off mode + clear triggered dicts
+        st.session_state["trading_mode"]    = "off"
         st.session_state["paper_triggered"] = {}
         st.session_state["real_triggered"]  = {}
+        st.session_state["scalp_triggered"] = {}
+        st.session_state["scalp_open"]      = {}
 
         _msg = f"🔴 Kill switch fired: {_closed_paper} paper trade(s) closed, {_cancelled_real} Kite order(s) cancelled."
         if _errors:
@@ -3951,13 +4044,32 @@ def _intraday_scalp_live():
         .head(15)
     )
 
-    _nifty_pct = st.session_state.get("_nifty_intraday_pct", 0.0) or 0.0
+    _nifty_pct     = st.session_state.get("_nifty_intraday_pct", 0.0) or 0.0
     _scalp_results = []
     _live_ltp_now  = st.session_state.get("_live_ltp", {})
+    _trade_mode    = st.session_state.get("trading_mode", "paper")
+    _ltp_ts_sc     = st.session_state.get("_live_ltp_ts")
+    _ltp_stale_sc  = (_ltp_ts_sc is None or
+                      (datetime.now(_IST) - _ltp_ts_sc).total_seconds() > config.LTP_FRESHNESS_SECS)
+
+    # ── Mode / status strip ───────────────────────────────────────────────────
+    _sc_open_count   = len(st.session_state.get("scalp_open", {}))
+    _sc_slots_left   = config.SCALP_MAX_POSITIONS - _sc_open_count
+    _sc_cap_deployed = _sc_open_count * config.SCALP_CAP_PER_TRADE
+
+    _mc1, _mc2, _mc3, _mc4 = st.columns(4)
+    _mc1.metric("Open Scalps",   _sc_open_count,   help="Currently open scalp trades")
+    _mc2.metric("Slots Left",    _sc_slots_left,   help=f"Max {config.SCALP_MAX_POSITIONS} concurrent scalp positions")
+    _mc3.metric("Cap Deployed",  f"₹{_sc_cap_deployed:,}", help=f"₹{config.SCALP_CAP_PER_TRADE:,} per trade")
+    _mc4.metric("Mode",          _trade_mode.upper(), help="Trading mode: Paper / Real / Off")
+
+    if _ltp_stale_sc:
+        st.info("⏸ Prices stale — waiting for refresh. Auto-scalp paused.", icon="🔄")
 
     st.caption(
         f"Scanning {len(_scalp_cands)} stocks for ORB breakouts. "
         "Requires 2/3 confirmations: **ORB break + VWAP + 5-min RSI**. "
+        f"Confirm hold: {_SCALP_ENTRY_CONFIRM_SECS}s. "
         f"Hard exit: 2:45 PM. Capital per scalp: ₹{config.SCALP_CAP_PER_TRADE:,}. "
         f"Nifty: {_nifty_pct:+.2f}%"
     )
@@ -3969,6 +4081,8 @@ def _intraday_scalp_live():
 
     import indicators as _ind  # noqa: PLC0415
     import signals as _sig_mod  # noqa: PLC0415
+
+    _scalp_confirm_map = st.session_state.setdefault("_scalp_confirm_since", {})
 
     for _, _row in _scalp_cands.iterrows():
         _sym = str(_row.get("tradingsymbol", ""))
@@ -3982,14 +4096,12 @@ def _intraday_scalp_live():
         if not _ltp_now:
             continue
 
+        # ── Fetch / cache 5-min candles ───────────────────────────────────────
         try:
-            # Fetch today's 5-min candles (rate-limited, cached per session via dict)
             _candle_cache = st.session_state.setdefault("_scalp_candle_cache", {})
             _cache_ts_key = f"_scalp_ts_{_sym}"
             _last_fetch   = st.session_state.get(_cache_ts_key)
             _candles_df   = _candle_cache.get(_sym, pd.DataFrame())
-
-            # Re-fetch every 5 minutes to stay fresh without hammering the API
             if (_last_fetch is None or
                     (datetime.now(_IST) - _last_fetch).total_seconds() > 300
                     or _candles_df.empty):
@@ -4002,12 +4114,12 @@ def _intraday_scalp_live():
         if _candles_df.empty:
             continue
 
-        # Compute intraday indicators
-        _orb_data    = _ind.opening_range(_candles_df, minutes=config.SCALP_ORB_MINUTES)
-        _vwap_price  = _ind.vwap(_candles_df)
-        _rsi_5m      = _ind.rsi_intraday(_candles_df)
-        _avg_vol     = float(_row.get("avg_volume") or 0)
-        _vol_ratio   = _ind.intraday_volume_ratio(_candles_df, _avg_vol) if _avg_vol > 0 else None
+        # ── Compute intraday indicators ───────────────────────────────────────
+        _orb_data   = _ind.opening_range(_candles_df, minutes=config.SCALP_ORB_MINUTES)
+        _vwap_price = _ind.vwap(_candles_df)
+        _rsi_5m     = _ind.rsi_intraday(_candles_df)
+        _avg_vol    = float(_row.get("avg_volume") or 0)
+        _vol_ratio  = _ind.intraday_volume_ratio(_candles_df, _avg_vol) if _avg_vol > 0 else None
 
         if not _orb_data:
             continue
@@ -4024,33 +4136,201 @@ def _intraday_scalp_live():
             daily_vol_ratio  = _vol_ratio,
         )
 
-        _status = _scalp_sig.get("scalp_signal") or "INSIDE_ORB"
-        _dir    = _scalp_sig.get("scalp_direction") or ""
-        _confs  = _scalp_sig.get("scalp_confirmations") or 0
+        _status  = _scalp_sig.get("scalp_signal") or "INSIDE_ORB"
+        _dir     = _scalp_sig.get("scalp_direction") or ""
+        _confs   = _scalp_sig.get("scalp_confirmations") or 0
+        _sc_conf = _scalp_sig.get("scalp_confidence") or 0
 
-        # Colour-code status
+        # ── Confirmation timer (10 s sustained breakout) ──────────────────────
+        _sc_key_long  = f"_sc_long_{_sym}"
+        _sc_key_short = f"_sc_short_{_sym}"
+        if _status == "LONG":
+            if _sc_key_long not in _scalp_confirm_map:
+                _scalp_confirm_map[_sc_key_long] = datetime.now(_IST)
+            _scalp_confirm_map.pop(_sc_key_short, None)
+        elif _status == "SHORT":
+            if _sc_key_short not in _scalp_confirm_map:
+                _scalp_confirm_map[_sc_key_short] = datetime.now(_IST)
+            _scalp_confirm_map.pop(_sc_key_long, None)
+        else:
+            _scalp_confirm_map.pop(_sc_key_long,  None)
+            _scalp_confirm_map.pop(_sc_key_short, None)
+
+        _sc_dir_key  = _sc_key_long if _status == "LONG" else _sc_key_short
+        _sc_ts       = _scalp_confirm_map.get(_sc_dir_key)
+        _sc_elapsed  = (datetime.now(_IST) - _sc_ts).total_seconds() if _sc_ts else 0
+        _sc_confirmed = _sc_elapsed >= _SCALP_ENTRY_CONFIRM_SECS
+
         if _status in ("LONG", "SHORT"):
-            _status_label = f"🚀 {_status}"
+            _remain_secs = max(0, int(_SCALP_ENTRY_CONFIRM_SECS - _sc_elapsed))
+            _status_label = (
+                f"🚀 {_status}" if _sc_confirmed
+                else f"⏱ CONFIRMING {_remain_secs}s"
+            )
         elif _status == "WATCH":
             _status_label = "👁 WATCH"
         else:
             _status_label = "⬜ INSIDE"
 
+        # ── Capital gate ──────────────────────────────────────────────────────
+        _sc_within_limit = (
+            _sc_slots_left > 0
+            and not st.session_state.get("paper_day_blocked", False)
+        )
+
+        # ── Signal type for DB ────────────────────────────────────────────────
+        _sc_sig_type   = "BUY_ORB" if _status == "LONG" else "SELL_ORB"
+        _sc_trig_key   = (_today_str, _sym, _sc_sig_type)
+        _entry_px      = _scalp_sig.get("scalp_entry") or _ltp_now
+        _stop_px       = _scalp_sig.get("scalp_stop")  or 0
+        _t1_px         = _scalp_sig.get("scalp_t1")    or 0
+        _pqty          = max(1, int(config.SCALP_CAP_PER_TRADE / (_entry_px or 1)))
+
+        # ── Auto-trade when confirmed + within limits ─────────────────────────
+        if (_status in ("LONG", "SHORT") and _sc_confirmed
+                and _sc_within_limit and not _ltp_stale_sc
+                and _trade_mode != "off"):
+
+            # ── Paper scalp ───────────────────────────────────────────────────
+            if (_trade_mode == "paper"
+                    and _sc_trig_key not in st.session_state.get("scalp_triggered", {})):
+                try:
+                    _scid = db.log_trade({
+                        "trade_date":          _dt.date.today(),
+                        "tradingsymbol":       _sym,
+                        "instrument_token":    _tok,
+                        "setup_type":          "SCALP",
+                        "signal_type":         _sc_sig_type,
+                        "rec_entry":           _entry_px,
+                        "rec_stop":            _stop_px,
+                        "rec_t1":              _t1_px,
+                        "rec_t2":              0,
+                        "rec_rr":              float(_scalp_sig.get("scalp_rr") or 0),
+                        "rec_reason":          str(_scalp_sig.get("scalp_reason") or "")[:250],
+                        "rec_composite_score": float(_row.get("composite_score") or 0),
+                        "kite_user_id":        _cur_user_id,
+                        "quantity":            _pqty,
+                        "actual_entry":        _ltp_now,
+                        "status":              "OPEN",
+                        "notes": (
+                            f"⚡ Scalp paper — {_status} ORB auto-triggered @ ₹{_ltp_now:.2f} "
+                            f"(confs {_confs}/3, score {_sc_conf}/10, qty {_pqty})"
+                        ),
+                        "is_paper_trade": True,
+                        "intraday_confidence": _sc_conf,
+                    })
+                    st.session_state["scalp_triggered"][_sc_trig_key] = _scid
+                    st.session_state["scalp_open"][_scid] = {
+                        "sym": _sym, "stop": _stop_px, "t1": _t1_px, "t2": 0,
+                        "signal_type": _sc_sig_type, "entry": _ltp_now,
+                        "cap": config.SCALP_CAP_PER_TRADE, "setup_type": "SCALP",
+                        "partial_booked": False,
+                    }
+                    _scalp_confirm_map.pop(_sc_dir_key, None)
+                    _sc_slots_left -= 1
+                    st.toast(
+                        f"⚡ Scalp paper {_status}: {_sym} @ ₹{_ltp_now:.2f} × {_pqty} "
+                        f"(confirmed {_SCALP_ENTRY_CONFIRM_SECS}s, {_confs}/3 confs)",
+                        icon="⚡",
+                    )
+                except Exception:
+                    pass
+
+            # ── Real scalp ────────────────────────────────────────────────────
+            elif (_trade_mode == "real"
+                    and _sc_trig_key not in st.session_state.get("scalp_triggered", {})):
+                _kc_sc_rt = st.session_state.get("kite_client")
+                if _kc_sc_rt and getattr(_kc_sc_rt, "authenticated", False):
+                    try:
+                        _sc_tx  = "BUY" if _status == "LONG" else "SELL"
+                        _sc_px  = round(_entry_px * (1.001 if _status == "LONG" else 0.999), 1)
+                        _sc_oid = _kc_sc_rt.place_order(
+                            tradingsymbol    = _sym,
+                            qty              = _pqty,
+                            transaction_type = _sc_tx,
+                            order_type       = "LIMIT",
+                            product          = "MIS",
+                            price            = _sc_px,
+                            tag              = "scr_scalp",
+                        )
+                        _sc_sl_oid = None
+                        if _stop_px:
+                            try:
+                                _sc_sl_tx = "SELL" if _status == "LONG" else "BUY"
+                                _sc_sl_oid = _kc_sc_rt.place_order(
+                                    tradingsymbol    = _sym,
+                                    qty              = _pqty,
+                                    transaction_type = _sc_sl_tx,
+                                    order_type       = "SL-M",
+                                    product          = "MIS",
+                                    trigger_price    = _stop_px,
+                                    tag              = "scr_scslp",
+                                )
+                            except Exception:
+                                pass
+                        _scid_r = db.log_trade({
+                            "trade_date":          _dt.date.today(),
+                            "tradingsymbol":       _sym,
+                            "instrument_token":    _tok,
+                            "setup_type":          "SCALP",
+                            "signal_type":         _sc_sig_type,
+                            "rec_entry":           _entry_px,
+                            "rec_stop":            _stop_px,
+                            "rec_t1":              _t1_px,
+                            "rec_t2":              0,
+                            "rec_rr":              float(_scalp_sig.get("scalp_rr") or 0),
+                            "rec_reason":          str(_scalp_sig.get("scalp_reason") or "")[:250],
+                            "rec_composite_score": float(_row.get("composite_score") or 0),
+                            "kite_user_id":        _cur_user_id,
+                            "kite_order_id":       _sc_oid,
+                            "kite_sl_order_id":    _sc_sl_oid,
+                            "kite_status":         "OPEN",
+                            "quantity":            _pqty,
+                            "actual_entry":        _ltp_now,
+                            "status":              "OPEN",
+                            "notes": (
+                                f"⚡ Scalp real — {_status} ORB @ ₹{_ltp_now:.2f} "
+                                f"(confs {_confs}/3, score {_sc_conf}/10) | Kite {_sc_oid}"
+                            ),
+                            "is_paper_trade": False,
+                            "intraday_confidence": _sc_conf,
+                        })
+                        st.session_state["scalp_triggered"][_sc_trig_key] = _scid_r
+                        st.session_state["scalp_open"][_scid_r] = {
+                            "sym": _sym, "stop": _stop_px, "t1": _t1_px, "t2": 0,
+                            "signal_type": _sc_sig_type, "entry": _ltp_now,
+                            "cap": config.SCALP_CAP_PER_TRADE, "setup_type": "SCALP",
+                            "partial_booked": False,
+                        }
+                        _scalp_confirm_map.pop(_sc_dir_key, None)
+                        _sc_slots_left -= 1
+                        st.toast(
+                            f"⚡ Scalp REAL {_status}: {_sym} @ ₹{_ltp_now:.2f} × {_pqty} | Kite {_sc_oid}",
+                            icon="⚡",
+                        )
+                    except Exception as _sc_re:
+                        st.toast(f"⚠ Scalp real order failed for {_sym}: {_sc_re}", icon="⚠️")
+
+        # ── Build display row ─────────────────────────────────────────────────
+        _auto_badge = ""
+        if _sc_trig_key in st.session_state.get("scalp_triggered", {}):
+            _auto_badge = " ✅ TRADED"
+
         _scalp_results.append({
-            "Status":     _status_label,
+            "Status":     _status_label + _auto_badge,
             "Symbol":     _sym,
             "LTP":        f"₹{_ltp_now:,.2f}",
             "Direction":  _dir or "—",
             "Confirms":   f"{_confs}/3" if _confs else "—",
-            "Conf Score": f"{_scalp_sig.get('scalp_confidence') or 0}/10",
+            "Conf":       f"{_sc_conf}/10",
             "ORB High":   f"₹{_orb_data['orb_high']:,.2f}",
             "ORB Low":    f"₹{_orb_data['orb_low']:,.2f}",
             "VWAP":       f"₹{_vwap_price:,.2f}" if _vwap_price else "—",
             "5m RSI":     f"{_rsi_5m:.0f}" if _rsi_5m else "—",
-            "Entry":      f"₹{_scalp_sig['scalp_entry']:,.2f}" if _scalp_sig.get("scalp_entry") else "—",
-            "Stop":       f"₹{_scalp_sig['scalp_stop']:,.2f}"  if _scalp_sig.get("scalp_stop")  else "—",
-            "Target":     f"₹{_scalp_sig['scalp_t1']:,.2f}"    if _scalp_sig.get("scalp_t1")    else "—",
-            "R/R":        f"{_scalp_sig['scalp_rr']:.1f}×"     if _scalp_sig.get("scalp_rr")    else "—",
+            "Entry":      f"₹{_entry_px:,.2f}" if _entry_px else "—",
+            "Stop":       f"₹{_stop_px:,.2f}"  if _stop_px  else "—",
+            "Target":     f"₹{_t1_px:,.2f}"    if _t1_px    else "—",
+            "R/R":        f"{_scalp_sig.get('scalp_rr', 0):.1f}×" if _scalp_sig.get("scalp_rr") else "—",
         })
 
     if not _scalp_results:
