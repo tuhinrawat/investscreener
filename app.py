@@ -3639,81 +3639,65 @@ def _live_signals_header():
     )
     if _should_run_exits:
 
-        # ── Pass 1: T1 / T2 / stop-loss exits ───────────────────────────────
-        # Stop is triggered at planned stop price OR if LTP has blown >0.2% past
-        # it (fast-exit: don't wait for the next 2-second tick, exit at actual LTP).
-        # T1 hit → partial booking: close 60% at T1, move stop to break-even, trail to T2.
-        _STOP_OVERSHOOT_PCT = 0.002   # 0.2% past planned stop = fast-exit at LTP
-        _exits   = []   # (pid, sym, outcome, exit_price) — full close
-        _partials = []  # (pid, sym, exit_price) — partial T1 exit, trail to T2
+        # ── Pass 1: trailing-profit + stop-loss exits for paper trades ──────────
+        # Same logic as real trades:
+        #   • Stop-loss   : close immediately if LTP hits rec_stop
+        #   • Trailing    : activates at 2% profit, closes when profit drops
+        #                   0.03% from peak — lets winners run beyond fixed T1
+        _STOP_OVERSHOOT_PCT  = 0.002   # 0.2% past stop = fast-exit at LTP
+        _P_TRAIL_ACTIVATE    = 2.0     # % profit to activate trailing
+        _P_TRAIL_DROP        = 0.03    # % drop from peak to trigger close
+        _paper_trail_peaks   = st.session_state.setdefault("_paper_trail_peak", {})
+
+        _exits   = []   # (pid, sym, outcome, exit_price, note)
         for _pid, _pt in list(st.session_state["paper_open"].items()):
             _pt_ltp = _live_ltp_now.get(_pt.get("sym", ""), 0)
             if not _pt_ltp:
                 continue
-            _sig    = _pt.get("signal_type", "")
-            _t1     = _pt.get("t1", 0)
-            _t2     = _pt.get("t2", 0)
-            _stop   = _pt.get("stop", 0)
-            _entry  = _pt.get("entry", 0)
-            _partial_done = _pt.get("partial_booked", False)
+            _sig   = _pt.get("signal_type", "")
+            _stop  = _pt.get("stop", 0)
+            _entry = _pt.get("entry", 0)
+            if not _entry:
+                continue
 
-            if _sig == "BUY_ABOVE":
-                if _t1 and _pt_ltp >= _t1:
-                    if _t2 and not _partial_done:
-                        # Partial booking: 60% exit at T1, trail 40% to T2
-                        _partials.append((_pid, _pt["sym"], _t1))
-                    else:
-                        # No T2, or already partial-booked and now hit T2 → full exit
-                        _exits.append((_pid, _pt["sym"], "TARGET_HIT", _t1 if not _partial_done else _pt_ltp))
-                elif _stop and (
-                    _pt_ltp <= _stop                             # hit stop exactly or below
-                    or _pt_ltp < _stop * (1 - _STOP_OVERSHOOT_PCT)  # blew through by 0.2%
+            _pt_dir     = -1 if _sig in ("SELL_BELOW", "SELL_ORB") else 1
+            _pt_pnl_pct = _pt_dir * (_pt_ltp - _entry) / _entry * 100
+
+            # Update trailing peak
+            _prev_pk = _paper_trail_peaks.get(_pid, 0.0)
+            if _pt_pnl_pct > _prev_pk:
+                _paper_trail_peaks[_pid] = _pt_pnl_pct
+            _cur_pk = _paper_trail_peaks.get(_pid, 0.0)
+
+            # ── Stop-loss check ───────────────────────────────────────────────
+            _stop_hit = False
+            if _stop:
+                if _sig == "BUY_ABOVE" and (
+                    _pt_ltp <= _stop or _pt_ltp < _stop * (1 - _STOP_OVERSHOOT_PCT)
                 ):
-                    _exits.append((_pid, _pt["sym"], "STOPPED_OUT", _pt_ltp))
-            elif _sig == "SELL_BELOW":
-                if _t1 and _pt_ltp <= _t1:
-                    if _t2 and not _partial_done:
-                        _partials.append((_pid, _pt["sym"], _t1))
-                    else:
-                        _exits.append((_pid, _pt["sym"], "TARGET_HIT", _t1 if not _partial_done else _pt_ltp))
-                elif _stop and (
-                    _pt_ltp >= _stop                             # hit stop exactly or above
-                    or _pt_ltp > _stop * (1 + _STOP_OVERSHOOT_PCT)  # blew through by 0.2%
+                    _stop_hit = True
+                elif _sig == "SELL_BELOW" and (
+                    _pt_ltp >= _stop or _pt_ltp > _stop * (1 + _STOP_OVERSHOOT_PCT)
                 ):
-                    _exits.append((_pid, _pt["sym"], "STOPPED_OUT", _pt_ltp))
+                    _stop_hit = True
+            if _stop_hit:
+                _exits.append((_pid, _pt["sym"], "STOPPED_OUT", _pt_ltp,
+                               f"🛑 Paper stop-loss @ ₹{_pt_ltp:.2f}"))
+                continue
 
-        # Apply partial bookings — 60% at T1, trail 40% to T2 (trade stays OPEN in DB)
-        for _pid, _sym_e, _t1_px in _partials:
-            try:
-                _pt_ref = st.session_state["paper_open"].get(_pid, {})
-                _orig_entry = _pt_ref.get("entry", _t1_px)
-                _t2_val     = _pt_ref.get("t2", 0)
-                _note_partial = (
-                    f"📊 Partial T1: 60% booked at ₹{_t1_px:.2f}. "
-                    f"Stop → break-even ₹{_orig_entry:.2f}. "
-                    f"Trailing 40% to T2 ₹{_t2_val:.2f}."
-                )
-                # Note on DB but keep trade OPEN — final close happens at T2 or stop
-                db.note_partial_t1(_pid, _t1_px, _note_partial)
-                # Update in-memory monitoring: new stop = break-even, new target = T2
-                st.session_state["paper_open"][_pid]["stop"]           = _orig_entry
-                st.session_state["paper_open"][_pid]["t1"]             = _t2_val
-                st.session_state["paper_open"][_pid]["t2"]             = 0
-                st.session_state["paper_open"][_pid]["partial_booked"] = True
-                st.toast(f"📊 Partial T1: {_sym_e} — 60% @ ₹{_t1_px:.2f}, trailing 40% → T2 ₹{_t2_val:.2f}", icon="📊")
-            except Exception:
-                pass
+            # ── Trailing profit check ─────────────────────────────────────────
+            if _cur_pk >= _P_TRAIL_ACTIVATE and (_cur_pk - _pt_pnl_pct) >= _P_TRAIL_DROP:
+                _exits.append((_pid, _pt["sym"], "TARGET_HIT", _pt_ltp,
+                               f"🎯 Paper trailing exit: peak {_cur_pk:.2f}% → {_pt_pnl_pct:.2f}% @ ₹{_pt_ltp:.2f}"))
 
-        # Apply full exits
-        for _pid, _sym_e, _outcome, _ep in _exits:
+        # Apply exits
+        for _pid, _sym_e, _outcome, _ep, _note in _exits:
             try:
-                _was_partial = st.session_state.get("paper_open", {}).get(_pid, {}).get("partial_booked", False)
-                _label = "T2 hit" if _was_partial else ("closed at T1" if _outcome == "TARGET_HIT" else "stopped")
-                _note = f"📄 Paper trade auto-{_label}"
                 db.close_trade(_pid, _ep, _outcome, _note)
                 st.session_state["paper_open"].pop(_pid, None)
-                _icon = "✅" if _outcome == "TARGET_HIT" else "🛑"
-                st.toast(f"{_icon} Paper {_sym_e}: {_outcome} at ₹{_ep:.2f}", icon=_icon)
+                _paper_trail_peaks.pop(_pid, None)
+                _icon = "🎯" if _outcome == "TARGET_HIT" else "🛑"
+                st.toast(f"{_icon} Paper {_sym_e}: {_outcome} @ ₹{_ep:.2f}", icon=_icon)
             except Exception:
                 pass
 
