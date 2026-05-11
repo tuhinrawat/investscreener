@@ -194,6 +194,7 @@ def fetch_historical_for_universe(
 
     success_count = 0
     fail_count = 0
+    first_error = ""
     all_candles = []
 
     iterator = enumerate(universe_df.itertuples(index=False))
@@ -250,7 +251,9 @@ def fetch_historical_for_universe(
 
         except Exception as e:
             fail_count += 1
-            # Don't print every failure — too noisy. Log count at end.
+            # Capture the first error for diagnosis — surfaces auth/token issues
+            if fail_count == 1:
+                first_error = str(e)
             continue
 
     # Final flush
@@ -258,6 +261,13 @@ def fetch_historical_for_universe(
         db.upsert_ohlcv(pd.DataFrame(all_candles))
 
     print(f"✓ History pulled: {success_count} success, {fail_count} failed")
+    if success_count == 0 and fail_count > 0:
+        raise RuntimeError(
+            f"All {fail_count} historical data fetches failed. "
+            f"First error: {first_error}. "
+            "This is usually an expired Kite access token — "
+            "please re-authenticate Kite from the sidebar."
+        )
     return success_count
 
 
@@ -436,20 +446,39 @@ def full_rescan(progress_callback=None, client: "KiteClient | None" = None) -> d
         client, fetch_list, progress_callback=progress_callback
     )
 
+    # Verify OHLCV landed in DB before spending time on indicators
+    conn = db.get_conn()
+    cur  = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM daily_ohlcv")
+    ohlcv_rows = cur.fetchone()[0]
+    cur.close()
+    db.release_conn(conn)
+    print(f"  daily_ohlcv total rows after fetch: {ohlcv_rows:,}")
+    if ohlcv_rows == 0:
+        raise RuntimeError(
+            "Historical fetch completed but daily_ohlcv is empty — "
+            "no candle data was written. "
+            "Check that your Kite access token is valid and try again."
+        )
+
     # Step 5: Compute everything
     metrics_df = compute_metrics_for_universe(filtered)
 
     # Step 6: Persist
     if not metrics_df.empty:
         db.replace_metrics(metrics_df)
+    else:
+        print("⚠ compute_metrics_for_universe returned 0 rows — "
+              "check liquidity gate thresholds and OHLCV data quality")
 
     elapsed = time.time() - t0
     return {
-        "universe_size": len(universe),
+        "universe_size":   len(universe),
         "post_pre_filter": len(filtered),
+        "ohlcv_rows":      ohlcv_rows,
         "history_fetched": n_fetched,
         "metrics_computed": len(metrics_df),
-        "elapsed_sec": round(elapsed, 1),
+        "elapsed_sec":     round(elapsed, 1),
     }
 
 
