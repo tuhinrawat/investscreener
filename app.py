@@ -832,6 +832,7 @@ if st.sidebar.button("📡 Refresh Signals (~30s)", use_container_width=True,
                     f"{k.replace('intraday_', '').replace('_', ' ')}→{v}"
                     for k, v in _pre_tune.items()
                 )
+            st.session_state["_last_metrics_update_ts"] = datetime.now(_IST)
             st.sidebar.success(
                 f"✓ {_sig_result['signals_updated']} signals refreshed "
                 f"({_sig_result['errors']} errors) in {_sig_result['elapsed_sec']}s\n"
@@ -859,6 +860,7 @@ if st.sidebar.button("🔄 Full Rescan (~3-5 min)", use_container_width=True,
         )
         progress_bar.progress(1.0)
         status.caption("Done")
+        st.session_state["_last_metrics_update_ts"] = datetime.now(_IST)
         st.sidebar.success(
             f"✓ {result['metrics_computed']} stocks scored "
             f"in {result['elapsed_sec']}s"
@@ -1131,6 +1133,75 @@ if require_all_positive:
 tab_screener, tab_signals, tab_activity = st.tabs([
     "📋 Screener", "🎯 Trade Signals", "📒 Activity Log"
 ])
+
+@st.fragment(run_every=1)
+def _freshness_bar():
+    """Live data-freshness status strip shown below the main tabs."""
+    _now_fb  = datetime.now(_IST)
+    _ltp_ts  = st.session_state.get("_live_ltp_ts")
+    _sig_ts  = st.session_state.get("_last_metrics_update_ts")   # set by quick/full scan
+    _mkt_open = (
+        _now_fb.weekday() < 5
+        and _now_fb.replace(hour=9, minute=15, second=0, microsecond=0)
+            <= _now_fb <=
+            _now_fb.replace(hour=15, minute=30, second=0, microsecond=0)
+    )
+
+    # ── LTP freshness ──────────────────────────────────────────────────────
+    if _ltp_ts:
+        _age = (_now_fb - _ltp_ts).total_seconds()
+        if _age < 3:
+            _ltp_col, _ltp_icon, _ltp_label = "#22c55e", "●", f"Live · {_ltp_ts.strftime('%H:%M:%S')} IST"
+        elif _age < 30:
+            _ltp_col, _ltp_icon, _ltp_label = "#f59e0b", "●", f"Delayed {int(_age)}s · {_ltp_ts.strftime('%H:%M:%S')} IST"
+        else:
+            _ltp_col, _ltp_icon, _ltp_label = "#ef4444", "●", f"Stale {int(_age//60)}m · {_ltp_ts.strftime('%H:%M:%S')} IST"
+    elif _mkt_open:
+        _ltp_col, _ltp_icon, _ltp_label = "#f59e0b", "○", "Awaiting prices…"
+    else:
+        _ltp_col, _ltp_icon, _ltp_label = "#475569", "○", "Market closed"
+
+    # ── Signal freshness ───────────────────────────────────────────────────
+    if _sig_ts:
+        _sig_age = (_now_fb - _sig_ts).total_seconds()
+        _sig_mins = int(_sig_age // 60)
+        _sig_hrs  = int(_sig_age // 3600)
+        if _sig_age < 3600:
+            _sig_label = f"Signals updated {_sig_mins}m ago"
+        else:
+            _sig_label = f"Signals updated {_sig_hrs}h ago"
+        _sig_col = "#22c55e" if _sig_age < 3600 else "#f59e0b"
+    else:
+        _sig_label = "Run a scan to load signals"
+        _sig_col   = "#475569"
+
+    # ── Current time ───────────────────────────────────────────────────────
+    _clock = _now_fb.strftime("%H:%M:%S")
+    _day   = _now_fb.strftime("%a %d %b")
+
+    st.markdown(
+        f"""
+        <div style="
+            display:flex; align-items:center; gap:20px; flex-wrap:wrap;
+            background:#0a0f1a; border:1px solid #1e293b; border-radius:6px;
+            padding:5px 16px; margin-bottom:8px; font-size:0.78rem;
+        ">
+            <span style="color:{_ltp_col};font-weight:700;letter-spacing:0.03em">
+                {_ltp_icon} {_ltp_label}
+            </span>
+            <span style="color:#334155">|</span>
+            <span style="color:{_sig_col}">{_sig_label}</span>
+            <span style="color:#334155">|</span>
+            <span style="color:#475569">
+                🕐 <b style="color:#64748b">{_clock}</b>
+                &nbsp;<span style="color:#334155">{_day}</span>
+            </span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+_freshness_bar()
 
 # ─── helper used by both tabs ───────────────────────────────
 def _isna(v) -> bool:
