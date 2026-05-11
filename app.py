@@ -1338,7 +1338,6 @@ def _market_pulse_header():
         # ── Source A: Yahoo Finance v8/chart per symbol ───────────────────
         # Same endpoint as VIX/crude — no crumb/cookie auth needed.
         # interval=1m gives real-time regularMarketPrice in meta.
-        import time as _time_mod
         _v8_hdr = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                           "AppleWebKit/537.36 (KHTML, like Gecko) "
