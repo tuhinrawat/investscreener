@@ -7185,45 +7185,56 @@ def _ticker_banner():
         the banner.
     """
     # ── Choose price source ───────────────────────────────────────────────
-    if _kc_module.is_ticker_alive():
-        _prices = _kc_module.get_all_ticker_prices()
+    # WebSocket dict retains the last-received prices even after market closes
+    # (prices are only cleared on start_ticker() — i.e. next login).
+    # So we ALWAYS read the ticker dict first (not gated by is_ticker_alive),
+    # falling back to session-state REST cache only if the dict is truly empty
+    # (first login, no ticks ever received this session).
+    _ws_prices = _kc_module.get_all_ticker_prices()
+    if _ws_prices:
+        _prices = _ws_prices
     else:
         _prices = st.session_state.get("_live_ltp", {})
 
+    _mkt_open = _is_market_open()
+
     if not _prices:
-        # Kite may be connected but market is closed (no ticks outside 9:15–15:30).
-        # Show the appropriate message rather than always saying "connect Kite".
+        # No prices at all — ticker started but zero ticks received yet.
         _kc_chk  = st.session_state.get("kite_client")
         _kite_ok = _kc_chk is not None and getattr(_kc_chk, "authenticated", False)
-        if _kite_ok:
-            _banner_msg = "⏸&nbsp;Market closed — live ticker starts at 9:15 AM IST"
-            _banner_col = "#475569"
+        if _kite_ok and not _mkt_open:
+            _banner_msg = "⏸&nbsp;Market closed — last prices will appear here once market opens (9:15 AM IST)"
+        elif _kite_ok:
+            _banner_msg = "⏳&nbsp;Ticker initialising — prices will stream here shortly"
         else:
             _banner_msg = "⏳&nbsp;Connect Kite to see live prices"
-            _banner_col = "#475569"
         st.markdown(
             f"<div style='position:fixed;bottom:0;left:0;right:0;height:26px;"
             "background:#060d18;border-top:1px solid #1e3a5f;z-index:9999;"
             "display:flex;align-items:center;padding:0 12px'>"
-            f"<span style='color:{_banner_col};font-size:10px;font-family:monospace'>"
+            f"<span style='color:#475569;font-size:10px;font-family:monospace'>"
             f"{_banner_msg}</span></div>"
             "<style>section.main .block-container{padding-bottom:36px!important}</style>",
             unsafe_allow_html=True,
         )
         return
 
-    _prev    = st.session_state.get("_prev_ltp", {})
-    _mkt_open = _is_market_open()
+    _prev = st.session_state.get("_prev_ltp", {})
+    # _mkt_open already computed above (before the early-return block)
 
     def _fmt_item(sym: str, ltp: float, css_class: str = "tb-stk") -> str:
         prev = _prev.get(sym, ltp)
-        pct  = (ltp - prev) / prev * 100 if prev and prev != ltp else 0.0
-        col  = "#22c55e" if pct >= 0 else "#ef4444"
-        arrow = "▲" if pct >= 0 else "▼"
-        pct_str = f"{arrow}{abs(pct):.2f}%"
+        if prev and prev != ltp:
+            pct   = (ltp - prev) / prev * 100
+            col   = "#22c55e" if pct >= 0 else "#ef4444"
+            badge = f'&nbsp;<span style="color:{col}">{"▲" if pct >= 0 else "▼"}{abs(pct):.2f}%</span>'
+        else:
+            # Frozen price (market closed) — show no change badge, dim colour
+            col   = "#64748b" if not _mkt_open else "#94a3b8"
+            badge = ""
         return (
             f'<span class="{css_class}">'
-            f'{sym}&nbsp;<span style="color:{col}">{ltp:,.2f}&nbsp;{pct_str}</span>'
+            f'{sym}&nbsp;<span style="color:{col}">{ltp:,.2f}{badge}</span>'
             f'</span>'
         )
 
@@ -7278,20 +7289,31 @@ def _ticker_banner():
     # Scale scroll duration with number of items for readable speed
     _duration = max(45, len(items) * 2)
 
+    # Determine source badge: live WS, last-known WS (closed), REST
+    _ticker_live = _kc_module.is_ticker_alive()
+    _had_ws_data = bool(_ws_prices)   # WebSocket dict had prices (even if market closed)
+    if _ticker_live:
+        _ws_badge_txt   = "⚡&nbsp;LIVE"
+        _ws_badge_color = "#22c55e"
+    elif _had_ws_data:
+        _ws_badge_txt   = "📌&nbsp;LAST"    # frozen last-known prices
+        _ws_badge_color = "#f59e0b"
+    else:
+        _ws_badge_txt   = "⚠&nbsp;REST"
+        _ws_badge_color = "#64748b"
+
     _mkt_badge = ""
     if not _mkt_open:
         _mkt_badge = (
             '<div style="flex-shrink:0;padding:0 10px;border-right:1px solid #1e3a5f;'
-            'font-size:10px;color:#f59e0b;font-family:monospace;white-space:nowrap">'
-            '⏸&nbsp;CLOSED</div>'
+            'font-size:10px;color:#64748b;font-family:monospace;white-space:nowrap">'
+            '⏸&nbsp;CLOSED&nbsp;·&nbsp;last prices</div>'
         )
 
     _ws_badge = (
-        '<div style="flex-shrink:0;padding:0 8px;border-right:1px solid #1e3a5f;'
-        'font-size:10px;font-family:monospace;white-space:nowrap;color:'
-        + ('#22c55e' if _kc_module.is_ticker_alive() else '#64748b') + '">'
-        + ('⚡&nbsp;WS' if _kc_module.is_ticker_alive() else '⚠&nbsp;REST')
-        + '</div>'
+        f'<div style="flex-shrink:0;padding:0 8px;border-right:1px solid #1e3a5f;'
+        f'font-size:10px;font-family:monospace;white-space:nowrap;color:{_ws_badge_color}">'
+        f'{_ws_badge_txt}</div>'
     )
 
     st.markdown(f"""
