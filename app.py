@@ -1846,10 +1846,10 @@ def _market_pulse_header():
             _pred_arr = "▲" if _predicted_up else "▼"
             _sn_short = _sn[:8] if len(_sn) <= 8 else (_sn[:7] + "…")
             _ai_sect_parts.append(
-                f'<span style="white-space:nowrap;font-size:10px;display:inline-flex;align-items:center;gap:2px">'
+                f'<span style="white-space:nowrap;font-size:12px;display:inline-flex;align-items:center;gap:2px">'
                 f'<span style="color:{_pred_col}">{_pred_arr}</span>'
                 f'<span style="color:#94a3b8">{_sn_short}</span>'
-                + (f'<span style="color:#334155;font-size:8px">&nbsp;AI</span>' if not _act_str else "")
+                + (f'<span style="color:#334155;font-size:10px">&nbsp;AI</span>' if not _act_str else "")
                 + (f'&nbsp;→&nbsp;{_act_str}&nbsp;{_verdict}' if _act_str else "")
                 + '</span>'
             )
@@ -1861,7 +1861,7 @@ def _market_pulse_header():
             '<div style="background:#080e1c;border:1px solid #1a2744;border-radius:6px;'
             'padding:3px 10px;display:flex;align-items:center;gap:8px;margin-bottom:3px;'
             'overflow-x:auto;scrollbar-width:none">'
-            '<span style="font-size:9px;color:#334155;text-transform:uppercase;'
+            '<span style="font-size:10px;color:#334155;text-transform:uppercase;'
             'letter-spacing:0.09em;white-space:nowrap;flex-shrink:0">AI SECTOR BIAS vs LIVE</span>'
             '<span style="color:#1e293b;flex-shrink:0">│</span>'
             + _sep_dot.join(_ai_sect_parts)
@@ -1875,30 +1875,24 @@ def _market_pulse_header():
             _sc = "#22c55e" if _spct >= 0 else "#ef4444"
             _si = "▲" if _spct >= 0 else "▼"
             _sect_parts.append(
-                f'<span style="white-space:nowrap;font-size:10px">'
-                f'<span style="color:#64748b">{_sn}</span>&nbsp;'
+                f'<span style="white-space:nowrap;font-size:12px">'
+                f'<span style="color:#94a3b8">{_sn}</span>&nbsp;'
                 f'<span style="color:{_sc};font-family:\'SF Mono\',monospace;font-weight:600">'
                 f'{_si}{abs(_spct):.2f}%</span>'
                 f'</span>'
             )
-        _live_badge = ('<span style="font-size:8px;padding:1px 4px;border-radius:3px;'
+        _live_badge = ('<span style="font-size:10px;padding:1px 5px;border-radius:3px;'
                        'background:#22c55e22;color:#22c55e;font-weight:600;flex-shrink:0">LIVE</span>'
                        if _kite_ok else "")
-        # Wrap each sector chip in a flex:1 cell so they fill the row evenly
-        _sect_cells = "".join(
-            f'<span style="flex:1;text-align:center;white-space:nowrap;font-size:10px">'
-            + p.split('style="white-space:nowrap;font-size:10px">', 1)[-1]  # reuse inner HTML
-            for p in _sect_parts
-        )
         _sect_live_html = (
             '<div style="background:#080e1c;border:1px solid #1a2744;border-radius:6px;'
-            'padding:3px 10px;display:flex;align-items:center;gap:4px;margin-bottom:4px;'
+            'padding:4px 12px;display:flex;align-items:center;gap:6px;margin-bottom:4px;'
             'overflow-x:auto;scrollbar-width:none">'
-            '<span style="font-size:9px;color:#334155;text-transform:uppercase;'
+            '<span style="font-size:10px;color:#334155;text-transform:uppercase;'
             'letter-spacing:0.09em;white-space:nowrap;flex-shrink:0">SECTOR INDICES</span>'
             + _live_badge
-            + '<span style="color:#1e293b;flex-shrink:0;margin:0 4px">│</span>'
-            + '<div style="display:flex;flex:1;justify-content:space-between;align-items:center">'
+            + '<span style="color:#1e293b;flex-shrink:0;margin:0 6px">│</span>'
+            + '<div style="display:flex;flex:1;justify-content:space-between;align-items:center;gap:8px">'
             + "".join(_sect_parts)
             + '</div></div>'
         )
@@ -8289,13 +8283,13 @@ def _ticker_banner():
     if not _mkt_open:
         _mkt_badge = (
             '<div style="flex-shrink:0;padding:0 10px;border-right:1px solid #1e3a5f;'
-            'font-size:10px;color:#64748b;font-family:monospace;white-space:nowrap">'
+            'font-size:12px;color:#64748b;font-family:monospace;white-space:nowrap">'
             '⏸&nbsp;CLOSED&nbsp;·&nbsp;last prices</div>'
         )
 
     _ws_badge = (
         f'<div style="flex-shrink:0;padding:0 8px;border-right:1px solid #1e3a5f;'
-        f'font-size:10px;font-family:monospace;white-space:nowrap;color:{_ws_badge_color}">'
+        f'font-size:12px;font-family:monospace;white-space:nowrap;color:{_ws_badge_color}">'
         f'{_ws_badge_txt}</div>'
     )
 
@@ -8308,7 +8302,7 @@ def _ticker_banner():
 ._tb_wrap {{
     position: fixed;
     bottom: 0; left: 0; right: 0;
-    height: 26px;
+    height: 34px;
     background: #060d18;
     border-top: 1px solid #1e3a5f;
     overflow: hidden;
@@ -8332,13 +8326,13 @@ def _ticker_banner():
     animation: _tb_scroll {_duration}s linear infinite;
     will-change: transform;
 }}
-._tb_wrap .tb-idx  {{ font-size:11px;padding:0 6px;color:#e2e8f0;font-weight:600;font-family:'SF Mono','Fira Code',monospace; }}
-._tb_wrap .tb-stk  {{ font-size:10px;padding:0 5px;color:#94a3b8;font-family:'SF Mono','Fira Code',monospace; }}
-._tb_wrap .tb-fx   {{ font-size:10px;padding:0 5px;color:#fbbf24;font-family:'SF Mono','Fira Code',monospace; }}
-._tb_wrap .tb-cx   {{ font-size:10px;padding:0 5px;color:#fb923c;font-family:'SF Mono','Fira Code',monospace; }}
-._tb_wrap .tb-pcr  {{ font-size:10px;padding:0 5px;color:#a78bfa;font-family:'SF Mono','Fira Code',monospace; }}
+._tb_wrap .tb-idx  {{ font-size:13px;padding:0 8px;color:#e2e8f0;font-weight:600;font-family:'SF Mono','Fira Code',monospace; }}
+._tb_wrap .tb-stk  {{ font-size:12px;padding:0 7px;color:#94a3b8;font-family:'SF Mono','Fira Code',monospace; }}
+._tb_wrap .tb-fx   {{ font-size:12px;padding:0 7px;color:#fbbf24;font-family:'SF Mono','Fira Code',monospace; }}
+._tb_wrap .tb-cx   {{ font-size:12px;padding:0 7px;color:#fb923c;font-family:'SF Mono','Fira Code',monospace; }}
+._tb_wrap .tb-pcr  {{ font-size:12px;padding:0 7px;color:#a78bfa;font-family:'SF Mono','Fira Code',monospace; }}
 /* Push page content up so the last widget isn't hidden behind the banner */
-section.main .block-container {{ padding-bottom: 36px !important; }}
+section.main .block-container {{ padding-bottom: 44px !important; }}
 </style>
 <div class="_tb_wrap">
     {_ws_badge}
