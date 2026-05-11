@@ -1386,13 +1386,17 @@ def _market_pulse_header():
     if _sectors:
         _ranked = sorted(_sectors.items(), key=lambda x: x[1]["bull"] - x[1]["bear"], reverse=True)
         _parts  = []
-        for _sn, _sc in _ranked[:4]:
+        for _sn, _sc in _ranked[:5]:
             _net = _sc["bull"] - _sc["bear"]
-            _sc_col = "#22c55e" if _net > 0 else ("#ef4444" if _net < 0 else "#94a3b8")
-            _icon   = "▲" if _net > 0 else ("▼" if _net < 0 else "—")
+            if _net == 0:
+                continue
+            _sc_col = "#22c55e" if _net > 0 else "#ef4444"
+            _icon   = "▲" if _net > 0 else "▼"
+            # Abbreviate long sector names cleanly (max 8 chars, prefer word boundary)
+            _sn_short = _sn[:8] if len(_sn) <= 8 else (_sn[:7] + "…")
             _parts.append(
-                f'<span style="color:{_sc_col};font-size:10px">'
-                f'{_icon}&nbsp;{_sn[:6]}</span>'
+                f'<span style="color:{_sc_col};font-size:10px;white-space:nowrap">'
+                f'{_icon}&nbsp;{_sn_short}</span>'
             )
         _sector_html = "&nbsp;&nbsp;".join(_parts)
 
@@ -2055,17 +2059,20 @@ def _show_market_intel_dialog(uid: str) -> None:
             "✅ Apply to Intraday Signals",
             type="primary",
             use_container_width=True,
-            help="Saves Market Intel stocks to DB and shows them in the Intraday Plan tab",
+            help="Activates Market Intel overlay on the Trade Signals → Intraday Plan tab",
         ):
-            db.save_market_intel(
-                user_id=uid,
-                raw_output=raw,
-                bias=bias,
-                confidence=confidence,
-                stocks=stocks,
-            )
+            # Data already saved to DB by the poller; just activate the session overlay
             st.session_state["_intel_applied"]      = True
             st.session_state["_intel_stocks_cache"] = stocks
+            # Re-save to DB in case user opened dialog from a previous session result
+            try:
+                db.save_market_intel(
+                    user_id=uid, raw_output=raw,
+                    bias=bias, confidence=confidence, stocks=stocks,
+                )
+                st.session_state.pop("_mph_intel_ts", None)
+            except Exception:
+                pass
             st.success(
                 f"✅ Applied {len(stocks)} Market Intel signals! "
                 "Switch to **🎯 Trade Signals → Intraday Plan** to see them.",
@@ -2096,6 +2103,24 @@ def _intel_poller():
             st.session_state["_intel_open_dialog"] = True   # triggers auto-show
             n = len(result.get("stocks", []))
             st.toast(f"🧠 Market Intel complete — {n} stocks identified!", icon="✅")
+            # Auto-save to DB immediately so the market pulse header picks up
+            # bias + sectors without requiring the user to click "Apply".
+            try:
+                _bias_d = result.get("bias", {})
+                db.save_market_intel(
+                    user_id    = st.session_state.get("kite_user_id", ""),
+                    raw_output = result.get("raw", ""),
+                    bias       = _bias_d.get("bias", "NEUTRAL"),
+                    confidence = _bias_d.get("confidence", "MEDIUM"),
+                    stocks     = result.get("stocks", []),
+                )
+                # Mark as applied so Activity log + Signals tab overlay activates
+                st.session_state["_intel_applied"]      = True
+                st.session_state["_intel_stocks_cache"] = result.get("stocks", [])
+                # Bust the market pulse header AI intel TTL so it reloads immediately
+                st.session_state.pop("_mph_intel_ts", None)
+            except Exception:
+                pass
         # Full-page rerun so the dialog auto-trigger fires regardless of active tab
         st.rerun(scope="app")
 
