@@ -742,6 +742,10 @@ def scalping_signal(
         return dict(_SCALP_NULL)
     if current_ltp is None or current_ltp <= 0:
         return dict(_SCALP_NULL)
+    # Quality gate: scalping on low-priced stocks is uneconomical — bid-ask spread
+    # alone erodes the edge. Require ≥ ₹300 LTP.
+    if current_ltp < _cfg.SCALP_MIN_PRICE:
+        return dict(_SCALP_NULL)
 
     min_conf = _cfg.SCALP_MIN_CONFIRMATIONS
 

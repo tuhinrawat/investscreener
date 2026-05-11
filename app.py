@@ -3584,7 +3584,7 @@ def _live_signals_header():
                 _g_ltp = _live_ltp_now.get(_g_pt.get("sym", ""), 0)
                 if not _g_ltp:
                     continue
-                _g_dir      = -1 if _g_pt.get("signal_type") == "SELL_BELOW" else 1
+                _g_dir      = -1 if _g_pt.get("signal_type") in ("SELL_BELOW", "SELL_ORB") else 1
                 _g_slot_cap = _g_pt.get("cap", config.PAPER_CAP_MODERATE)
                 _g_qty      = max(1, int(_g_slot_cap / (_g_pt.get("entry") or 1)))
                 _g_trade_mtm = _g_dir * (_g_ltp - _g_pt["entry"]) * _g_qty
@@ -3939,7 +3939,7 @@ def _intraday_paper_banner():
     _capital_deployed = 0
     for _ppid, _pp in _open_pt.items():
         _p_ltp    = _live_ltp_now.get(_pp["sym"], _pp.get("entry", 0))
-        _dir      = -1 if _pp["signal_type"] == "SELL_BELOW" else 1
+        _dir      = -1 if _pp.get("signal_type") in ("SELL_BELOW", "SELL_ORB") else 1
         _slot_cap = _pp.get("cap", config.PAPER_CAP_MODERATE)
         _p_qty    = max(1, int(_slot_cap / (_pp.get("entry") or 1)))
         _open_mtm         += _dir * (_p_ltp - _pp["entry"]) * _p_qty
@@ -4146,6 +4146,14 @@ def _intraday_scalp_live():
 
         _ltp_now = _live_ltp_now.get(_sym, 0) or float(_row.get("ltp") or 0)
         if not _ltp_now:
+            continue
+
+        # Quality gate: skip low-priced or illiquid stocks — bid-ask spread and
+        # slippage make scalping uneconomical below these thresholds.
+        if _ltp_now < config.SCALP_MIN_PRICE:
+            continue
+        _avg_turnover_cr = float(_row.get("avg_turnover_cr") or 0)
+        if _avg_turnover_cr > 0 and _avg_turnover_cr < config.SCALP_MIN_TURNOVER_CR:
             continue
 
         # ── Fetch / cache 5-min candles ───────────────────────────────────────
@@ -6199,7 +6207,8 @@ def _activity_log_live():
                 if _ltp_v and not _isna(_row.get("actual_entry")) and _row.get("actual_entry"):
                     _ep   = float(_row["actual_entry"])
                     _qp   = float(_row.get("quantity", 0) or 0) if not _isna(_row.get("quantity")) else 0
-                    _mult = -1 if _row.get("signal_type","") == "SELL_BELOW" else 1
+                    _sigt = _row.get("signal_type", "") or ""
+                    _mult = -1 if _sigt in ("SELL_BELOW", "SELL_ORB") else 1
                     df.at[_idx, "pnl_amount"] = (_ltp_v - _ep) * _qp * _mult
                     if _ep:
                         df.at[_idx, "pnl_pct"] = (_ltp_v - _ep) / _ep * 100 * _mult
@@ -6209,6 +6218,9 @@ def _activity_log_live():
             exit_p = 0.0 if _isna(row.get("actual_exit"))  else float(row.get("actual_exit")  or 0)
             qty    = 0   if _isna(row.get("quantity"))      else int(row.get("quantity") or 0)
             stype  = str(row.get("setup_type") or "INTRADAY")
+            # ORB signals are always intraday regardless of what setup_type stored
+            if str(row.get("signal_type", "")).upper() in ("BUY_ORB", "SELL_ORB"):
+                stype = "SCALP"
             if str(row.get("status","")) == "OPEN" and not exit_p:
                 exit_p = float(_live_ltp_now.get(str(row.get("tradingsymbol") or ""), 0) or 0)
             if entry and exit_p and qty:

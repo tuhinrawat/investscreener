@@ -952,16 +952,19 @@ def get_total_charges(user_id: str = "", is_paper: bool | None = None) -> float:
         elif is_paper is False:
             clauses.append("(is_paper_trade = FALSE OR is_paper_trade IS NULL)")
         cur.execute(
-            "SELECT actual_entry, actual_exit, quantity, setup_type FROM trade_log "
+            "SELECT actual_entry, actual_exit, quantity, setup_type, signal_type FROM trade_log "
             "WHERE " + " AND ".join(clauses),
             params,
         )
         rows  = cur.fetchall()
         total = 0.0
-        for entry, exit_p, qty, stype in rows:
+        for entry, exit_p, qty, stype, sig_type in rows:
             try:
+                # ORB signals are always intraday regardless of stored setup_type
+                effective_stype = "SCALP" if str(sig_type or "").upper() in ("BUY_ORB", "SELL_ORB") \
+                                  else str(stype or "INTRADAY")
                 total += compute_trade_charges(
-                    float(entry), float(exit_p), int(qty), str(stype or "INTRADAY")
+                    float(entry), float(exit_p), int(qty), effective_stype
                 ).get("total", 0.0)
             except Exception:
                 pass

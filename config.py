@@ -222,5 +222,12 @@ SCALP_CAP_PER_TRADE    = 75_000    # ₹75,000 per scalp position
 SCALP_MAX_POSITIONS    = 4         # max 4 concurrent scalp trades
 SCALP_HARD_EXIT_TIME   = (14, 45)  # (hour, minute) in IST — hard exit all scalps at 2:45 PM
 
+# Scalp quality gates — prevent taking low-priced / illiquid stocks as scalps.
+# Low-price stocks (< ₹300) have wide bid-ask spreads that consume the entire
+# scalp edge before charges. Illiquid stocks (< ₹50 Cr avg daily turnover)
+# show unfavourable slippage on rapid entries/exits.
+SCALP_MIN_PRICE        = 300.0    # ₹300 minimum LTP to qualify for a scalp entry
+SCALP_MIN_TURNOVER_CR  = 50.0     # ₹50 Cr minimum avg daily turnover (screener metric)
+
 # VWAP band — price must be within this % of VWAP to count as "near VWAP" alignment
 VWAP_BAND_PCT          = 0.5   # within 0.5% of VWAP counts as VWAP pull-to trade
