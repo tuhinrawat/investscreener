@@ -1245,6 +1245,41 @@ def _market_pulse_header():
         except Exception:
             pass
 
+    # ── Fetch live sectoral index % change (60-s TTL, Kite ohlc) ────────────
+    _SECTOR_SYMBOLS = {
+        "BANK":     "NSE:NIFTY BANK",
+        "IT":       "NSE:NIFTY IT",
+        "PHARMA":   "NSE:NIFTY PHARMA",
+        "AUTO":     "NSE:NIFTY AUTO",
+        "FMCG":     "NSE:NIFTY FMCG",
+        "METAL":    "NSE:NIFTY METAL",
+        "REALTY":   "NSE:NIFTY REALTY",
+        "ENERGY":   "NSE:NIFTY ENERGY",
+        "INFRA":    "NSE:NIFTY INFRA",
+        "MEDIA":    "NSE:NIFTY MEDIA",
+        "PSUBANK":  "NSE:NIFTY PSU BANK",
+        "FINSERV":  "NSE:NIFTY FINANCIAL SERVICES",
+        "MID100":   "NSE:NIFTY MIDCAP 100",
+        "SML100":   "NSE:NIFTY SMALLCAP 100",
+    }
+    if (_force or (_now_ts - st.session_state.get("_sect_ts", 0) > 60)) and _kite_ok:
+        try:
+            _s_ohlc = _kc_mph.kite.ohlc(list(_SECTOR_SYMBOLS.values()))
+            _sect_perf: list = []
+            for _sname, _ssym in _SECTOR_SYMBOLS.items():
+                _sd = (_s_ohlc.get(_ssym) or {})
+                _sltp  = _sd.get("last_price")
+                _sclose = (_sd.get("ohlc") or {}).get("close")
+                if _sltp and _sclose and _sclose > 0:
+                    _spct = (_sltp - _sclose) / _sclose * 100
+                    _sect_perf.append((_sname, round(_spct, 2), round(_sltp, 1)))
+            # Sort by absolute move (biggest movers first)
+            _sect_perf.sort(key=lambda x: abs(x[1]), reverse=True)
+            st.session_state["_sect_perf"] = _sect_perf
+            st.session_state["_sect_ts"]   = _now_ts
+        except Exception:
+            pass
+
     # ── Fetch 1-year sparkline data (24-hour TTL, fire once per session day) ──
     _SPARK_TTL = 86400
     if _force or (_now_ts - st.session_state.get("_spark_ts", 0) > _SPARK_TTL):
@@ -1300,10 +1335,10 @@ def _market_pulse_header():
         except Exception:
             pass
 
-    # If force-refresh, also bust FX/commodity + sparkline cache
+    # If force-refresh, also bust FX/commodity + sparkline + sector cache
     if _force:
         for _k in ("_usdinr_ltp", "_crude_usd", "_crude_ltp", "_brent_usd", "_natgas_usd", "_nifty_pcr",
-                   "_spark_data", "_spark_ts"):
+                   "_spark_data", "_spark_ts", "_sect_perf", "_sect_ts"):
             st.session_state.pop(_k, None)
 
     # ── Read all values from session state ───────────────────────────────
@@ -1513,14 +1548,14 @@ def _market_pulse_header():
         )
     )
 
-    # ── Sector leaders — slim single-line row below metrics ───────────────
+    # ── Sector leaders (AI Intel stance) — slim row ───────────────────────
     if _sector_html:
         _sector_row_html = (
             '<div style="background:#080e1c;border:1px solid #1a2744;border-radius:6px;'
-            'padding:3px 10px;display:flex;align-items:center;gap:10px;margin-bottom:4px;'
+            'padding:3px 10px;display:flex;align-items:center;gap:10px;margin-bottom:3px;'
             'overflow-x:auto;scrollbar-width:none">'
             '<span style="font-size:9px;color:#334155;text-transform:uppercase;'
-            'letter-spacing:0.09em;white-space:nowrap;flex-shrink:0">SECTOR LEADERS</span>'
+            'letter-spacing:0.09em;white-space:nowrap;flex-shrink:0">AI SECTOR BIAS</span>'
             '<span style="color:#1e293b;flex-shrink:0">│</span>'
             + _sector_html
             + '</div>'
@@ -1528,10 +1563,43 @@ def _market_pulse_header():
     else:
         _sector_row_html = ""
 
+    # ── Live sectoral index performance (Kite real-time) ─────────────────
+    _sect_perf_data: list = st.session_state.get("_sect_perf", [])
+    if _sect_perf_data:
+        _sect_parts = []
+        for _sn, _spct, _sltp in _sect_perf_data:
+            _sc = "#22c55e" if _spct >= 0 else "#ef4444"
+            _si = "▲" if _spct >= 0 else "▼"
+            _sect_parts.append(
+                f'<span style="white-space:nowrap;font-size:10px">'
+                f'<span style="color:#64748b">{_sn}</span>&nbsp;'
+                f'<span style="color:{_sc};font-family:\'SF Mono\',monospace;font-weight:600">'
+                f'{_si}{abs(_spct):.2f}%</span>'
+                f'</span>'
+            )
+        _sep_dot = '<span style="color:#1e3a5f;margin:0 2px">·</span>'
+        _live_badge = ('<span style="font-size:8px;padding:1px 4px;border-radius:3px;'
+                       'background:#22c55e22;color:#22c55e;font-weight:600;flex-shrink:0">LIVE</span>'
+                       if _kite_ok else "")
+        _sect_live_html = (
+            '<div style="background:#080e1c;border:1px solid #1a2744;border-radius:6px;'
+            'padding:3px 10px;display:flex;align-items:center;gap:8px;margin-bottom:4px;'
+            'overflow-x:auto;scrollbar-width:none">'
+            '<span style="font-size:9px;color:#334155;text-transform:uppercase;'
+            'letter-spacing:0.09em;white-space:nowrap;flex-shrink:0">SECTOR INDICES</span>'
+            + _live_badge
+            + '<span style="color:#1e293b;flex-shrink:0">│</span>'
+            + _sep_dot.join(_sect_parts)
+            + '</div>'
+        )
+    else:
+        _sect_live_html = ""
+
     _row_html = (
         '<div style="background:#080e1c;border:1px solid #1a2744;border-radius:8px;padding:6px 4px;display:flex;align-items:stretch;gap:0;overflow-x:auto;margin-bottom:4px;scrollbar-width:none">'
         + _cards_g1 + _divider() + _cards_g2 + _divider() + _cards_g3
         + '</div>'
+        + _sect_live_html
         + _sector_row_html
         + '<style>div[data-testid="stMarkdownContainer"] div[style*="080e1c"]::-webkit-scrollbar{display:none}</style>'
     )
