@@ -13,7 +13,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import charts as _charts
-from datetime import datetime, timezone, timedelta, date as date_type
+from datetime import datetime, timezone, timedelta, date as date_type, time
 
 import os as _os
 
@@ -195,10 +195,10 @@ def _load_kite_from_user(user: dict) -> None:
         st.session_state["kite_authenticated"] = True
         try:
             _kc_boot = KiteClient(
-                api_key    = user["kite_api_key"],
-                api_secret = user["kite_api_secret"],
+                api_key      = user["kite_api_key"],
+                api_secret   = user["kite_api_secret"],
+                access_token = token,
             )
-            _kc_boot.set_access_token(token)
             st.session_state["kite_client"] = _kc_boot
         except Exception:
             pass
@@ -527,7 +527,8 @@ _cur_user_id: str = st.session_state.get("kite_user_id", "")
 # paper_triggered: {(date_str, sym): trade_id} — prevents re-triggering same signal
 # paper_open:      {trade_id: {sym, stop, t1, signal_type, entry, cap}} — exit monitoring; cap = capital allocated (tier-based)
 import datetime as _dt
-_today_str = _dt.date.today().isoformat()
+_IST_tz = _dt.timezone(_dt.timedelta(hours=5, minutes=30))
+_today_str = _dt.datetime.now(_IST_tz).date().isoformat()
 
 if "paper_triggered" not in st.session_state:
     st.session_state["paper_triggered"] = {}
@@ -556,6 +557,7 @@ if "scalp_triggered" not in st.session_state:
     st.session_state["scalp_triggered"] = {}
 if "scalp_open" not in st.session_state:
     st.session_state["scalp_open"] = {}
+
 _SCALP_ENTRY_CONFIRM_SECS = 10  # scalps need faster execution: 10 s (vs 30 s intraday)
 
 # ── Market Intel state ────────────────────────────────────────────────────────
@@ -624,23 +626,34 @@ if st.session_state.get("_paper_sync_date") != _today_str:
             _k = (_today_str, _pt["tradingsymbol"])
             # Always mark symbol as triggered (blocks re-entry for any status)
             st.session_state["paper_triggered"][_k] = _pt["id"]
-            # Only add OPEN trades to the exit-monitoring dict
-            if _pt["status"] == "OPEN":
-                _sig_t = _pt.get("signal_type", "")
+            # Only add OPEN paper trades to the exit-monitoring dict
+            if _pt["status"] == "OPEN" and _pt.get("is_paper_trade", True):
+                _sig_t = _pt.get("signal_type", "BUY_ABOVE")
                 _setup  = _pt.get("setup_type", "INTRADAY")
+                _conf_v = int(_pt.get("intraday_confidence") or 0)
+                # Restore correct capital tier so MTM uses the right position size
+                if _setup == "SCALP":
+                    _cap_v = config.SCALP_CAP_PER_TRADE
+                elif _conf_v >= config.CONFIDENCE_STRONG_MIN:
+                    _cap_v = config.PAPER_CAP_STRONG
+                elif _conf_v >= config.CONFIDENCE_MODERATE_MIN:
+                    _cap_v = config.PAPER_CAP_MODERATE
+                else:
+                    _cap_v = config.PAPER_CAP_MARGINAL
                 _mon_dict = (
                     st.session_state["scalp_open"]
                     if _setup == "SCALP"
                     else st.session_state["paper_open"]
                 )
                 _mon_dict[_pt["id"]] = {
-                    "sym":         _pt["tradingsymbol"],
-                    "stop":        float(_pt["rec_stop"] or 0),
-                    "t1":          float(_pt["rec_t1"] or 0),
-                    "t2":          float(_pt.get("rec_t2") or 0),
-                    "signal_type": _sig_t,
-                    "entry":       float(_pt["actual_entry"] or 0),
-                    "setup_type":  _setup,
+                    "sym":            _pt["tradingsymbol"],
+                    "stop":           float(_pt["rec_stop"] or 0),
+                    "t1":             float(_pt["rec_t1"] or 0),
+                    "t2":             float(_pt.get("rec_t2") or 0),
+                    "signal_type":    _sig_t,
+                    "entry":          float(_pt["actual_entry"] or 0),
+                    "cap":            _cap_v,
+                    "setup_type":     _setup,
                     "partial_booked": False,
                 }
                 # Also mark scalp as triggered so it doesn't re-enter
@@ -3485,8 +3498,23 @@ def _live_signals_header():
     # ── Global paper trade exit monitor ──────────────────────────────────────
     # Runs here (in the header fragment) so exits are detected regardless of
     # which tab the user is viewing — not just when the Intraday Plan tab is open.
-    if _market_open and st.session_state.get("paper_open"):
-        _live_ltp_now = st.session_state.get("_live_ltp", {})
+    #
+    # Gate: run during market hours (live stop/target exits) OR any time after
+    # the hard-exit thresholds (2:45 PM for scalps, 3:10 PM for intraday) when
+    # there are still open positions — covers the case where close_trade failed
+    # during market hours and needs a retry after 3:30 PM market close.
+    _live_ltp_now      = st.session_state.get("_live_ltp", {})
+    _now_exit          = datetime.now(_IST)
+    _past_245_chk      = (_now_exit.hour > 14 or (_now_exit.hour == 14 and _now_exit.minute >= 45))
+    _past_310_chk      = (_now_exit.hour > 15 or (_now_exit.hour == 15 and _now_exit.minute >= 10))
+    _has_scalp_open    = bool(st.session_state.get("scalp_open"))
+    _has_intraday_open = bool(st.session_state.get("paper_open"))
+    _should_run_exits  = (
+        (_market_open and (_has_intraday_open or _has_scalp_open))
+        or (_past_245_chk and _has_scalp_open)
+        or (_past_310_chk and _has_intraday_open)
+    )
+    if _should_run_exits:
 
         # ── Pass 1: T1 / T2 / stop-loss exits ───────────────────────────────
         # Stop is triggered at planned stop price OR if LTP has blown >0.2% past
@@ -3514,9 +3542,10 @@ def _live_signals_header():
                     else:
                         # No T2, or already partial-booked and now hit T2 → full exit
                         _exits.append((_pid, _pt["sym"], "TARGET_HIT", _t1 if not _partial_done else _pt_ltp))
-                elif _stop and _pt_ltp <= _stop:
-                    _exits.append((_pid, _pt["sym"], "STOPPED_OUT", _pt_ltp))
-                elif _stop and _entry and _pt_ltp < _stop * (1 - _STOP_OVERSHOOT_PCT):
+                elif _stop and (
+                    _pt_ltp <= _stop                             # hit stop exactly or below
+                    or _pt_ltp < _stop * (1 - _STOP_OVERSHOOT_PCT)  # blew through by 0.2%
+                ):
                     _exits.append((_pid, _pt["sym"], "STOPPED_OUT", _pt_ltp))
             elif _sig == "SELL_BELOW":
                 if _t1 and _pt_ltp <= _t1:
@@ -3524,9 +3553,10 @@ def _live_signals_header():
                         _partials.append((_pid, _pt["sym"], _t1))
                     else:
                         _exits.append((_pid, _pt["sym"], "TARGET_HIT", _t1 if not _partial_done else _pt_ltp))
-                elif _stop and _pt_ltp >= _stop:
-                    _exits.append((_pid, _pt["sym"], "STOPPED_OUT", _pt_ltp))
-                elif _stop and _pt_ltp > _stop * (1 + _STOP_OVERSHOOT_PCT):
+                elif _stop and (
+                    _pt_ltp >= _stop                             # hit stop exactly or above
+                    or _pt_ltp > _stop * (1 + _STOP_OVERSHOOT_PCT)  # blew through by 0.2%
+                ):
                     _exits.append((_pid, _pt["sym"], "STOPPED_OUT", _pt_ltp))
 
         # Apply partial bookings — 60% at T1, trail 40% to T2 (trade stays OPEN in DB)
@@ -3629,16 +3659,18 @@ def _live_signals_header():
             if _sc_sig == "BUY_ORB":
                 if _sc_t1 and _sc_ltp >= _sc_t1:
                     _scalp_exits.append((_scid, _sct["sym"], "TARGET_HIT", _sc_t1))
-                elif _sc_stop and _sc_ltp <= _sc_stop:
-                    _scalp_exits.append((_scid, _sct["sym"], "STOPPED_OUT", _sc_ltp))
-                elif _sc_stop and _sc_ltp < _sc_stop * (1 - _STOP_OVERSHOOT_PCT):
+                elif _sc_stop and (
+                    _sc_ltp <= _sc_stop
+                    or _sc_ltp < _sc_stop * (1 - _STOP_OVERSHOOT_PCT)
+                ):
                     _scalp_exits.append((_scid, _sct["sym"], "STOPPED_OUT", _sc_ltp))
             elif _sc_sig == "SELL_ORB":
                 if _sc_t1 and _sc_ltp <= _sc_t1:
                     _scalp_exits.append((_scid, _sct["sym"], "TARGET_HIT", _sc_t1))
-                elif _sc_stop and _sc_ltp >= _sc_stop:
-                    _scalp_exits.append((_scid, _sct["sym"], "STOPPED_OUT", _sc_ltp))
-                elif _sc_stop and _sc_ltp > _sc_stop * (1 + _STOP_OVERSHOOT_PCT):
+                elif _sc_stop and (
+                    _sc_ltp >= _sc_stop
+                    or _sc_ltp > _sc_stop * (1 + _STOP_OVERSHOOT_PCT)
+                ):
                     _scalp_exits.append((_scid, _sct["sym"], "STOPPED_OUT", _sc_ltp))
         for _scid, _sym_sc, _out_sc, _ep_sc in _scalp_exits:
             try:
@@ -3652,13 +3684,15 @@ def _live_signals_header():
                 pass
 
         # ── Pass 2c: Scalp hard exit at 2:45 PM ──────────────────────────────
-        _now_sc_exit = datetime.now(_IST)
-        _past_245 = (_now_sc_exit.hour > 14 or
-                     (_now_sc_exit.hour == 14 and _now_sc_exit.minute >= 45))
-        _scalp_exit_key = f"_scalp_hard_exit_{_dt.date.today()}"
-        if _past_245 and st.session_state.get("scalp_open") and not st.session_state.get(_scalp_exit_key):
+        # No once-per-day flag: scalp_open being non-empty is the retry gate.
+        # This allows re-attempting close if close_trade failed on the first try.
+        if _past_245_chk and st.session_state.get("scalp_open"):
             for _schid, _scht in list(st.session_state["scalp_open"].items()):
-                _sch_ltp = _live_ltp_now.get(_scht.get("sym", ""), 0) or _scht.get("entry", 0)
+                # Prefer live LTP; if stale/missing, use last known stop as a conservative exit
+                # rather than entry (which gives ₹0 P&L and is misleading).
+                _sch_ltp = (_live_ltp_now.get(_scht.get("sym", ""), 0)
+                            or _scht.get("stop", 0)
+                            or _scht.get("entry", 0))
                 try:
                     db.close_trade(
                         _schid, _sch_ltp, "CLOSED",
@@ -3668,17 +3702,16 @@ def _live_signals_header():
                     st.toast(f"⏰ Scalp exit: {_scht.get('sym', '')} @ ₹{_sch_ltp:.2f}", icon="⏰")
                 except Exception:
                     pass
-            st.session_state[_scalp_exit_key] = True
 
         # ── Pass 3: Hard exit at 3:10 PM — close ALL remaining paper positions ─
         # Kite auto-squares MIS at 3:20 PM; we enforce 3:10 PM ourselves.
-        # The flag is day-scoped so it only fires once per calendar day.
-        _now_p3  = datetime.now(_IST)
-        _past_310 = _now_p3.hour > 15 or (_now_p3.hour == 15 and _now_p3.minute >= 10)
-        _hard_exit_key = f"_paper_hard_exit_{_dt.date.today()}"
-        if _past_310 and st.session_state.get("paper_open") and not st.session_state.get(_hard_exit_key):
+        # No once-per-day flag: paper_open being non-empty is the retry gate.
+        if _past_310_chk and st.session_state.get("paper_open"):
             for _hpid, _hpt in list(st.session_state["paper_open"].items()):
-                _h_ltp = _live_ltp_now.get(_hpt.get("sym", ""), 0) or _hpt.get("entry", 0)
+                # Prefer live LTP; if stale/missing, use stop as conservative exit
+                _h_ltp = (_live_ltp_now.get(_hpt.get("sym", ""), 0)
+                          or _hpt.get("stop", 0)
+                          or _hpt.get("entry", 0))
                 try:
                     db.close_trade(
                         _hpid, _h_ltp, "CLOSED",
@@ -3691,14 +3724,13 @@ def _live_signals_header():
                     )
                 except Exception:
                     pass
-            st.session_state[_hard_exit_key] = True
 
     # ── Pass 4 (real trades): Kite position sync at 3:20 PM ──────────────────
     # After 3:20 PM, Kite has finished auto-squaring MIS positions.
     # Fetch day positions and update any DB open real trades that were squared.
     _now_p4   = datetime.now(_IST)
     _past_320 = _now_p4.hour > 15 or (_now_p4.hour == 15 and _now_p4.minute >= 20)
-    _kite_sync_key = f"_real_kite_sync_{_dt.date.today()}"
+    _kite_sync_key = f"_real_kite_sync_{_today_str}"
     _kc_sync  = st.session_state.get("kite_client")
     if (
         _past_320
@@ -3937,7 +3969,8 @@ def _intraday_paper_banner():
     # ── Live MTM on open positions ────────────────────────────────────────────
     _open_pt       = st.session_state.get("paper_open", {})
     _n_open        = len(_open_pt)
-    _n_today       = len(st.session_state.get("paper_triggered", {}))
+    # Count only successfully logged trades (exclude -1 sentinel from failed attempts)
+    _n_today       = sum(1 for v in st.session_state.get("paper_triggered", {}).values() if v and v > 0)
     _live_ltp_now  = st.session_state.get("_live_ltp", {})
     _open_mtm      = 0.0
     _capital_deployed = 0
@@ -3966,9 +3999,12 @@ def _intraday_paper_banner():
     # Cutoff = hwm − TRAIL (but only active once hwm ≥ LOW)
     _cutoff_pct: float | None = (_hwm - _TRAIL) if _hwm >= _LOW else None
 
-    # New entries blocked when REALIZED return drops to cutoff (or hits ceiling)
+    # Block new entries when EITHER realised OR total (realised + MTM) return
+    # drops to the cutoff, or when the hard ceiling is reached.
+    # Using total return prevents new entries while open losses are being force-closed.
     _blocked = (
-        (_cutoff_pct is not None and _ret_pct <= _cutoff_pct)
+        (_cutoff_pct is not None and
+         ((_ret_pct <= _cutoff_pct) or (_total_ret <= _cutoff_pct)))
         or _ret_pct >= _HIGH
     )
     # Persist so auto-trigger code can read it without re-computing
@@ -4261,7 +4297,7 @@ def _intraday_scalp_live():
                     and _sc_trig_key not in st.session_state.get("scalp_triggered", {})):
                 try:
                     _scid = db.log_trade({
-                        "trade_date":          _dt.date.today(),
+                        "trade_date":          datetime.now(_IST).date(),
                         "tradingsymbol":       _sym,
                         "instrument_token":    _tok,
                         "setup_type":          "SCALP",
@@ -4298,8 +4334,9 @@ def _intraday_scalp_live():
                         f"(confirmed {_SCALP_ENTRY_CONFIRM_SECS}s, {_confs}/3 confs)",
                         icon="⚡",
                     )
-                except Exception:
-                    pass
+                except Exception as _e:
+                    st.session_state["scalp_triggered"].setdefault(_sc_trig_key, -1)
+                    st.toast(f"⚠️ Scalp log failed ({_sym}): {_e}", icon="⚠️")
 
             # ── Real scalp ────────────────────────────────────────────────────
             elif (_trade_mode == "real"
@@ -4334,7 +4371,7 @@ def _intraday_scalp_live():
                             except Exception:
                                 pass
                         _scid_r = db.log_trade({
-                            "trade_date":          _dt.date.today(),
+                            "trade_date":          datetime.now(_IST).date(),
                             "tradingsymbol":       _sym,
                             "instrument_token":    _tok,
                             "setup_type":          "SCALP",
@@ -4575,9 +4612,13 @@ def _intraday_long_live():
             _conf_tier = "LOW"
 
         # ── Capital availability gate (replaces fixed slot count) ─────────────
-        _deployed = sum(
-            v.get("cap", config.PAPER_CAP_MODERATE)
-            for v in st.session_state.get("paper_open", {}).values()
+        # Include BOTH intraday (paper_open) and scalp (scalp_open) positions
+        # so the total never exceeds PAPER_CAPITAL (₹9L).
+        _deployed = (
+            sum(v.get("cap", config.PAPER_CAP_MODERATE)
+                for v in st.session_state.get("paper_open", {}).values())
+            + sum(v.get("cap", config.SCALP_CAP_PER_TRADE)
+                  for v in st.session_state.get("scalp_open", {}).values())
         )
         _remaining = config.PAPER_CAPITAL - _deployed
         _within_limit = (_cap_this_trade > 0) and (_remaining >= _cap_this_trade)
@@ -4617,7 +4658,7 @@ def _intraday_long_live():
                 try:
                     _t2_val = float(r.get("intraday_t2") or r.get("intraday_r3") or 0)
                     _pid = db.log_trade({
-                        "trade_date":          _dt.date.today(),
+                        "trade_date":          datetime.now(_IST).date(),
                         "tradingsymbol":       sym,
                         "instrument_token":    int(r.get("instrument_token") or 0),
                         "setup_type":          "INTRADAY",
@@ -4635,6 +4676,7 @@ def _intraday_long_live():
                         "status":              "OPEN",
                         "notes":               f"📄 Paper — auto TRIGGERED @ ₹{_trigger_price:.2f} (conf {confidence}/10, ₹{_cap_this_trade:,})",
                         "is_paper_trade":      True,
+                        "intraday_confidence": confidence,
                     })
                     st.session_state["paper_triggered"][_paper_key] = _pid
                     st.session_state["paper_open"][_pid] = {
@@ -4647,8 +4689,10 @@ def _intraday_long_live():
                     }
                     _confirm_map.pop(sym, None)  # reset timer after firing
                     st.toast(f"📄 Paper BUY [{_conf_tier}]: {sym} @ ₹{_trigger_price:.2f} × {_pqty} (confirmed {_ENTRY_CONFIRM_SECS}s)", icon="📄")
-                except Exception:
-                    pass
+                except Exception as _e:
+                    # Prevent duplicate entry on next render even when DB call failed
+                    st.session_state["paper_triggered"].setdefault(_paper_key, -1)
+                    st.toast(f"⚠️ Paper BUY log failed ({sym}): {_e}", icon="⚠️")
 
             # ── REAL mode ─────────────────────────────────────────────────────
             elif (_trade_mode == "real"
@@ -4687,7 +4731,7 @@ def _intraday_long_live():
                             except Exception:
                                 pass
                         _rid = db.log_trade({
-                            "trade_date":          _dt.date.today(),
+                            "trade_date":          datetime.now(_IST).date(),
                             "tradingsymbol":       sym,
                             "instrument_token":    int(r.get("instrument_token") or 0),
                             "setup_type":          "INTRADAY",
@@ -4707,6 +4751,7 @@ def _intraday_long_live():
                             "status":              "OPEN",
                             "notes":               f"💸 Real — auto TRIGGERED @ ₹{_trigger_price:.2f} (conf {confidence}/10, ₹{_cap_this_trade:,})",
                             "is_paper_trade":      False,
+                            "intraday_confidence": confidence,
                         })
                         st.session_state["real_triggered"][_real_key] = _rid
                         _confirm_map.pop(sym, None)  # reset timer after firing
@@ -5049,9 +5094,12 @@ def _intraday_short_live():
             _conf_tier = "LOW"
 
         # ── Capital availability gate ─────────────────────────────────────────
-        _deployed = sum(
-            v.get("cap", config.PAPER_CAP_MODERATE)
-            for v in st.session_state.get("paper_open", {}).values()
+        # Include both intraday and scalp positions for correct total exposure.
+        _deployed = (
+            sum(v.get("cap", config.PAPER_CAP_MODERATE)
+                for v in st.session_state.get("paper_open", {}).values())
+            + sum(v.get("cap", config.SCALP_CAP_PER_TRADE)
+                  for v in st.session_state.get("scalp_open", {}).values())
         )
         _remaining = config.PAPER_CAPITAL - _deployed
         _within_limit = (_cap_this_trade > 0) and (_remaining >= _cap_this_trade)
@@ -5088,7 +5136,7 @@ def _intraday_short_live():
                 try:
                     _t2_val_s = float(r.get("intraday_t2") or r.get("intraday_s3") or 0)
                     _pid = db.log_trade({
-                        "trade_date":          _dt.date.today(),
+                        "trade_date":          datetime.now(_IST).date(),
                         "tradingsymbol":       sym,
                         "instrument_token":    int(r.get("instrument_token") or 0),
                         "setup_type":          "INTRADAY",
@@ -5106,6 +5154,7 @@ def _intraday_short_live():
                         "status":              "OPEN",
                         "notes":               f"📄 Paper — auto TRIGGERED @ ₹{_trigger_price:.2f} (conf {confidence}/10, ₹{_cap_this_trade:,})",
                         "is_paper_trade":      True,
+                        "intraday_confidence": confidence,
                     })
                     st.session_state["paper_triggered"][_paper_key] = _pid
                     st.session_state["paper_open"][_pid] = {
@@ -5118,8 +5167,9 @@ def _intraday_short_live():
                     }
                     _confirm_map_s.pop(_short_key, None)
                     st.toast(f"📄 Paper SHORT [{_conf_tier}]: {sym} @ ₹{_trigger_price:.2f} × {_pqty} (confirmed {_ENTRY_CONFIRM_SECS}s)", icon="📄")
-                except Exception:
-                    pass
+                except Exception as _e:
+                    st.session_state["paper_triggered"].setdefault(_paper_key, -1)
+                    st.toast(f"⚠️ Paper SHORT log failed ({sym}): {_e}", icon="⚠️")
 
             # ── REAL mode ─────────────────────────────────────────────────────
             elif (_trade_mode == "real"
@@ -5155,7 +5205,7 @@ def _intraday_short_live():
                             except Exception:
                                 pass
                         _rid = db.log_trade({
-                            "trade_date":          _dt.date.today(),
+                            "trade_date":          datetime.now(_IST).date(),
                             "tradingsymbol":       sym,
                             "instrument_token":    int(r.get("instrument_token") or 0),
                             "setup_type":          "INTRADAY",
@@ -5175,6 +5225,7 @@ def _intraday_short_live():
                             "status":              "OPEN",
                             "notes":               f"💸 Real — auto TRIGGERED @ ₹{_trigger_price:.2f} (conf {confidence}/10, ₹{_cap_this_trade:,})",
                             "is_paper_trade":      False,
+                            "intraday_confidence": confidence,
                         })
                         st.session_state["real_triggered"][_real_key] = _rid
                         _confirm_map_s.pop(_short_key, None)
@@ -5934,9 +5985,67 @@ def _activity_log_live():
     _st_autorefresh(interval=2000, limit=None, key="_actlog_ar", debounce=True)
     _uid = st.session_state.get("kite_user_id", "")
 
+    # ── Market-hours gate: skip live Kite API calls outside 9:00–15:35 IST ──
+    _now_act = datetime.now(_IST)
+    _act_in_market = (
+        _now_act.weekday() < 5
+        and time(9, 0) <= _now_act.time() <= time(15, 35)
+    )
+    _past_310_act = (
+        _now_act.weekday() < 5
+        and (_now_act.hour > 15 or (_now_act.hour == 15 and _now_act.minute >= 10))
+    )
+
+    # ── EOD Force Close — shown after 3:10 PM if any paper/scalp trades stuck OPEN ─
+    if _past_310_act and _uid:
+        _stuck_open = st.session_state.get("paper_open", {}) or st.session_state.get("scalp_open", {})
+        if not _stuck_open:
+            # Also query DB directly in case session_state lost tracking after a refresh
+            try:
+                _db_open = db.get_open_paper_trades(user_id=_uid)
+                _stuck_open = _db_open
+            except Exception:
+                _db_open = []
+        if _stuck_open:
+            st.warning(
+                f"⚠️ **{len(_stuck_open) if isinstance(_stuck_open, list) else len(_stuck_open)} open paper trade(s)** still active after market close. "
+                "Click below to force-close all at last known price.",
+                icon="⚠️",
+            )
+            if st.button("⏰ Force Close All Open Paper Trades (EOD)", type="primary", key="_eod_force_close"):
+                _ltp_snap = st.session_state.get("_live_ltp", {})
+                # Close from session state (in-memory)
+                for _fc_id, _fc_t in list(st.session_state.get("paper_open", {}).items()):
+                    _fc_ltp = _ltp_snap.get(_fc_t.get("sym", ""), 0) or _fc_t.get("stop", 0) or _fc_t.get("entry", 0)
+                    try:
+                        db.close_trade(_fc_id, _fc_ltp, "CLOSED", f"⏰ EOD manual force-close @ ₹{_fc_ltp:.2f}")
+                        st.session_state["paper_open"].pop(_fc_id, None)
+                    except Exception:
+                        pass
+                for _fc_id, _fc_t in list(st.session_state.get("scalp_open", {}).items()):
+                    _fc_ltp = _ltp_snap.get(_fc_t.get("sym", ""), 0) or _fc_t.get("stop", 0) or _fc_t.get("entry", 0)
+                    try:
+                        db.close_trade(_fc_id, _fc_ltp, "CLOSED", f"⏰ EOD manual force-close @ ₹{_fc_ltp:.2f}")
+                        st.session_state["scalp_open"].pop(_fc_id, None)
+                    except Exception:
+                        pass
+                # Also close any DB-tracked open trades (in case session_state was reset)
+                try:
+                    for _dbt in db.get_open_paper_trades(user_id=_uid):
+                        _dbt_ltp = _ltp_snap.get(_dbt.get("tradingsymbol", ""), 0) or 0
+                        try:
+                            db.close_trade(_dbt["id"], _dbt_ltp or _dbt.get("rec_stop", 0) or _dbt.get("actual_entry", 0),
+                                           "CLOSED", "⏰ EOD manual force-close (DB)")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                st.success("All open paper trades closed.")
+                st.rerun()
+
     # ── PORTFOLIO SNAPSHOT — live Kite margin + holdings + positions ────────
     _pf_kc = st.session_state.get("kite_client")
-    _pf_ok = _pf_kc is not None and getattr(_pf_kc, "authenticated", False)
+    _pf_ok = _pf_kc is not None and getattr(_pf_kc, "authenticated", False) and _act_in_market
     if _pf_ok:
         try:
             _margins   = _pf_kc.get_margins("equity")
@@ -6291,7 +6400,7 @@ def _activity_log_live():
             default=[], placeholder="All statuses", key="act_flt_status",
         )
         _a_flt_setup = _af2.multiselect(
-            "Setup type", ["SWING","INTRADAY","SCALING"],
+            "Setup type", ["SWING","INTRADAY","SCALP"],
             default=[], placeholder="All setups", key="act_flt_setup",
         )
         _a_flt_sym   = _af3.text_input("Symbol search", placeholder="e.g. RELIANCE", key="act_flt_sym")

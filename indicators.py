@@ -114,7 +114,9 @@ def fifty_two_week_levels(df: pd.DataFrame) -> dict:
     high = float(window["high"].max())
     low = float(window["low"].min())
     ltp = float(df["close"].iloc[-1])
-    dist_high = (high - ltp) / ltp * 100 if ltp > 0 else None
+    # Distance expressed as % below the 52W high (denominator = 52W high, not LTP)
+    # Positive value means stock is trading below its 52W high (as expected)
+    dist_high = (high - ltp) / high * 100 if high > 0 else None
     return {
         "high_52w": high,
         "low_52w": low,
@@ -403,7 +405,7 @@ def intraday_volume_ratio(df_5min: pd.DataFrame, daily_avg_volume: float) -> flo
     ratio > 1.3 = strong participation today (confirms breakout)
     ratio < 0.7 = quiet day (lower conviction on ORB signals)
     """
-    if df_5min is None or df_5min.empty or not daily_avg_volume:
+    if df_5min is None or df_5min.empty or not daily_avg_volume or float(daily_avg_volume) <= 0:
         return None
     total_5min_candles_per_day = 75   # 9:15 AM – 3:30 PM = 375 min / 5 = 75 candles
     elapsed = len(df_5min)
@@ -412,4 +414,4 @@ def intraday_volume_ratio(df_5min: pd.DataFrame, daily_avg_volume: float) -> flo
     today_vol   = float(df_5min["volume"].sum())
     pace_factor = total_5min_candles_per_day / elapsed   # scale to full day
     projected   = today_vol * pace_factor
-    return round(projected / daily_avg_volume, 3)
+    return round(projected / float(daily_avg_volume), 3)

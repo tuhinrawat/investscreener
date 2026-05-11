@@ -141,7 +141,23 @@ def _pivot_levels(df: pd.DataFrame) -> dict:
     Classic floor-trader pivot points computed from the last completed session.
     Used for intraday planning — these are levels to WATCH on a chart.
     """
-    prev = df.iloc[-1]
+    # Always use yesterday's complete candle.  If df was fetched during the trading
+    # day, the last row is today's partial candle — drop it so pivots are correct.
+    _ref = df
+    if "date" in df.columns and len(df) >= 2:
+        import datetime as _dt2
+        _today_str = _dt2.date.today().isoformat()
+        _last_date = str(df["date"].iloc[-1])[:10]
+        if _last_date == _today_str:
+            _ref = df.iloc[:-1]
+    elif len(df) >= 2 and hasattr(df.index, "date"):
+        import datetime as _dt2
+        _today_str = _dt2.date.today().isoformat()
+        _last_date = str(df.index[-1])[:10]
+        if _last_date == _today_str:
+            _ref = df.iloc[:-1]
+
+    prev = _ref.iloc[-1]
     H, L, C = float(prev["high"]), float(prev["low"]), float(prev["close"])
     P  = (H + L + C) / 3
     R1 = 2 * P - L

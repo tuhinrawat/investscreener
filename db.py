@@ -453,7 +453,10 @@ def _compute_outcomes(quantity, actual_entry, actual_exit,
         if risk and risk > 0:
             rr_realised = actual_gain / risk
     if rec_entry and actual_entry:
-        slippage = (actual_entry - rec_entry) / rec_entry * 100
+        # For LONG: paying more than rec = bad → positive slippage
+        # For SHORT: selling below rec = bad → positive slippage (flip sign)
+        raw_slip = (actual_entry - rec_entry) / rec_entry * 100
+        slippage = raw_slip if direction == 1 else -raw_slip
     return {
         "pnl_amount":         pnl_amount,
         "pnl_pct":            pnl_pct,
@@ -812,14 +815,17 @@ def delete_trade(trade_id: int):
 
 
 def load_trade_log(status_filter: list = None, user_id: str = "") -> pd.DataFrame:
-    """Load trade log entries for a user, newest first."""
+    """Load trade log entries for a user, newest first.
+
+    If user_id is empty (Kite not yet authenticated), returns an empty DataFrame
+    rather than leaking all users' trades.
+    """
+    if not user_id:
+        return pd.DataFrame()
     conn = get_conn()
     cur  = conn.cursor()
     try:
-        clauses, params = [], []
-        if user_id:
-            clauses.append("kite_user_id = %s")
-            params.append(user_id)
+        clauses, params = ["kite_user_id = %s"], [user_id]
         if status_filter:
             placeholders = ",".join(["%s"] * len(status_filter))
             clauses.append(f"status IN ({placeholders})")
@@ -833,18 +839,18 @@ def load_trade_log(status_filter: list = None, user_id: str = "") -> pd.DataFram
 
 
 def sync_from_kite_orders(orders: list, user_id: str = "") -> int:
-    """Update OPEN trade_log entries from Kite order status."""
-    if not orders:
+    """Update OPEN trade_log entries from Kite order status.
+
+    Requires a non-empty user_id to prevent cross-user order leakage.
+    """
+    if not orders or not user_id:
         return 0
     orders_map = {str(o.get("order_id", "")): o for o in orders}
     conn = get_conn()
     cur  = conn.cursor()
     try:
-        clauses = ["status = 'OPEN'", "kite_order_id IS NOT NULL"]
-        params  = []
-        if user_id:
-            clauses.append("kite_user_id = %s")
-            params.append(user_id)
+        clauses = ["status = 'OPEN'", "kite_order_id IS NOT NULL", "kite_user_id = %s"]
+        params  = [user_id]
         cur.execute(
             "SELECT id, kite_order_id, actual_entry, quantity, signal_type, rec_entry, rec_stop "
             "FROM trade_log WHERE " + " AND ".join(clauses),
@@ -883,14 +889,17 @@ def sync_from_kite_orders(orders: list, user_id: str = "") -> int:
 
 
 def get_trade_stats(user_id: str = "", is_paper: bool | None = None) -> dict:
-    """Aggregate stats for Activity Log header, scoped to user."""
+    """Aggregate stats for Activity Log header, scoped to user.
+
+    Returns zeroed stats if user_id is empty to prevent cross-user data leaks.
+    """
+    if not user_id:
+        return {"total": 0, "open": 0, "closed": 0, "wins": 0, "losses": 0,
+                "total_pnl": 0.0, "avg_rr": None, "best_trade": None, "win_rate": 0.0}
     conn = get_conn()
     cur  = conn.cursor()
     try:
-        clauses, params = [], []
-        if user_id:
-            clauses.append("kite_user_id = %s")
-            params.append(user_id)
+        clauses, params = ["kite_user_id = %s"], [user_id]
         if is_paper is True:
             clauses.append("is_paper_trade = TRUE")
         elif is_paper is False:
@@ -913,11 +922,15 @@ def get_trade_stats(user_id: str = "", is_paper: bool | None = None) -> dict:
         if row is None:
             return {}
         total, open_c, wins, losses, tot_pnl, avg_rr, best, worst = row
-        closed   = (total or 0) - (open_c or 0)
+        total    = int(total  or 0)
+        open_c   = int(open_c or 0)
+        wins     = int(wins   or 0)
+        losses   = int(losses or 0)
+        closed   = total - open_c
         win_rate = (wins / closed * 100) if closed > 0 else 0.0
         return {
-            "total":      total or 0,
-            "open":       open_c or 0,
+            "total":      total,
+            "open":       open_c,
             "closed":     closed,
             "wins":       wins or 0,
             "losses":     losses or 0,
@@ -933,20 +946,23 @@ def get_trade_stats(user_id: str = "", is_paper: bool | None = None) -> dict:
 
 
 def get_total_charges(user_id: str = "", is_paper: bool | None = None) -> float:
-    """Sum of Zerodha statutory charges for all CLOSED trades."""
+    """Sum of Zerodha statutory charges for all CLOSED trades.
+
+    Returns 0.0 if user_id is empty to prevent cross-user data leaks.
+    """
+    if not user_id:
+        return 0.0
     conn = get_conn()
     cur  = conn.cursor()
     try:
         clauses = [
+            "kite_user_id = %s",
             "status != 'OPEN'",
             "actual_entry IS NOT NULL",
             "actual_exit IS NOT NULL",
             "quantity IS NOT NULL",
         ]
-        params = []
-        if user_id:
-            clauses.append("kite_user_id = %s")
-            params.append(user_id)
+        params = [user_id]
         if is_paper is True:
             clauses.append("is_paper_trade = TRUE")
         elif is_paper is False:
@@ -979,9 +995,10 @@ def get_total_charges(user_id: str = "", is_paper: bool | None = None) -> float:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def get_open_paper_trades(user_id: str = "", trade_date=None) -> list:
-    """Open paper trades for a given date (defaults to today), scoped to user."""
+    """Open paper trades for a given date (defaults to today IST), scoped to user."""
     import datetime as _dt
-    d = trade_date or _dt.date.today()
+    _IST = _dt.timezone(_dt.timedelta(hours=5, minutes=30))
+    d = trade_date or _dt.datetime.now(_IST).date()
     conn = get_conn()
     cur  = conn.cursor()
     try:
@@ -1007,12 +1024,13 @@ def get_open_paper_trades(user_id: str = "", trade_date=None) -> list:
 
 def get_all_today_paper_trades(user_id: str = "", trade_date=None) -> list:
     """
-    ALL paper trades for today (any status). Used on startup to rebuild
+    ALL paper trades for today IST (any status). Used on startup to rebuild
     paper_triggered / scalp_triggered so closed trades can't re-fire after
     a page refresh.
     """
     import datetime as _dt
-    d = trade_date or _dt.date.today()
+    _IST = _dt.timezone(_dt.timedelta(hours=5, minutes=30))
+    d = trade_date or _dt.datetime.now(_IST).date()
     conn = get_conn()
     cur  = conn.cursor()
     try:
@@ -1023,21 +1041,23 @@ def get_all_today_paper_trades(user_id: str = "", trade_date=None) -> list:
             params.append(user_id)
         cur.execute(
             "SELECT id, tradingsymbol, signal_type, actual_entry, rec_stop, rec_t1, "
-            "       status, setup_type, rec_t2 "
+            "       status, setup_type, rec_t2, intraday_confidence, is_paper_trade "
             "FROM trade_log WHERE " + " AND ".join(clauses) + " ORDER BY id",
             params,
         )
         return [
             {
-                "id":            r[0],
-                "tradingsymbol": r[1],
-                "signal_type":   r[2],
-                "actual_entry":  r[3],
-                "rec_stop":      r[4],
-                "rec_t1":        r[5],
-                "status":        r[6],
-                "setup_type":    r[7] or "INTRADAY",
-                "rec_t2":        r[8],
+                "id":                 r[0],
+                "tradingsymbol":      r[1],
+                "signal_type":        r[2],
+                "actual_entry":       r[3],
+                "rec_stop":           r[4],
+                "rec_t1":             r[5],
+                "status":             r[6],
+                "setup_type":         r[7] or "INTRADAY",
+                "rec_t2":             r[8],
+                "intraday_confidence": r[9] or 0,
+                "is_paper_trade":     r[10],
             }
             for r in cur.fetchall()
         ]
@@ -1047,21 +1067,25 @@ def get_all_today_paper_trades(user_id: str = "", trade_date=None) -> list:
 
 
 def get_today_closed_pnl(user_id: str = "", is_paper: bool | None = None) -> float:
-    """Total realised P&L for trades closed today."""
+    """Total realised P&L for trades closed today.
+
+    Returns 0 if user_id is empty to prevent cross-user data leaks.
+    """
+    if not user_id:
+        return 0.0
     import datetime as _dt
-    _today = _dt.date.today().isoformat()
+    _IST = _dt.timezone(_dt.timedelta(hours=5, minutes=30))
+    _today = _dt.datetime.now(_IST).date().isoformat()
     conn = get_conn()
     cur  = conn.cursor()
     try:
         clauses = [
+            "kite_user_id = %s",
             "status IN ('CLOSED', 'TARGET_HIT', 'STOPPED_OUT')",
             "pnl_amount IS NOT NULL",
             "(trade_date = %s OR logged_at::DATE = %s)",
         ]
-        params: list = [_today, _today]
-        if user_id:
-            clauses.append("kite_user_id = %s")
-            params.append(user_id)
+        params: list = [user_id, _today, _today]
         if is_paper is True:
             clauses.append("is_paper_trade = TRUE")
         elif is_paper is False:
@@ -1141,9 +1165,10 @@ def get_paper_trade_perf(user_id: str = "", days: int = 30) -> dict:
 
 
 def get_archived_paper_trades_for_analysis(user_id: str = "") -> pd.DataFrame:
-    """All closed paper trades from days BEFORE today for algorithm re-tuning."""
+    """All closed paper trades from days BEFORE today IST for algorithm re-tuning."""
     import datetime as _dt
-    today = str(_dt.date.today())
+    _IST = _dt.timezone(_dt.timedelta(hours=5, minutes=30))
+    today = str(_dt.datetime.now(_IST).date())
     conn = get_conn()
     cur  = conn.cursor()
     try:
@@ -1172,9 +1197,10 @@ def get_archived_paper_trades_for_analysis(user_id: str = "") -> pd.DataFrame:
 
 
 def get_open_real_trades(user_id: str = "") -> list:
-    """All real (non-paper) OPEN trades for today — used by 3:20 PM Kite sync."""
+    """All real (non-paper) OPEN trades for today IST — used by 3:20 PM Kite sync."""
     import datetime as _dt_mod
-    today = str(_dt_mod.date.today())
+    _IST_r = _dt_mod.timezone(_dt_mod.timedelta(hours=5, minutes=30))
+    today = str(_dt_mod.datetime.now(_IST_r).date())
     conn  = get_conn()
     cur   = conn.cursor()
     try:

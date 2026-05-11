@@ -16,8 +16,14 @@ Why split? Because they have wildly different latency profiles:
 import io
 import json
 import time
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from typing import Optional
+
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+def _now_ist() -> datetime:
+    """Current datetime in IST, timezone-naive (safe for TIMESTAMP columns)."""
+    return datetime.now(_IST).replace(tzinfo=None)
 
 import pandas as pd
 from tqdm import tqdm
@@ -152,7 +158,7 @@ def refresh_universe(client: KiteClient) -> pd.DataFrame:
         "tick_size", "lot_size"
     ]
     df = df[keep_cols].copy()
-    df["last_updated"] = datetime.now()
+    df["last_updated"] = _now_ist()
 
     db.upsert_instruments(df)
     print(f"✓ Stored {len(df)} instruments in universe")
@@ -362,7 +368,7 @@ def compute_metrics_for_universe(universe_df: pd.DataFrame) -> pd.DataFrame:
 
         metrics["instrument_token"] = token
         metrics["tradingsymbol"] = symbol
-        metrics["last_updated"] = datetime.now()
+        metrics["last_updated"] = _now_ist()
         rows.append(metrics)
 
     if not rows:
@@ -385,8 +391,11 @@ def compute_metrics_for_universe(universe_df: pd.DataFrame) -> pd.DataFrame:
         "swing_rr", "swing_quality", "swing_reason",
         # Intraday signals
         "intraday_signal", "intraday_pivot",
-        "intraday_r1", "intraday_r2", "intraday_s1", "intraday_s2",
-        "intraday_entry", "intraday_stop", "intraday_t1", "intraday_reason",
+        "intraday_r1", "intraday_r2", "intraday_r3",
+        "intraday_s1", "intraday_s2", "intraday_s3",
+        "intraday_entry", "intraday_stop", "intraday_t1", "intraday_t2",
+        "intraday_confidence", "intraday_gap_flag", "intraday_nifty_gate",
+        "intraday_reason",
         # Scaling signals
         "scale_signal", "scale_setup",
         "scale_entry_1", "scale_stop", "scale_trailing_stop",
@@ -547,8 +556,11 @@ def quick_refresh(client: "KiteClient | None" = None) -> dict:
         "swing_signal", "swing_setup", "swing_entry", "swing_stop",
         "swing_t1", "swing_t2", "swing_rr", "swing_quality", "swing_reason",
         "intraday_signal", "intraday_pivot",
-        "intraday_r1", "intraday_r2", "intraday_s1", "intraday_s2",
-        "intraday_entry", "intraday_stop", "intraday_t1", "intraday_reason",
+        "intraday_r1", "intraday_r2", "intraday_r3",
+        "intraday_s1", "intraday_s2", "intraday_s3",
+        "intraday_entry", "intraday_stop", "intraday_t1", "intraday_t2",
+        "intraday_confidence", "intraday_gap_flag", "intraday_nifty_gate",
+        "intraday_reason",
         "scale_signal", "scale_setup",
         "scale_entry_1", "scale_stop", "scale_trailing_stop",
         "scale_target", "scale_quality", "scale_reason",
@@ -563,9 +575,10 @@ def quick_refresh(client: "KiteClient | None" = None) -> dict:
         # returns all-None for these fields — we must NOT overwrite valid values
         # from the last Full Rescan.
         _PRESERVE_PIVOT = {
-            "intraday_pivot", "intraday_r1", "intraday_r2",
-            "intraday_s1",    "intraday_s2",
-            "intraday_entry", "intraday_stop", "intraday_t1",
+            "intraday_pivot",
+            "intraday_r1", "intraday_r2", "intraday_r3",
+            "intraday_s1", "intraday_s2", "intraday_s3",
+            "intraday_entry", "intraday_stop", "intraday_t1", "intraday_t2",
         }
 
         sigs_updated = 0
@@ -586,7 +599,7 @@ def quick_refresh(client: "KiteClient | None" = None) -> dict:
     else:
         sigs_updated = 0
 
-    metrics["last_updated"] = datetime.now()
+    metrics["last_updated"] = _now_ist()
     db.replace_metrics(metrics)
 
     return {
@@ -656,7 +669,7 @@ def refresh_signals_only(progress_callback=None, user_id: str = "") -> dict:
             errors += 1
             continue
 
-    metrics["last_updated"] = datetime.now()
+    metrics["last_updated"] = _now_ist()
     db.replace_metrics(metrics)
 
     return {
