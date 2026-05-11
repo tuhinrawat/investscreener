@@ -347,6 +347,13 @@ def init_schema():
                 last_seen_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS user_capital (
+                user_id         BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                paper_balance   DOUBLE PRECISION NOT NULL DEFAULT 900000,
+                last_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
 
         # ── Idempotent column additions for older DBs ──────────────────────────
         _add_column_if_missing(cur, "computed_metrics", "intraday_r3",       "DOUBLE PRECISION")
@@ -744,19 +751,23 @@ def log_trade(trade: dict) -> int:
 
 
 def close_trade(trade_id: int, actual_exit: float, status: str, notes: str = None):
-    """Update an OPEN trade with exit price and final status, recompute P&L."""
+    """Update an OPEN trade with exit price and final status, recompute P&L.
+
+    For paper trades the realised P&L is immediately reflected in user_capital.
+    """
     conn = get_conn()
     cur  = conn.cursor()
     try:
         cur.execute(
-            "SELECT quantity, actual_entry, rec_entry, rec_stop, signal_type, notes "
+            "SELECT quantity, actual_entry, rec_entry, rec_stop, signal_type, notes, "
+            "       is_paper_trade, kite_user_id "
             "FROM trade_log WHERE id = %s",
             [trade_id],
         )
         row = cur.fetchone()
         if not row:
             return
-        qty, ae, re, rs, sig, old_notes = row
+        qty, ae, re, rs, sig, old_notes, is_paper, kite_uid = row
         outcomes = _compute_outcomes(qty or 1, ae, actual_exit, re, rs, sig or "")
         merged_notes = "\n".join(filter(None, [old_notes, notes]))
         cur.execute("""
@@ -776,6 +787,88 @@ def close_trade(trade_id: int, actual_exit: float, status: str, notes: str = Non
             trade_id,
         ])
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        release_conn(conn)
+
+    # ── Cumulative capital: adjust balance for paper trades only ──────────
+    if is_paper and kite_uid and outcomes.get("pnl_amount") is not None:
+        try:
+            adjust_user_capital(kite_uid, outcomes["pnl_amount"])
+        except Exception:
+            pass  # never let a capital-update failure block a trade close
+
+
+def get_user_capital(user_id) -> float:
+    """Return the user's current paper balance.  Falls back to PAPER_CAPITAL if no row yet."""
+    from config import PAPER_CAPITAL  # local import to avoid circular
+    if not user_id:
+        return float(PAPER_CAPITAL)
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT paper_balance FROM user_capital WHERE user_id = %s",
+            [user_id],
+        )
+        row = cur.fetchone()
+        return float(row[0]) if row else float(PAPER_CAPITAL)
+    finally:
+        cur.close()
+        release_conn(conn)
+
+
+def seed_user_capital_if_missing(user_id) -> None:
+    """Insert a default ₹9L capital row for an existing user who predates this feature."""
+    from config import PAPER_CAPITAL
+    if not user_id:
+        return
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            """INSERT INTO user_capital (user_id, paper_balance)
+               VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING""",
+            [user_id, PAPER_CAPITAL],
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+    finally:
+        cur.close()
+        release_conn(conn)
+
+
+def adjust_user_capital(user_id, delta: float) -> float:
+    """Add *delta* (positive = profit, negative = loss) to the user's paper balance.
+
+    Uses INSERT … ON CONFLICT (upsert) so it works even if the row doesn't exist yet
+    (seeds from PAPER_CAPITAL + delta in that case).
+    Returns the new balance.
+    """
+    from config import PAPER_CAPITAL
+    if not user_id:
+        return float(PAPER_CAPITAL)
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO user_capital (user_id, paper_balance, last_updated_at)
+                VALUES (%s, %s + %s, NOW())
+            ON CONFLICT (user_id) DO UPDATE
+                SET paper_balance   = user_capital.paper_balance + EXCLUDED.paper_balance - %s,
+                    last_updated_at = NOW()
+            RETURNING paper_balance
+            """,
+            [user_id, PAPER_CAPITAL, delta, PAPER_CAPITAL],
+        )
+        new_bal = cur.fetchone()[0]
+        conn.commit()
+        return float(new_bal)
     except Exception:
         conn.rollback()
         raise
@@ -1456,6 +1549,7 @@ def create_user(username: str, password_hash: str,
     Create a new user. Returns the new user id.
     Raises psycopg2.errors.UniqueViolation if username already exists.
     """
+    from config import PAPER_CAPITAL
     conn = get_conn()
     cur  = conn.cursor()
     try:
@@ -1465,6 +1559,12 @@ def create_user(username: str, password_hash: str,
             [username.strip().lower(), password_hash, kite_api_key, kite_api_secret],
         )
         uid = cur.fetchone()[0]
+        # Seed the paper trading balance for the new user
+        cur.execute(
+            """INSERT INTO user_capital (user_id, paper_balance)
+               VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING""",
+            [uid, PAPER_CAPITAL],
+        )
         conn.commit()
         return uid
     except Exception:

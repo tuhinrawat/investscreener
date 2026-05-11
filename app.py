@@ -305,6 +305,8 @@ def _show_auth_page() -> None:
                         _tok = _auth.new_session_token()
                         db.create_session(_u["id"], _tok)
                         db.update_last_login(_u["id"])
+                        # Seed capital row for users who existed before this feature
+                        db.seed_user_capital_if_missing(_u.get("kite_user_id") or str(_u["id"]))
                         st.session_state["app_user"]       = _u
                         st.session_state["_session_token"] = _tok
                         st.query_params["_sid"] = _tok          # primary: URL param
@@ -545,6 +547,15 @@ if "kite_client" not in st.session_state or not st.session_state["kite_client"]:
 
 # Convenience alias — current Kite user id for per-user DB filtering
 _cur_user_id: str = st.session_state.get("kite_user_id", "")
+
+# ── Cumulative paper capital (loaded from DB once per session) ───────────────
+# Refreshed each time the main script re-runs (i.e. every page load / rerun).
+# Fragments read st.session_state["_paper_balance"] directly.
+try:
+    _paper_balance_db = db.get_user_capital(_cur_user_id) if _cur_user_id else float(config.PAPER_CAPITAL)
+except Exception:
+    _paper_balance_db = float(config.PAPER_CAPITAL)
+st.session_state["_paper_balance"] = _paper_balance_db
 
 # ── Paper trade session state ────────────────────────────────────────────────
 # paper_triggered: {(date_str, sym): trade_id} — prevents re-triggering same signal
@@ -4169,7 +4180,8 @@ def _intraday_paper_banner():
     except Exception:
         _today_paper_pnl = 0.0
 
-    _cap = config.PAPER_CAPITAL
+    # Use cumulative balance as the reference capital so returns reflect compounding
+    _cap = st.session_state.get("_paper_balance", float(config.PAPER_CAPITAL))
     _ret_pct = (_today_paper_pnl / _cap * 100) if _cap else 0.0
 
     # ── Live MTM on open positions ────────────────────────────────────────────
@@ -4265,8 +4277,9 @@ def _intraday_paper_banner():
             f'(<span style="font-size:0.8em">{_total_ret:+.2f}%</span>)'
             f'</span>'
             f'<span style="font-size:0.75rem;color:#64748b;white-space:nowrap">'
-            f'Capital: ₹{_cap:,} · ₹{_cap // config.PAPER_MAX_POSITIONS:,}/trade · '
-            f'Deployed: ₹{_capital_deployed:,}</span>'
+            f'Balance: <b style="color:#e2e8f0">₹{_cap:,.0f}</b> · '
+            f'Deployed: ₹{_capital_deployed:,} · '
+            f'Free: ₹{max(0, _cap - _capital_deployed):,.0f}</span>'
             f'<span>{_gate_html}</span>'
             f'</div>',
             unsafe_allow_html=True,
@@ -4833,7 +4846,8 @@ def _intraday_long_live():
             + sum(v.get("cap", config.SCALP_CAP_PER_TRADE)
                   for v in st.session_state.get("scalp_open", {}).values())
         )
-        _remaining = config.PAPER_CAPITAL - _deployed
+        _avail_bal  = st.session_state.get("_paper_balance", float(config.PAPER_CAPITAL))
+        _remaining  = _avail_bal - _deployed
         _within_limit = (_cap_this_trade > 0) and (_remaining >= _cap_this_trade)
 
         # Quantity based on tier capital and actual trigger price
@@ -5344,7 +5358,8 @@ def _intraday_short_live():
             + sum(v.get("cap", config.SCALP_CAP_PER_TRADE)
                   for v in st.session_state.get("scalp_open", {}).values())
         )
-        _remaining = config.PAPER_CAPITAL - _deployed
+        _avail_bal  = st.session_state.get("_paper_balance", float(config.PAPER_CAPITAL))
+        _remaining  = _avail_bal - _deployed
         _within_limit = (_cap_this_trade > 0) and (_remaining >= _cap_this_trade)
 
         _trigger_price = ltp_now if ltp_now > 0 else entry_val
@@ -6387,7 +6402,8 @@ def _activity_log_live():
         )
         return
 
-    _cap = config.PAPER_CAPITAL  # reference capital for both paper and real
+    # Use cumulative balance so all-time return % is accurate
+    _cap = st.session_state.get("_paper_balance", float(config.PAPER_CAPITAL))
 
     def _stat_banner(label: str, icon: str, s: dict, accent: str,
                      charges: float = 0.0, extra_html: str = "") -> str:
