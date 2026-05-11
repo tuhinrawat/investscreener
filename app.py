@@ -1213,15 +1213,20 @@ def _market_pulse_header():
         except Exception:
             pass
 
-    # ── Fetch NIFTY BANK open price for % change (once per day) ─────────
+    # ── Fetch NIFTY 50 + NIFTY BANK previous-day close (once per day) ────
+    # Kite OHLC: ohlc.close = PREVIOUS DAY's close (what Kite shows as base for %).
+    # ohlc.open = today's open — do NOT use for % change (gaps distort it).
     _today_str_mph = datetime.now(_IST).strftime("%Y-%m-%d")
-    if (_force or st.session_state.get("_nbank_open_date") != _today_str_mph) and _kite_ok:
+    if (_force or st.session_state.get("_nidx_prevclose_date") != _today_str_mph) and _kite_ok:
         try:
-            _nb_ohlc = _kc_mph.kite.ohlc(["NSE:NIFTY BANK"])
-            _nb_open = (_nb_ohlc.get("NSE:NIFTY BANK") or {}).get("ohlc", {}).get("open")
-            if _nb_open:
-                st.session_state["_nifty_bank_open"] = float(_nb_open)
-                st.session_state["_nbank_open_date"] = _today_str_mph
+            _idx_ohlc = _kc_mph.kite.ohlc(["NSE:NIFTY 50", "NSE:NIFTY BANK"])
+            _n50_prev  = (_idx_ohlc.get("NSE:NIFTY 50")   or {}).get("ohlc", {}).get("close")
+            _nbnk_prev = (_idx_ohlc.get("NSE:NIFTY BANK") or {}).get("ohlc", {}).get("close")
+            if _n50_prev:
+                st.session_state["_nifty50_prev_close_mph"] = float(_n50_prev)
+            if _nbnk_prev:
+                st.session_state["_nifty_bank_prev_close"] = float(_nbnk_prev)
+            st.session_state["_nidx_prevclose_date"] = _today_str_mph
         except Exception:
             pass
 
@@ -1251,18 +1256,29 @@ def _market_pulse_header():
 
     # If force-refresh, also bust FX/commodity cache so banner picks up fresh data
     if _force:
-        for _k in ("_usdinr_ltp", "_crude_usd", "_crude_ltp", "_nifty_pcr"):
+        for _k in ("_usdinr_ltp", "_crude_usd", "_crude_ltp", "_brent_usd", "_natgas_usd", "_nifty_pcr"):
             st.session_state.pop(_k, None)
 
     # ── Read all values from session state ───────────────────────────────
-    _nifty_ltp  = st.session_state.get("_nifty_live_ltp")
-    _nifty_pct  = st.session_state.get("_nifty_intraday_pct")
-    _nbank_ltp  = _kc_module.get_ticker_ltp("NIFTY BANK") or st.session_state.get("_live_ltp", {}).get("NIFTY BANK")
-    _nbank_open = st.session_state.get("_nifty_bank_open")
-    _nbank_pct  = ((_nbank_ltp - _nbank_open) / _nbank_open * 100) if (_nbank_ltp and _nbank_open) else None
+    # NIFTY 50: try WebSocket ticker first (always subscribed as token 256265)
+    _ticker_all = _kc_module.get_all_ticker_prices()
+    _nifty_ltp  = (_ticker_all.get("NIFTY 50")
+                   or st.session_state.get("_nifty_live_ltp"))
+    _n50_prev   = st.session_state.get("_nifty50_prev_close_mph") or st.session_state.get("_nifty_prev_close")
+    _nifty_pct  = ((_nifty_ltp - _n50_prev) / _n50_prev * 100) if (_nifty_ltp and _n50_prev) else st.session_state.get("_nifty_intraday_pct")
+
+    # NIFTY BANK: LTP from WebSocket, % vs previous close (not open)
+    _nbank_ltp   = (_ticker_all.get("NIFTY BANK")
+                    or st.session_state.get("_live_ltp", {}).get("NIFTY BANK"))
+    _nbank_prev  = st.session_state.get("_nifty_bank_prev_close")
+    _nbank_pct   = ((_nbank_ltp - _nbank_prev) / _nbank_prev * 100) if (_nbank_ltp and _nbank_prev) else None
+
     _vix        = st.session_state.get("_vix_ltp")
     _usd_inr    = st.session_state.get("_usdinr_ltp")
     _crude_usd  = st.session_state.get("_crude_usd")
+    _brent_usd  = st.session_state.get("_brent_usd")
+    _natgas_usd = st.session_state.get("_natgas_usd")
+    # PCR: show last known value even after market close (don't gate on _is_market_open)
     _pcr        = st.session_state.get("_nifty_pcr")
     _intel      = st.session_state.get("_mph_intel", {})
     _sectors    = st.session_state.get("_mph_sectors", {})
@@ -1362,11 +1378,11 @@ def _market_pulse_header():
     )
     _cards_g2 = (
         _group_label("MACRO")
-        + _card("USD / INR", f"₹{_usd_inr:.2f}" if _usd_inr else "—",
-                val_col="#f59e0b")
-        + _card("CRUDE WTI", f"${_crude_usd:.2f}" if _crude_usd else "—",
-                val_col="#fb923c")
-        + _card("NIFTY PCR", f"{_pcr:.2f}" if _pcr else "—",
+        + _card("USD / INR",  f"₹{_usd_inr:.2f}"    if _usd_inr    else "—", val_col="#f59e0b")
+        + _card("CRUDE WTI",  f"${_crude_usd:.2f}"   if _crude_usd  else "—", val_col="#fb923c")
+        + _card("BRENT",      f"${_brent_usd:.2f}"   if _brent_usd  else "—", val_col="#f97316")
+        + _card("NAT GAS",    f"${_natgas_usd:.3f}"  if _natgas_usd else "—", val_col="#a78bfa")
+        + _card("NIFTY PCR",  f"{_pcr:.2f}"          if _pcr        else "—",
                 badge=_pcr_lbl, badge_col=_pcr_col)
     )
     _cards_g3 = (
@@ -7417,12 +7433,40 @@ def _fetch_fx_commodity():
     except Exception:
         pass
 
-    # ── Nifty PCR — option chain OI (NFO segment, market hours only) ─────
+    # Source 2: Brent Crude BZ=F (ICE Brent front-month)
+    try:
+        _yf_br = _req_fx.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/BZ=F"
+            "?interval=1d&range=1d",
+            headers=_HDR, timeout=5,
+        )
+        _meta_br = (_yf_br.json().get("chart", {}).get("result") or [{}])[0].get("meta", {})
+        _br_usd = _meta_br.get("regularMarketPrice")
+        if _br_usd:
+            st.session_state["_brent_usd"] = float(_br_usd)
+    except Exception:
+        pass
+
+    # Source 3: Natural Gas NG=F (Henry Hub front-month, USD/MMBtu)
+    try:
+        _yf_ng = _req_fx.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/NG=F"
+            "?interval=1d&range=1d",
+            headers=_HDR, timeout=5,
+        )
+        _meta_ng = (_yf_ng.json().get("chart", {}).get("result") or [{}])[0].get("meta", {})
+        _ng_usd = _meta_ng.get("regularMarketPrice")
+        if _ng_usd:
+            st.session_state["_natgas_usd"] = float(_ng_usd)
+    except Exception:
+        pass
+
+    # ── Nifty PCR — option chain OI (store even if computed outside market hours) ─
     try:
         _kc_pcr = st.session_state.get("kite_client")
         _nf_atm = st.session_state.get("_nifty_live_ltp")
         if (_kc_pcr and getattr(_kc_pcr, "authenticated", False)
-                and _nf_atm and _nf_atm > 0 and _is_market_open()):
+                and _nf_atm and _nf_atm > 0 and _is_market_open()):  # only live during market hours
             _atm      = int(round(_nf_atm / 50.0)) * 50
             _strikes  = [_atm + i * 50 for i in range(-10, 11)]
             from datetime import date as _pcr_date  # noqa: PLC0415
@@ -7550,15 +7594,31 @@ def _ticker_banner():
     _cr_inr = st.session_state.get("_crude_ltp")   # INR/barrel (converted)
     if _cr_usd:
         items.append(
-            f'<span class="tb-cx">🛢&nbsp;Crude(WTI)&nbsp;'
+            f'<span class="tb-cx">🛢&nbsp;WTI&nbsp;'
             f'<span style="color:#f59e0b">${_cr_usd:,.2f}</span>'
             + (f'&nbsp;<span style="color:#94a3b8">₹{_cr_inr:,.0f}</span>' if _cr_inr else "")
             + '</span>'
         )
     elif _cr_inr:
         items.append(
-            f'<span class="tb-cx">🛢&nbsp;Crude&nbsp;'
+            f'<span class="tb-cx">🛢&nbsp;WTI&nbsp;'
             f'<span style="color:#f59e0b">₹{_cr_inr:,.1f}</span></span>'
+        )
+
+    # ── 4b. Brent Crude ───────────────────────────────────────────────────
+    _brent_usd_bn = st.session_state.get("_brent_usd")
+    if _brent_usd_bn:
+        items.append(
+            f'<span class="tb-cx">🛢&nbsp;Brent&nbsp;'
+            f'<span style="color:#f97316">${_brent_usd_bn:,.2f}</span></span>'
+        )
+
+    # ── 4c. Natural Gas ───────────────────────────────────────────────────
+    _ng_usd_bn = st.session_state.get("_natgas_usd")
+    if _ng_usd_bn:
+        items.append(
+            f'<span class="tb-cx">⛽&nbsp;NatGas&nbsp;'
+            f'<span style="color:#a78bfa">${_ng_usd_bn:,.3f}</span></span>'
         )
 
     # ── 5. Nifty PCR ──────────────────────────────────────────────────────
