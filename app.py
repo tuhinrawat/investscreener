@@ -212,6 +212,9 @@ def _load_kite_from_user(user: dict) -> None:
     """Populate Kite session_state from a validated users row."""
     st.session_state["kite_api_key"]    = user.get("kite_api_key",    "")
     st.session_state["kite_api_secret"] = user.get("kite_api_secret", "")
+    # Also seed AI keys so sidebar pre-fills without a round-trip
+    st.session_state["_db_openrouter_key"] = user.get("openrouter_key", "")
+    st.session_state["_db_openai_key"]     = user.get("openai_key",     "")
     st.session_state["kite_user_id"]    = user.get("kite_user_id",    "")
     token = user.get("kite_access_token", "")
     fresh = _auth.is_kite_token_fresh(user.get("kite_token_updated_at"))
@@ -1030,8 +1033,18 @@ st.sidebar.caption(
     "sentiment, and macro analysis. OpenRouter (Perplexity) uses live web search."
 )
 
-# Load persisted keys
-_ai_keys = _ai.load_keys()
+# Load persisted keys — prefer DB (survives redeployments), fall back to local file
+_logged_in_uid = st.session_state.get("user_id")
+if _logged_in_uid:
+    _ai_keys_db = db.get_ai_keys(_logged_in_uid)
+    # Merge: DB takes priority; fill blanks from local file fallback
+    _ai_keys_local = _ai.load_keys()
+    _ai_keys = {
+        "openrouter_key": _ai_keys_db.get("openrouter_key") or _ai_keys_local.get("openrouter_key", ""),
+        "openai_key":     _ai_keys_db.get("openai_key")     or _ai_keys_local.get("openai_key", ""),
+    }
+else:
+    _ai_keys = _ai.load_keys()
 
 _or_key = st.sidebar.text_input(
     "OpenRouter API Key",
@@ -1048,9 +1061,11 @@ _oa_key = st.sidebar.text_input(
     key="sidebar_oa_key",
 )
 
-# Save keys whenever they change
+# Save keys whenever they change — write to DB (primary) and local file (dev fallback)
 if _or_key != _ai_keys.get("openrouter_key", "") or _oa_key != _ai_keys.get("openai_key", ""):
-    _ai.save_keys(_oa_key, _or_key)
+    _ai.save_keys(_oa_key, _or_key)  # local file
+    if _logged_in_uid:
+        db.update_ai_keys(_logged_in_uid, _or_key, _oa_key)  # DB (cloud-safe)
 
 # Show connection status
 _ai_client, _ai_provider = _ai.get_client(_oa_key, _or_key)
@@ -7394,25 +7409,47 @@ def _fetch_fx_commodity():
     _HDR = {"User-Agent": "Mozilla/5.0 (compatible; screener-app/1.0)"}
 
     # ── USD / INR ─────────────────────────────────────────────────────────
-    # Source 1: open.er-api.com — free, no auth, updated every few minutes
+    # Priority 1: Kite CDS:USDINR — exact NSE-traded rate, same as Kite app
+    _fx_set = False
     try:
-        _r = _req_fx.get("https://open.er-api.com/v6/latest/USD",
-                         headers=_HDR, timeout=4)
-        _rate = (_r.json().get("rates") or {}).get("INR")
-        if _rate:
-            st.session_state["_usdinr_ltp"] = float(_rate)
+        _kc_fx = st.session_state.get("kite_client")
+        if _kc_fx and getattr(_kc_fx, "authenticated", False):
+            _fx_raw = _kc_fx.kite.ltp(["CDS:USDINR25MAYFUT"])
+            _rate   = (_fx_raw.get("CDS:USDINR25MAYFUT") or {}).get("last_price")
+            if not _rate:
+                # Try spot / nearest expiry
+                _fx_raw2 = _kc_fx.kite.ltp(["CDS:USDINR"])
+                _rate = (_fx_raw2.get("CDS:USDINR") or {}).get("last_price")
+            if _rate and float(_rate) > 1:
+                st.session_state["_usdinr_ltp"] = float(_rate)
+                _fx_set = True
     except Exception:
         pass
 
-    # Source 2: Kite CDS segment (bonus — only works if user has currency derivatives)
-    if not st.session_state.get("_usdinr_ltp"):
+    # Priority 2: Yahoo Finance USDINR=X — reflects Indian market rate (~95)
+    if not _fx_set:
         try:
-            _kc_fx = st.session_state.get("kite_client")
-            if _kc_fx and getattr(_kc_fx, "authenticated", False):
-                _fx_raw = _kc_fx.kite.ltp(["CDS:USDINR"])
-                _rate   = (_fx_raw.get("CDS:USDINR") or {}).get("last_price")
-                if _rate:
-                    st.session_state["_usdinr_ltp"] = float(_rate)
+            _yf_fx = _req_fx.get(
+                "https://query1.finance.yahoo.com/v8/finance/chart/USDINR=X"
+                "?interval=1d&range=1d",
+                headers=_HDR, timeout=5,
+            )
+            _meta_fx = (_yf_fx.json().get("chart", {}).get("result") or [{}])[0].get("meta", {})
+            _rate = _meta_fx.get("regularMarketPrice")
+            if _rate and float(_rate) > 1:
+                st.session_state["_usdinr_ltp"] = float(_rate)
+                _fx_set = True
+        except Exception:
+            pass
+
+    # Priority 3: open.er-api.com (interbank mid-market, last resort)
+    if not _fx_set:
+        try:
+            _r = _req_fx.get("https://open.er-api.com/v6/latest/USD",
+                             headers=_HDR, timeout=4)
+            _rate = (_r.json().get("rates") or {}).get("INR")
+            if _rate:
+                st.session_state["_usdinr_ltp"] = float(_rate)
         except Exception:
             pass
 

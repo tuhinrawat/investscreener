@@ -347,10 +347,22 @@ def init_schema():
                 kite_user_id            VARCHAR DEFAULT '',
                 kite_access_token       VARCHAR DEFAULT '',
                 kite_token_updated_at   TIMESTAMP,
+                openrouter_key          VARCHAR DEFAULT '',
+                openai_key              VARCHAR DEFAULT '',
                 created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_login_at           TIMESTAMP
             );
         """)
+        # Migrate existing tables that may not have the AI key columns yet
+        for _col, _dflt in [("openrouter_key", "''"), ("openai_key", "''")] :
+            cur.execute("""
+                DO $$ BEGIN
+                    ALTER TABLE users ADD COLUMN IF NOT EXISTS openrouter_key VARCHAR DEFAULT '';
+                    ALTER TABLE users ADD COLUMN IF NOT EXISTS openai_key      VARCHAR DEFAULT '';
+                EXCEPTION WHEN others THEN NULL;
+                END $$;
+            """)
+            break  # single idempotent block is enough
         cur.execute("""
             CREATE TABLE IF NOT EXISTS user_sessions (
                 id              BIGSERIAL PRIMARY KEY,
@@ -1667,7 +1679,8 @@ def get_user_by_username(username: str) -> dict | None:
         cur.execute(
             "SELECT id, username, password_hash, kite_api_key, kite_api_secret, "
             "       kite_user_id, kite_access_token, kite_token_updated_at, "
-            "       created_at, last_login_at "
+            "       created_at, last_login_at, "
+            "       COALESCE(openrouter_key,''), COALESCE(openai_key,'') "
             "FROM users WHERE username = %s",
             [username.strip().lower()],
         )
@@ -1685,6 +1698,8 @@ def get_user_by_username(username: str) -> dict | None:
             "kite_token_updated_at": row[7],
             "created_at":            row[8],
             "last_login_at":         row[9],
+            "openrouter_key":        row[10] or "",
+            "openai_key":            row[11] or "",
         }
     finally:
         cur.close()
@@ -1724,7 +1739,8 @@ def get_user_by_session(session_token: str) -> dict | None:
         cur.execute(
             """SELECT u.id, u.username, u.password_hash, u.kite_api_key,
                       u.kite_api_secret, u.kite_user_id, u.kite_access_token,
-                      u.kite_token_updated_at, u.created_at, u.last_login_at
+                      u.kite_token_updated_at, u.created_at, u.last_login_at,
+                      COALESCE(u.openrouter_key,''), COALESCE(u.openai_key,'')
                FROM user_sessions s
                JOIN users u ON s.user_id = u.id
                WHERE s.session_token = %s""",
@@ -1753,6 +1769,8 @@ def get_user_by_session(session_token: str) -> dict | None:
             "kite_token_updated_at": row[7],
             "created_at":            row[8],
             "last_login_at":         row[9],
+            "openrouter_key":        row[10] or "",
+            "openai_key":            row[11] or "",
         }
     finally:
         cur.close()
@@ -1830,6 +1848,42 @@ def update_kite_auth(user_id: int, kite_user_id: str, access_token: str) -> None
     except Exception:
         conn.rollback()
         raise
+    finally:
+        cur.close()
+        release_conn(conn)
+
+
+def get_ai_keys(user_id: int) -> dict:
+    """Return stored OpenRouter and OpenAI keys for the user."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT openrouter_key, openai_key FROM users WHERE id = %s",
+                [user_id],
+            )
+            row = cur.fetchone()
+            if row:
+                return {"openrouter_key": row[0] or "", "openai_key": row[1] or ""}
+            return {"openrouter_key": "", "openai_key": ""}
+    except Exception:
+        return {"openrouter_key": "", "openai_key": ""}
+    finally:
+        release_conn(conn)
+
+
+def update_ai_keys(user_id: int, openrouter_key: str, openai_key: str) -> None:
+    """Persist AI API keys in the users table (stored securely in Neon PostgreSQL)."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "UPDATE users SET openrouter_key = %s, openai_key = %s WHERE id = %s",
+            [openrouter_key.strip(), openai_key.strip(), user_id],
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
     finally:
         cur.close()
         release_conn(conn)
