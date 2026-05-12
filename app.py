@@ -2010,6 +2010,15 @@ def _market_pulse_header():
 
 _market_pulse_header()
 
+# ── Auto outcome-check for yesterday's signals (runs once per session) ────────
+if not st.session_state.get("_signal_outcomes_checked"):
+    try:
+        _oc_uid = st.session_state.get("kite_user_id", "")
+        db.check_signal_outcomes(user_id=_oc_uid)
+    except Exception:
+        pass
+    st.session_state["_signal_outcomes_checked"] = True
+
 # ============================================================
 # TAB LAYOUT — Screener | Trade Signals | Activity Log
 # ============================================================
@@ -8237,6 +8246,143 @@ def _activity_log_live():
                         st.markdown(_ins)
                 else:
                     st.caption("No strongly conclusive patterns yet — keep trading and re-compute.")
+
+            # ── Signal Quality Scorecard ─────────────────────────────────────
+            st.markdown("---")
+            _sq_hdr_col, _sq_btn_col = st.columns([3, 1])
+            with _sq_hdr_col:
+                st.subheader("📡 Signal Quality Scorecard")
+                st.caption(
+                    "Tracks every signal the screener generates — not just the ones you trade. "
+                    "Checks whether the entry price would have been hit and whether the trade "
+                    "would have won. Helps you see if the signals themselves are sound, "
+                    "independent of your execution decisions."
+                )
+            with _sq_btn_col:
+                if st.button("🔄 Check Outcomes", type="secondary",
+                             use_container_width=True, key="btn_check_signal_outcomes",
+                             help="Run outcome check now for any pending signals"):
+                    with st.spinner("Checking outcomes…"):
+                        try:
+                            _n_checked = db.check_signal_outcomes(user_id=_uid)
+                            st.success(f"Done — {_n_checked} signals evaluated.")
+                            st.rerun()
+                        except Exception as _sqe:
+                            st.error(f"Outcome check failed: {_sqe}")
+
+            _sq_days = st.slider("Look-back window (days)", 7, 90, 30, key="sq_days_slider")
+
+            try:
+                _sc = db.get_signal_scorecard(user_id=_uid, days=_sq_days)
+            except Exception as _sc_err:
+                _sc = None
+                st.error(f"Could not load scorecard: {_sc_err}")
+
+            if not _sc or _sc.get("total_signals", 0) == 0:
+                st.info(
+                    "No signal data yet. Signals are captured automatically on each Quick Refresh "
+                    "or Signal-Only Refresh. Run one of those and check back tomorrow.",
+                    icon="📡",
+                )
+            elif _sc:
+                import pandas as _scd_pd
+
+                # ── Top-level KPIs ────────────────────────────────────────────
+                _kpi1, _kpi2, _kpi3, _kpi4 = st.columns(4)
+                _kpi1.metric(
+                    "Total Signals",
+                    f"{_sc.get('total_signals', 0):,}",
+                    help=f"Actionable signals generated in last {_sq_days} days",
+                )
+                _entry_hit = _sc.get("entry_hit_rate")
+                _kpi2.metric(
+                    "Entry Hit Rate",
+                    f"{_entry_hit:.1f}%" if _entry_hit is not None else "—",
+                    help="% of signals where price reached the entry level",
+                )
+                _theo_wr = _sc.get("theoretical_win_rate")
+                _kpi3.metric(
+                    "Signal Win Rate",
+                    f"{_theo_wr:.1f}%" if _theo_wr is not None else "—",
+                    help="% of entered signals that hit T1 before stop-loss (pessimistic daily rule)",
+                )
+                _avg_pnl_top = _sc.get("avg_theoretical_pnl")
+                _kpi4.metric(
+                    "Avg Signal P&L",
+                    f"{_avg_pnl_top:+.2f}%" if _avg_pnl_top is not None else "—",
+                    help="Average theoretical P&L % for signals where entry was hit",
+                )
+
+                # Insight callout when win rate is clearly strong or weak
+                if _theo_wr is not None:
+                    if _theo_wr >= 60:
+                        st.success(
+                            f"Signals are performing well — **{_theo_wr:.0f}%** theoretical win rate. "
+                            "Execution quality and trade selection are the key levers now.",
+                            icon="✅",
+                        )
+                    elif _theo_wr <= 40:
+                        st.warning(
+                            f"Signal win rate is only **{_theo_wr:.0f}%** — consider reviewing signal "
+                            "thresholds via the Readjust Algo button.",
+                            icon="⚠️",
+                        )
+
+                st.markdown("")
+
+                # ── By signal type ────────────────────────────────────────────
+                _by_type  = _sc.get("by_signal_type", {})
+                _by_conf  = _sc.get("by_confidence_band", {})
+                _by_setup = _sc.get("by_setup", {})
+                _by_dow   = _sc.get("by_day_of_week", {})
+
+                _sq_c1, _sq_c2 = st.columns(2)
+
+                def _fmt_grp_rows(data, key_label):
+                    return [
+                        {
+                            key_label: k or "—",
+                            "Count":     v.get("total", 0),
+                            "Hit %":     f"{v['entry_hit_rate']:.0f}%" if v.get("entry_hit_rate") is not None else "—",
+                            "Win %":     f"{v['t1_hit_rate']:.0f}%"   if v.get("t1_hit_rate")   is not None else "—",
+                            "Avg P&L %": f"{v['avg_pnl']:+.2f}%"      if v.get("avg_pnl")       is not None else "—",
+                        }
+                        for k, v in data.items()
+                    ]
+
+                with _sq_c1:
+                    st.markdown("##### By Signal Type")
+                    if _by_type:
+                        st.dataframe(_scd_pd.DataFrame(_fmt_grp_rows(_by_type, "Signal")),
+                                     hide_index=True, use_container_width=True)
+                    else:
+                        st.caption("No data yet.")
+
+                    st.markdown("##### By Day of Week")
+                    _dow_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+                    if _by_dow:
+                        _dow_rows = sorted(
+                            _fmt_grp_rows(_by_dow, "Day"),
+                            key=lambda r: _dow_order.index(r["Day"]) if r["Day"] in _dow_order else 9
+                        )
+                        st.dataframe(_scd_pd.DataFrame(_dow_rows), hide_index=True, use_container_width=True)
+                    else:
+                        st.caption("No data yet.")
+
+                with _sq_c2:
+                    st.markdown("##### By Confidence Band")
+                    if _by_conf:
+                        st.dataframe(_scd_pd.DataFrame(_fmt_grp_rows(_by_conf, "Band")),
+                                     hide_index=True, use_container_width=True)
+                    else:
+                        st.caption("No data yet.")
+
+                    st.markdown("##### By Setup")
+                    if _by_setup:
+                        st.dataframe(_scd_pd.DataFrame(_fmt_grp_rows(_by_setup, "Setup")),
+                                     hide_index=True, use_container_width=True)
+                    else:
+                        st.caption("No data yet.")
 
 
 # ============================================================

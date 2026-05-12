@@ -445,6 +445,42 @@ def init_schema():
             );
         """)
 
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS signal_log (
+                id                  BIGSERIAL PRIMARY KEY,
+                kite_user_id        VARCHAR     NOT NULL DEFAULT '',
+                snapshot_at         TIMESTAMP   NOT NULL,
+                trade_date          DATE        NOT NULL,
+                tradingsymbol       VARCHAR     NOT NULL,
+                instrument_token    BIGINT,
+                signal_type         VARCHAR     NOT NULL,
+                setup_type          VARCHAR,
+                entry               DOUBLE PRECISION,
+                stop                DOUBLE PRECISION,
+                t1                  DOUBLE PRECISION,
+                t2                  DOUBLE PRECISION,
+                rec_rr              DOUBLE PRECISION,
+                confidence          SMALLINT,
+                rsi_at_snapshot     DOUBLE PRECISION,
+                atr_ratio           DOUBLE PRECISION,
+                composite_score     DOUBLE PRECISION,
+                sector              VARCHAR,
+                nifty_pct_chg       DOUBLE PRECISION,
+                -- outcome fields (filled next morning)
+                entry_hit           BOOLEAN,
+                t1_hit              BOOLEAN,
+                stop_hit            BOOLEAN,
+                theoretical_pnl_pct DOUBLE PRECISION,
+                theoretical_rr      DOUBLE PRECISION,
+                outcome_checked_at  TIMESTAMP,
+                UNIQUE (kite_user_id, trade_date, tradingsymbol, signal_type, entry)
+            );
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_signal_log_user_date
+                ON signal_log (kite_user_id, trade_date DESC)
+        """)
+
         # One-time migration: UTC → IST shift on logged_at
         cur.execute("SELECT value FROM _db_meta WHERE key = 'logged_at_utc_to_ist_done'")
         if not cur.fetchone():
@@ -1869,6 +1905,319 @@ def get_learned_signal_adjustment(
                 return {"win_rate": row[0], "opt_rsi": row[1], "opt_min_rr": row[2],
                         "source": dim, "n": row[3]}
         return {}
+    finally:
+        cur.close()
+        release_conn(conn)
+
+
+# ─── Signal Quality Tracking ─────────────────────────────────────────────────
+
+def save_signal_snapshot(metrics_df, user_id: str = "", nifty_pct_chg: float | None = None) -> int:
+    """
+    Snapshot all actionable signals from the current metrics DataFrame into
+    signal_log.  Called after every quick_refresh / refresh_signals_only so
+    every signal generated during market hours is recorded — whether or not
+    a trade is ever triggered from it.
+
+    Only inserts rows for signals that are BUY_ABOVE / SELL_BELOW / BUY_ORB /
+    SELL_ORB / BUY (swing). AVOID rows are skipped — they're not actionable.
+
+    Uses ON CONFLICT DO NOTHING so re-running after a refresh won't duplicate.
+    Returns the number of new rows inserted.
+    """
+    import datetime as _dt
+    _IST   = _dt.timezone(_dt.timedelta(hours=5, minutes=30))
+    now_ts = _dt.datetime.now(_IST).replace(tzinfo=None)
+    today  = now_ts.date()
+
+    if metrics_df is None or metrics_df.empty:
+        return 0
+
+    ACTIONABLE = {"BUY_ABOVE", "SELL_BELOW", "BUY_ORB", "SELL_ORB", "BUY"}
+
+    rows = []
+    for _, r in metrics_df.iterrows():
+        ltp = float(r.get("ltp") or 0) or 1.0
+        atr = float(r.get("atr_14") or 0)
+        atr_ratio = round(atr / ltp, 5) if ltp else None
+
+        # Intraday signal
+        it_sig = str(r.get("intraday_signal") or "")
+        if it_sig in ACTIONABLE:
+            rows.append((
+                user_id, now_ts, today,
+                str(r.get("tradingsymbol", "")),
+                r.get("instrument_token"),
+                it_sig, "INTRADAY",
+                r.get("intraday_entry"), r.get("intraday_stop"),
+                r.get("intraday_t1"),   r.get("intraday_t2"),
+                None,                   # rec_rr
+                r.get("intraday_confidence"),
+                r.get("rsi_14"), atr_ratio,
+                r.get("composite_score"), None, nifty_pct_chg,
+            ))
+
+        # Swing signal
+        sw_sig = str(r.get("swing_signal") or "")
+        if sw_sig in ACTIONABLE:
+            rows.append((
+                user_id, now_ts, today,
+                str(r.get("tradingsymbol", "")),
+                r.get("instrument_token"),
+                sw_sig, "SWING",
+                r.get("swing_entry"), r.get("swing_stop"),
+                r.get("swing_t1"),   r.get("swing_t2"),
+                r.get("swing_rr"),
+                None,                   # no confidence for swing
+                r.get("rsi_14"), atr_ratio,
+                r.get("composite_score"), None, nifty_pct_chg,
+            ))
+
+    if not rows:
+        return 0
+
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        inserted = 0
+        for row in rows:
+            cur.execute("""
+                INSERT INTO signal_log (
+                    kite_user_id, snapshot_at, trade_date,
+                    tradingsymbol, instrument_token,
+                    signal_type, setup_type,
+                    entry, stop, t1, t2, rec_rr,
+                    confidence, rsi_at_snapshot, atr_ratio,
+                    composite_score, sector, nifty_pct_chg
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (kite_user_id, trade_date, tradingsymbol, signal_type, entry)
+                DO NOTHING
+            """, row)
+            inserted += cur.rowcount
+        conn.commit()
+        return inserted
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        release_conn(conn)
+
+
+def check_signal_outcomes(user_id: str = "") -> int:
+    """
+    For every signal_log row from BEFORE today whose outcome hasn't been
+    checked yet, look up that day's OHLCV candle and fill in:
+        entry_hit, t1_hit, stop_hit, theoretical_pnl_pct, theoretical_rr
+
+    Logic (pessimistic — assumes worst-case ordering):
+      Long (BUY_ABOVE / BUY / BUY_ORB):
+        entry_hit  = day_high >= entry
+        stop_hit   = entry_hit AND day_low  <= stop  (stop hit before T1 if both in range)
+        t1_hit     = entry_hit AND NOT stop_hit AND day_high >= t1
+
+      Short (SELL_BELOW / SELL_ORB):
+        entry_hit  = day_low  <= entry
+        stop_hit   = entry_hit AND day_high >= stop
+        t1_hit     = entry_hit AND NOT stop_hit AND day_low <= t1
+
+    Returns number of rows updated.
+    """
+    import datetime as _dt
+    _IST  = _dt.timezone(_dt.timedelta(hours=5, minutes=30))
+    today = _dt.datetime.now(_IST).date()
+
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        # Fetch unchecked rows from past days
+        clauses = ["trade_date < %s", "outcome_checked_at IS NULL"]
+        params: list = [str(today)]
+        if user_id:
+            clauses.append("kite_user_id = %s")
+            params.append(user_id)
+        cur.execute(
+            "SELECT id, tradingsymbol, instrument_token, signal_type, "
+            "       entry, stop, t1, rec_rr, trade_date "
+            "FROM signal_log WHERE " + " AND ".join(clauses),
+            params,
+        )
+        pending = cur.fetchall()
+        if not pending:
+            return 0
+
+        # Group by (instrument_token, trade_date) to batch OHLCV lookups
+        from collections import defaultdict as _dd
+        by_token_date: dict = _dd(list)
+        for row in pending:
+            rid, sym, tok, sig_type, entry, stop, t1, rec_rr, tdate = row
+            if tok:
+                by_token_date[(int(tok), str(tdate))].append(row)
+
+        updated = 0
+        now_ts  = _dt.datetime.now(_IST).replace(tzinfo=None)
+
+        for (tok, tdate), rows_group in by_token_date.items():
+            # Fetch that day's candle
+            cur.execute(
+                "SELECT high, low FROM daily_ohlcv "
+                "WHERE instrument_token = %s AND date = %s LIMIT 1",
+                [tok, tdate],
+            )
+            candle = cur.fetchone()
+            if not candle:
+                continue
+            day_high, day_low = float(candle[0] or 0), float(candle[1] or 0)
+
+            for rid, sym, _, sig_type, entry, stop, t1, rec_rr, _ in rows_group:
+                if not entry:
+                    continue
+                entry = float(entry)
+                stop  = float(stop)  if stop else None
+                t1    = float(t1)    if t1   else None
+
+                is_long = sig_type in ("BUY_ABOVE", "BUY", "BUY_ORB")
+
+                if is_long:
+                    entry_hit = day_high >= entry if entry else False
+                    stop_hit  = (entry_hit and stop is not None and day_low  <= stop)
+                    t1_hit    = (entry_hit and not stop_hit and t1 is not None and day_high >= t1)
+                else:
+                    entry_hit = day_low  <= entry if entry else False
+                    stop_hit  = (entry_hit and stop is not None and day_high >= stop)
+                    t1_hit    = (entry_hit and not stop_hit and t1 is not None and day_low <= t1)
+
+                # Theoretical P&L
+                theo_pnl = None
+                theo_rr  = None
+                if entry_hit and entry > 0:
+                    if t1_hit and t1:
+                        raw = (t1 - entry) / entry * 100
+                        theo_pnl = raw if is_long else -raw
+                    elif stop_hit and stop:
+                        raw = (stop - entry) / entry * 100
+                        theo_pnl = raw if is_long else -raw
+                    if stop and t1 and abs(entry - stop) > 0:
+                        theo_rr = abs(t1 - entry) / abs(entry - stop)
+
+                cur.execute("""
+                    UPDATE signal_log
+                    SET entry_hit=%(eh)s, t1_hit=%(th)s, stop_hit=%(sh)s,
+                        theoretical_pnl_pct=%(pnl)s, theoretical_rr=%(rr)s,
+                        outcome_checked_at=%(ts)s
+                    WHERE id=%(rid)s
+                """, {
+                    "eh": entry_hit, "th": t1_hit, "sh": stop_hit,
+                    "pnl": theo_pnl, "rr": theo_rr,
+                    "ts": now_ts, "rid": rid,
+                })
+                updated += 1
+
+        conn.commit()
+        return updated
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        release_conn(conn)
+
+
+def get_signal_scorecard(user_id: str = "", days: int = 30) -> dict:
+    """
+    Aggregate signal_log outcomes into scorecard metrics.
+
+    Returns a dict with:
+      total_signals          — all snapshots with outcomes checked
+      entry_hit_rate         — % where LTP actually crossed the entry level
+      theoretical_win_rate   — % where T1 was hit (among entry-hit signals)
+      theoretical_stop_rate  — % where stop was hit first
+      avg_theoretical_pnl    — avg P&L % on entry-hit signals
+      by_signal_type         — breakdown per signal_type
+      by_confidence_band     — win rate per confidence bucket (5-6 / 7-8 / 9-10)
+      by_setup               — breakdown per setup_type
+      by_day_of_week         — win rate per weekday
+      executed_vs_theoretical — comparison dict
+    """
+    import datetime as _dt
+    _IST  = _dt.timezone(_dt.timedelta(hours=5, minutes=30))
+    since = str((_dt.datetime.now(_IST).date() - _dt.timedelta(days=days)))
+
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        clauses = [
+            "outcome_checked_at IS NOT NULL",
+            "trade_date >= %s",
+        ]
+        params: list = [since]
+        if user_id:
+            clauses.append("kite_user_id = %s")
+            params.append(user_id)
+
+        cur.execute(
+            "SELECT signal_type, setup_type, confidence, trade_date, "
+            "       entry_hit, t1_hit, stop_hit, theoretical_pnl_pct, theoretical_rr "
+            "FROM signal_log WHERE " + " AND ".join(clauses),
+            params,
+        )
+        rows = cur.fetchall()
+        if not rows:
+            return {}
+
+        import pandas as _pd
+        df = _pd.DataFrame(rows, columns=[
+            "signal_type", "setup_type", "confidence", "trade_date",
+            "entry_hit", "t1_hit", "stop_hit", "theo_pnl", "theo_rr",
+        ])
+        for c in ("confidence", "theo_pnl", "theo_rr"):
+            df[c] = _pd.to_numeric(df[c], errors="coerce")
+        df["trade_date"] = _pd.to_datetime(df["trade_date"])
+        df["day_of_week"] = df["trade_date"].dt.day_name()
+
+        total = len(df)
+        hit   = df[df["entry_hit"] == True]
+        n_hit = len(hit)
+
+        def _conf_band(v):
+            if _pd.isna(v): return "UNKNOWN"
+            v = int(v)
+            if v >= 9: return "9-10"
+            if v >= 7: return "7-8"
+            if v >= 5: return "5-6"
+            return "<5"
+        df["conf_band"] = df["confidence"].apply(_conf_band)
+
+        def _grp_stats(sub):
+            n = len(sub)
+            h = sub[sub["entry_hit"] == True]
+            nh = len(h)
+            return {
+                "total":       n,
+                "entry_hit_n": nh,
+                "entry_hit_rate": round(nh / n * 100, 1) if n else None,
+                "t1_hit_rate":    round(h["t1_hit"].sum() / nh * 100, 1) if nh else None,
+                "stop_hit_rate":  round(h["stop_hit"].sum() / nh * 100, 1) if nh else None,
+                "avg_pnl":        round(float(h["theo_pnl"].dropna().mean()), 2) if nh and h["theo_pnl"].notna().any() else None,
+            }
+
+        by_sig  = {k: _grp_stats(g) for k, g in df.groupby("signal_type")}
+        by_setup = {k: _grp_stats(g) for k, g in df.groupby("setup_type")}
+        by_conf = {k: _grp_stats(g) for k, g in df.groupby("conf_band")}
+        by_dow  = {k: _grp_stats(g) for k, g in df.groupby("day_of_week")}
+
+        return {
+            "total_signals":        total,
+            "entry_hit_rate":       round(n_hit / total * 100, 1) if total else None,
+            "theoretical_win_rate": round(hit["t1_hit"].sum() / n_hit * 100, 1) if n_hit else None,
+            "theoretical_stop_rate":round(hit["stop_hit"].sum() / n_hit * 100, 1) if n_hit else None,
+            "avg_theoretical_pnl":  round(float(hit["theo_pnl"].dropna().mean()), 2) if n_hit and hit["theo_pnl"].notna().any() else None,
+            "by_signal_type":       by_sig,
+            "by_setup":             by_setup,
+            "by_confidence_band":   by_conf,
+            "by_day_of_week":       by_dow,
+            "days":                 days,
+        }
     finally:
         cur.close()
         release_conn(conn)

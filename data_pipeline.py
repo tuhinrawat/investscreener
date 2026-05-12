@@ -675,6 +675,11 @@ def quick_refresh(client: "KiteClient | None" = None) -> dict:
     metrics["last_updated"] = _now_ist()
     db.replace_metrics(metrics)
 
+    try:
+        db.save_signal_snapshot(metrics, user_id="", nifty_pct_chg=None)
+    except Exception:
+        pass
+
     return {
         "stocks_updated": updated,
         "signals_recomputed": sigs_updated,
@@ -748,6 +753,11 @@ def refresh_signals_only(progress_callback=None, user_id: str = "") -> dict:
 
     metrics["last_updated"] = _now_ist()
     db.replace_metrics(metrics)
+
+    try:
+        db.save_signal_snapshot(metrics, user_id=user_id, nifty_pct_chg=None)
+    except Exception:
+        pass
 
     return {
         "signals_updated": updated,
