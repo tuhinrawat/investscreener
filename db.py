@@ -1028,56 +1028,6 @@ def get_stored_ltps(symbols: list[str]) -> dict[str, float]:
         release_conn(conn)
 
 
-def get_hard_exit_trades_today(user_id: str = "") -> list[dict]:
-    """
-    Return today's closed trades where actual_exit matches rec_stop within 1%
-    — the fingerprint of the stop-used-as-exit bug.  No notes filter so it
-    catches trades closed via any mechanism (hard exit, manual EOD, etc.).
-    """
-    import datetime as _dt
-    _IST  = _dt.timezone(_dt.timedelta(hours=5, minutes=30))
-    today = str(_dt.datetime.now(_IST).date())
-
-    conn = get_conn()
-    cur  = conn.cursor()
-    try:
-        clauses = [
-            "DATE(opened_at AT TIME ZONE 'Asia/Kolkata') = %s",
-            "status = 'CLOSED'",   # STOPPED_OUT = genuine stop hit, price is correct
-            "actual_exit IS NOT NULL",
-            "rec_stop IS NOT NULL",
-            "rec_stop > 0",
-        ]
-        params: list = [today]
-        if user_id:
-            clauses.append("kite_user_id = %s")
-            params.append(user_id)
-
-        cur.execute(
-            "SELECT id, tradingsymbol, signal_type, quantity, "
-            "       actual_entry, actual_exit, rec_stop, pnl_amount, "
-            "       is_paper_trade, notes "
-            "FROM trade_log WHERE " + " AND ".join(clauses),
-            params,
-        )
-        rows = cur.fetchall()
-        results = []
-        for r in rows:
-            tid, sym, sig, qty, ae, ax, rs, pnl, is_paper, notes = r
-            ax_f, rs_f = float(ax), float(rs)
-            # actual_exit within 1% of rec_stop = stop was used as exit price
-            if abs(ax_f - rs_f) / max(rs_f, 0.01) < 0.01:
-                results.append({
-                    "id": tid, "tradingsymbol": sym, "signal_type": sig,
-                    "quantity": qty, "actual_entry": ae, "actual_exit": ax_f,
-                    "rec_stop": rs_f, "pnl_amount": pnl,
-                    "is_paper_trade": is_paper, "notes": notes or "",
-                })
-        return results
-    finally:
-        cur.close()
-        release_conn(conn)
-
 
 def refix_trade_exit(trade_id: int, new_exit: float) -> dict:
     """
