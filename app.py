@@ -8064,7 +8064,7 @@ def _activity_log_live():
                 _pm_hdr.markdown("**🔍 Post-Mortem: Recommended vs Executed**")
                 _pm_labels = []
                 for _, _pm_r in _closed_arch.sort_values("logged_at", ascending=False).iterrows():
-                    _d = str((_pm_r.get("trade_date") or _pm_r.get("logged_at") or "")[:10])
+                    _d = str(_pm_r.get("trade_date") or _pm_r.get("logged_at") or "")[:10]
                     _pnl_s = (f"₹{float(_pm_r['pnl_amount']):+,.0f}"
                               if _pm_r.get("pnl_amount") is not None and not _isna(_pm_r.get("pnl_amount"))
                               else "?")
