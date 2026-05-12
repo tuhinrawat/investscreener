@@ -891,6 +891,28 @@ if st.sidebar.button("📡 Refresh Signals (~30s)", use_container_width=True,
     except Exception as _e:
         st.sidebar.error(f"Failed: {_e}")
 
+# --- Push cached scan data (shown only when a checkpoint exists from a failed run)
+if data_pipeline.checkpoint_exists():
+    _ckpt_rows = data_pipeline.checkpoint_row_count()
+    st.sidebar.warning(
+        f"⚠️ {_ckpt_rows:,} unsaved candle rows from a previous scan. "
+        "Push them to DB without re-fetching Kite."
+    )
+    if st.sidebar.button("📤 Push Cached Scan to DB", use_container_width=True):
+        _ckpt_bar = st.sidebar.progress(0)
+        _ckpt_status = st.sidebar.empty()
+        try:
+            _pushed = data_pipeline.push_checkpoint(
+                progress_callback=lambda i, t, s: (
+                    _ckpt_bar.progress((i + 1) / max(t, 1)),
+                    _ckpt_status.caption(f"{i+1}/{t}: {s}"),
+                )
+            )
+            _ckpt_bar.progress(1.0)
+            st.sidebar.success(f"✓ {_pushed:,} rows pushed to DB successfully.")
+        except Exception as _ce:
+            st.sidebar.error(f"Push failed: {_ce}")
+
 # --- Full rescan button
 if st.sidebar.button("🔄 Full Rescan (~3-5 min)", use_container_width=True,
                      help="Re-pulls 400 days of history for all NSE EQ stocks. "

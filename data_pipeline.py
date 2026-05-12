@@ -15,8 +15,10 @@ Why split? Because they have wildly different latency profiles:
 """
 import io
 import json
+import pickle
 import time
 from datetime import datetime, timedelta, date, timezone
+from pathlib import Path
 from typing import Optional
 
 _IST = timezone(timedelta(hours=5, minutes=30))
@@ -27,6 +29,65 @@ def _now_ist() -> datetime:
 
 import pandas as pd
 from tqdm import tqdm
+
+# ── Scan checkpoint ───────────────────────────────────────────────────────────
+# After every stock fetch the candle rows are appended here.  If the DB push
+# fails (SSL drop, timeout, etc.) the data is NOT lost — it survives in this
+# file and can be re-pushed via push_checkpoint() without re-fetching Kite.
+_CHECKPOINT_PATH = Path("/tmp/_ohlcv_scan_checkpoint.pkl")
+
+
+def checkpoint_exists() -> bool:
+    return _CHECKPOINT_PATH.exists() and _CHECKPOINT_PATH.stat().st_size > 0
+
+
+def checkpoint_row_count() -> int:
+    if not checkpoint_exists():
+        return 0
+    try:
+        data = pickle.loads(_CHECKPOINT_PATH.read_bytes())
+        return len(data)
+    except Exception:
+        return 0
+
+
+def push_checkpoint(progress_callback=None) -> int:
+    """
+    Load candle rows saved by the last (possibly interrupted) scan and push
+    them to the DB in chunks.  Returns the number of rows pushed.
+    Clears the checkpoint file on success.
+    """
+    if not checkpoint_exists():
+        return 0
+    rows = pickle.loads(_CHECKPOINT_PATH.read_bytes())
+    if not rows:
+        _CHECKPOINT_PATH.unlink(missing_ok=True)
+        return 0
+    df = pd.DataFrame(rows)
+    chunk = 2000
+    total = len(df)
+    for i in range(0, total, chunk):
+        if progress_callback:
+            progress_callback(i, total, "pushing to DB…")
+        db.upsert_ohlcv(df.iloc[i: i + chunk])
+    _CHECKPOINT_PATH.unlink(missing_ok=True)
+    return total
+
+
+def _checkpoint_append(rows: list) -> None:
+    """Append a list of candle-row dicts to the checkpoint file."""
+    existing: list = []
+    if checkpoint_exists():
+        try:
+            existing = pickle.loads(_CHECKPOINT_PATH.read_bytes())
+        except Exception:
+            existing = []
+    existing.extend(rows)
+    _CHECKPOINT_PATH.write_bytes(pickle.dumps(existing))
+
+
+def clear_checkpoint() -> None:
+    _CHECKPOINT_PATH.unlink(missing_ok=True)
 
 import config
 import db
@@ -247,8 +308,8 @@ def fetch_historical_for_universe(
             if not candles:
                 fail_count += 1
                 continue
-            for c in candles:
-                all_candles.append({
+            new_rows = [
+                {
                     "instrument_token": token,
                     "date": c["date"].date() if hasattr(c["date"], "date") else c["date"],
                     "open": c["open"],
@@ -256,26 +317,32 @@ def fetch_historical_for_universe(
                     "low": c["low"],
                     "close": c["close"],
                     "volume": c["volume"],
-                })
+                }
+                for c in candles
+            ]
+            all_candles.extend(new_rows)
+            # Persist to checkpoint immediately — survives DB failures
+            _checkpoint_append(new_rows)
             success_count += 1
 
-            # Flush every ~20 stocks (~5,000 candles) so a crash loses at most
-            # 20 stocks of progress rather than 200. The incremental logic on
-            # restart skips anything already persisted, so this is safe to tune.
+            # Flush to DB every ~20 stocks and clear that portion from checkpoint
             if len(all_candles) > 5_000:
                 db.upsert_ohlcv(pd.DataFrame(all_candles))
                 all_candles = []
+                # Checkpoint still holds the full run; clear only after full success
 
         except Exception as e:
             fail_count += 1
-            # Capture the first error for diagnosis — surfaces auth/token issues
             if fail_count == 1:
                 first_error = str(e)
             continue
 
-    # Final flush
+    # Final DB flush
     if all_candles:
         db.upsert_ohlcv(pd.DataFrame(all_candles))
+
+    # All data committed — checkpoint no longer needed
+    clear_checkpoint()
 
     print(f"✓ History pulled: {success_count} success, {fail_count} failed")
     if success_count == 0 and fail_count > 0:
