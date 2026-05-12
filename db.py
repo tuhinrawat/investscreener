@@ -542,36 +542,79 @@ def upsert_instruments(df: pd.DataFrame):
         release_conn(conn)
 
 
+_OHLCV_SQL = """
+    INSERT INTO daily_ohlcv (instrument_token, date, open, high, low, close, volume)
+    VALUES %s
+    ON CONFLICT (instrument_token, date) DO UPDATE SET
+        open   = EXCLUDED.open,
+        high   = EXCLUDED.high,
+        low    = EXCLUDED.low,
+        close  = EXCLUDED.close,
+        volume = EXCLUDED.volume
+"""
+_UPSERT_CHUNK = 2000   # rows per commit — keeps each connection window short
+_UPSERT_RETRIES = 3    # retry on SSL drop with a fresh connection
+
+
 def upsert_ohlcv(df: pd.DataFrame):
-    """Append-or-replace daily candles using ON CONFLICT UPDATE."""
+    """
+    Append-or-replace daily candles.
+
+    Chunked into _UPSERT_CHUNK rows per commit so a long full-scan never
+    holds a single Neon connection open long enough for the SSL idle-timeout
+    to fire.  Each chunk is retried up to _UPSERT_RETRIES times with a fresh
+    connection on OperationalError / InterfaceError (SSL drop).
+    """
     if df.empty:
         return
-    conn = get_conn()
-    cur  = conn.cursor()
-    try:
-        cols  = ["instrument_token", "date", "open", "high", "low", "close", "volume"]
-        avail = [c for c in cols if c in df.columns]
-        rows  = [tuple(row[c] for c in avail) for _, row in df[avail].iterrows()]
-        psycopg2.extras.execute_values(
-            cur,
-            """INSERT INTO daily_ohlcv (instrument_token, date, open, high, low, close, volume)
-               VALUES %s
-               ON CONFLICT (instrument_token, date) DO UPDATE SET
-                   open   = EXCLUDED.open,
-                   high   = EXCLUDED.high,
-                   low    = EXCLUDED.low,
-                   close  = EXCLUDED.close,
-                   volume = EXCLUDED.volume""",
-            rows,
-            page_size=1000,
-        )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        cur.close()
-        release_conn(conn)
+    cols  = ["instrument_token", "date", "open", "high", "low", "close", "volume"]
+    avail = [c for c in cols if c in df.columns]
+    rows  = [tuple(row[c] for c in avail) for _, row in df[avail].iterrows()]
+
+    for chunk_start in range(0, len(rows), _UPSERT_CHUNK):
+        chunk = rows[chunk_start: chunk_start + _UPSERT_CHUNK]
+        last_exc = None
+        for attempt in range(_UPSERT_RETRIES):
+            conn = get_conn()          # always fresh from pool (pool rebuilds if dead)
+            cur  = conn.cursor()
+            try:
+                psycopg2.extras.execute_values(cur, _OHLCV_SQL, chunk, page_size=500)
+                conn.commit()
+                last_exc = None
+                break                  # success — move to next chunk
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
+                # SSL connection dropped — don't bother rolling back a dead conn
+                last_exc = exc
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                # Force pool rebuild so next get_conn() opens a fresh SSL session
+                global _pool
+                try:
+                    if _pool:
+                        _pool.closeall()
+                except Exception:
+                    pass
+                _pool = None
+            except Exception as exc:
+                last_exc = exc
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                break                  # non-retriable error — propagate below
+            finally:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+                try:
+                    release_conn(conn)
+                except Exception:
+                    pass
+        if last_exc is not None:
+            raise last_exc
 
 
 def replace_metrics(df: pd.DataFrame):
