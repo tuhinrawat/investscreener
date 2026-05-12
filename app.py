@@ -8329,9 +8329,9 @@ def _ticker_banner():
     import streamlit.components.v1 as _stc
 
     _inner_html = (
-        f'{_ws_badge}{_mkt_badge}'
+        f'<div id="__tb_badges" style="display:contents">{_ws_badge}{_mkt_badge}</div>'
         f'<div style="flex:1;overflow:hidden;height:100%;display:flex;align-items:center">'
-        f'<div style="display:inline-flex;white-space:nowrap;align-items:center;height:100%;'
+        f'<div id="__tb_scroll" style="display:inline-flex;white-space:nowrap;align-items:center;height:100%;'
         f'animation:_tbsc {_duration}s linear infinite;will-change:transform">'
         f'{_content_full}</div></div>'
     )
@@ -8339,6 +8339,13 @@ def _ticker_banner():
     # st.markdown strips <script> tags, so we use components.html (0-height iframe)
     # which executes JS and can reach window.parent.document to inject/update a
     # persistent <div id="__tb"> on the parent page body — never removed by Streamlit.
+    #
+    # On every tick we update only the inner content of #__tb_scroll and #__tb_badges
+    # rather than replacing el.innerHTML wholesale.  Replacing el.innerHTML destroys
+    # the animated div and recreates it, resetting the CSS translateX animation to
+    # position 0 each second — which is why the banner never scrolled past the first
+    # few stocks.  By updating only the children of the animated element (not the
+    # element itself) the CSS animation state is preserved across price updates.
     _stc.html(f"""
 <script>
 (function() {{
@@ -8361,14 +8368,25 @@ def _ticker_banner():
     ].join('');
     p.head.appendChild(s);
   }}
-  // Create banner element once, update innerHTML on every tick
   var el = p.getElementById('__tb');
   if (!el) {{
+    // First render: create the banner and set full structure
     el = p.createElement('div');
     el.id = '__tb';
     p.body.appendChild(el);
+    el.innerHTML = {_json.dumps(_inner_html)};
+  }} else {{
+    // Subsequent renders: update only content inside the animated div and badges.
+    // Leaving #__tb_scroll itself untouched preserves its CSS animation position.
+    var scroll = p.getElementById('__tb_scroll');
+    var badges = p.getElementById('__tb_badges');
+    if (scroll && badges) {{
+      scroll.innerHTML  = {_json.dumps(_content_full)};
+      badges.innerHTML  = {_json.dumps(_ws_badge + _mkt_badge)};
+    }} else {{
+      el.innerHTML = {_json.dumps(_inner_html)};
+    }}
   }}
-  el.innerHTML = {_json.dumps(_inner_html)};
 }})();
 </script>
 """, height=0, scrolling=False)
