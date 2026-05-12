@@ -7998,21 +7998,28 @@ def _activity_log_live():
 
         # ── Fix wrong exit prices ──────────────────────────────────────────
         if st.button("🔧 Fix Today's Exit Prices", key="_fix_exit_prices",
-                     help="Fetches latest Kite price for every closed trade today and corrects "
-                          "any exit recorded at the stop-loss price instead of actual LTP"):
-            _fix_kc  = st.session_state.get("kite_client")
-            _fix_uid = _uid
-            _fixed, _skipped, _errors = 0, 0, []
-            try:
-                _today_closed = db.get_hard_exit_trades_today(user_id=_fix_uid)
-            except Exception as _fte:
-                _today_closed = []
-                _errors.append(str(_fte))
-            if not _today_closed:
-                st.info("No exit-price mismatches found for today's closed trades.")
+                     help="For each closed trade today: fetches Kite last price, and if "
+                          "actual_exit matches rec_stop (stop used instead of LTP), corrects it"):
+            _fix_kc = st.session_state.get("kite_client")
+            _fixed, _errors = 0, []
+
+            # Use _closed_rows already loaded above — no extra DB query needed
+            _fixable = _closed_rows[
+                (_closed_rows["status"] == "CLOSED") &
+                (_closed_rows["rec_stop"].notna()) &
+                (_closed_rows["actual_exit"].notna()) &
+                (
+                    ((_closed_rows["actual_exit"] - _closed_rows["rec_stop"]).abs()
+                     / _closed_rows["rec_stop"].clip(lower=0.01)) < 0.01
+                )
+            ]
+
+            if _fixable.empty:
+                st.info("No exit-price mismatches found in today's closed trades.")
             else:
-                for _ft in _today_closed:
-                    _ft_sym = _ft["tradingsymbol"]
+                for _, _frow in _fixable.iterrows():
+                    _ft_sym = _frow["tradingsymbol"]
+                    _ft_id  = int(_frow["id"])
                     _ft_ltp = 0.0
                     try:
                         if _fix_kc and getattr(_fix_kc, "authenticated", False):
@@ -8025,13 +8032,14 @@ def _activity_log_live():
                     if not _ft_ltp:
                         _ft_ltp = (_kc_module.get_all_ticker_prices() or {}).get(_ft_sym, 0)
                     if not _ft_ltp:
-                        _errors.append(f"{_ft_sym}: could not fetch price")
+                        _errors.append(f"{_ft_sym}: could not fetch price from Kite")
                         continue
                     try:
-                        db.refix_trade_exit(_ft["id"], float(_ft_ltp))
+                        db.refix_trade_exit(_ft_id, float(_ft_ltp))
                         _fixed += 1
                     except Exception as _fe:
                         _errors.append(f"{_ft_sym}: {_fe}")
+
                 st.session_state["_actlog_stale"] = True
                 if _fixed:
                     st.success(f"✅ Fixed {_fixed} trade(s).")
