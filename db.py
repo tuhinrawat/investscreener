@@ -417,6 +417,33 @@ def init_schema():
         _add_column_if_missing(cur, "trade_log",         "intraday_confidence",    "INTEGER")
         _add_column_if_missing(cur, "trade_log",         "rec_t2",                 "DOUBLE PRECISION")
         _add_column_if_missing(cur, "trade_log",         "kite_target_order_id",   "VARCHAR")
+        # Trade context columns — captured at trigger time for pattern learning
+        _add_column_if_missing(cur, "trade_log",         "sector",                 "VARCHAR")
+        _add_column_if_missing(cur, "trade_log",         "nifty_pct_chg",          "DOUBLE PRECISION")
+        _add_column_if_missing(cur, "trade_log",         "rsi_at_entry",           "DOUBLE PRECISION")
+        _add_column_if_missing(cur, "trade_log",         "atr_ratio",              "DOUBLE PRECISION")
+        _add_column_if_missing(cur, "trade_log",         "entry_hour",             "SMALLINT")
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS trade_patterns (
+                id              BIGSERIAL PRIMARY KEY,
+                kite_user_id    VARCHAR     NOT NULL DEFAULT '',
+                dimension       VARCHAR     NOT NULL,
+                dimension_val   VARCHAR     NOT NULL,
+                signal_type     VARCHAR     NOT NULL DEFAULT 'ALL',
+                wins            INTEGER     NOT NULL DEFAULT 0,
+                losses          INTEGER     NOT NULL DEFAULT 0,
+                total           INTEGER     NOT NULL DEFAULT 0,
+                avg_pnl_pct     DOUBLE PRECISION,
+                avg_rr          DOUBLE PRECISION,
+                avg_entry_slip  DOUBLE PRECISION,
+                win_rate        DOUBLE PRECISION,
+                opt_rsi         DOUBLE PRECISION,
+                opt_min_rr      DOUBLE PRECISION,
+                last_computed   TIMESTAMP   DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (kite_user_id, dimension, dimension_val, signal_type)
+            );
+        """)
 
         # One-time migration: UTC → IST shift on logged_at
         cur.execute("SELECT value FROM _db_meta WHERE key = 'logged_at_utc_to_ist_done'")
@@ -1449,7 +1476,8 @@ def get_archived_paper_trades_for_analysis(user_id: str = "") -> pd.DataFrame:
             "SELECT id, tradingsymbol, signal_type, trade_date, logged_at, "
             "       actual_entry, actual_exit, rec_entry, rec_stop, rec_t1, "
             "       pnl_amount, pnl_pct, rr_realised, intraday_confidence, "
-            "       status, quantity "
+            "       status, quantity, slippage_entry_pct, setup_type, "
+            "       sector, nifty_pct_chg, rsi_at_entry, atr_ratio, entry_hour "
             "FROM trade_log WHERE " + " AND ".join(clauses)
             + " ORDER BY trade_date DESC, id DESC",
             params,
@@ -1579,6 +1607,272 @@ def tune_signal_config_from_paper(user_id: str = "", days: int = 30) -> dict:
     if changes:
         save_signal_config({**current, **changes}, user_id=user_id)
     return changes
+
+
+# ─── Trade Pattern Learning ───────────────────────────────────────────────────
+
+def compute_trade_patterns(user_id: str = "") -> int:
+    """
+    Analyse all archived closed paper trades and populate trade_patterns with
+    win-rate statistics across 7 dimensions:
+      symbol, sector, day_of_week, nifty_direction, confidence_band,
+      entry_session, volatility_regime
+
+    Returns the total number of pattern rows written.
+    Only runs on buckets with >= MIN_SAMPLES trades to avoid noise.
+    """
+    import datetime as _dt
+    import math as _math
+
+    MIN_SAMPLES = 5   # minimum trades to materialise a pattern row
+    _IST = _dt.timezone(_dt.timedelta(hours=5, minutes=30))
+    today = str(_dt.datetime.now(_IST).date())
+
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        clauses = [
+            "is_paper_trade = TRUE",
+            "status IN ('TARGET_HIT','STOPPED_OUT','CLOSED')",
+            "trade_date < %s",
+        ]
+        params: list = [today]
+        if user_id:
+            clauses.append("kite_user_id = %s")
+            params.append(user_id)
+
+        cur.execute(
+            "SELECT tradingsymbol, signal_type, trade_date, "
+            "       pnl_amount, pnl_pct, rr_realised, intraday_confidence, "
+            "       actual_entry, rec_entry, slippage_entry_pct, "
+            "       sector, nifty_pct_chg, rsi_at_entry, atr_ratio, entry_hour "
+            "FROM trade_log WHERE " + " AND ".join(clauses),
+            params,
+        )
+        rows = cur.fetchall()
+        if not rows:
+            return 0
+
+        import pandas as _pd
+        df = _pd.DataFrame(rows, columns=[
+            "symbol", "signal_type", "trade_date",
+            "pnl_amount", "pnl_pct", "rr_realised", "confidence",
+            "actual_entry", "rec_entry", "slip_pct",
+            "sector", "nifty_pct_chg", "rsi_at_entry", "atr_ratio", "entry_hour",
+        ])
+        for col in ("pnl_amount","pnl_pct","rr_realised","confidence",
+                    "actual_entry","rec_entry","slip_pct",
+                    "nifty_pct_chg","rsi_at_entry","atr_ratio","entry_hour"):
+            df[col] = _pd.to_numeric(df[col], errors="coerce")
+
+        df["trade_date"] = _pd.to_datetime(df["trade_date"])
+        df["day_of_week"] = df["trade_date"].dt.day_name()   # Monday … Friday
+        df["win"] = (df["pnl_amount"] > 0).astype(int)
+
+        # Derived dimensions
+        def _nifty_dir(v):
+            if _pd.isna(v): return "UNKNOWN"
+            if v >  0.3: return "UP"
+            if v < -0.3: return "DOWN"
+            return "FLAT"
+        df["nifty_direction"] = df["nifty_pct_chg"].apply(_nifty_dir)
+
+        def _conf_band(v):
+            if _pd.isna(v): return "UNKNOWN"
+            v = int(v)
+            if v >= 9: return "9-10"
+            if v >= 7: return "7-8"
+            if v >= 5: return "5-6"
+            return "<5"
+        df["confidence_band"] = df["confidence"].apply(_conf_band)
+
+        def _session(h):
+            if _pd.isna(h): return "UNKNOWN"
+            h = int(h)
+            if h <= 9:  return "OPENING"   # 9:15 – 9:59
+            if h <= 11: return "MORNING"   # 10:00 – 11:59
+            if h <= 13: return "MIDDAY"    # 12:00 – 13:59
+            return "AFTERNOON"             # 14:00 – 15:30
+        df["entry_session"] = df["entry_hour"].apply(_session)
+
+        def _vol_regime(v):
+            if _pd.isna(v): return "UNKNOWN"
+            # atr_ratio = ATR/LTP; >0.018 = high vol, <0.010 = low vol
+            if v > 0.018: return "HIGH_VOL"
+            if v < 0.010: return "LOW_VOL"
+            return "NORMAL_VOL"
+        df["volatility_regime"] = df["atr_ratio"].apply(_vol_regime)
+
+        # Dimensions to compute: (dimension_name, value_column)
+        DIMS = [
+            ("symbol",           "symbol"),
+            ("sector",           "sector"),
+            ("day_of_week",      "day_of_week"),
+            ("nifty_direction",  "nifty_direction"),
+            ("confidence_band",  "confidence_band"),
+            ("entry_session",    "entry_session"),
+            ("volatility_regime","volatility_regime"),
+        ]
+
+        def _bucket_stats(sub):
+            n    = len(sub)
+            wins = int(sub["win"].sum())
+            losses = n - wins
+            wr   = round((wins / n) * 100, 1) if n else None
+            avg_pnl = round(float(sub["pnl_pct"].dropna().mean()), 3) if sub["pnl_pct"].notna().any() else None
+            avg_rr  = round(float(sub["rr_realised"].dropna().mean()), 3) if sub["rr_realised"].notna().any() else None
+            avg_slip = round(float(sub["slip_pct"].dropna().mean()), 3) if sub["slip_pct"].notna().any() else None
+            # opt_rsi: median RSI at entry among WINNING trades (conservative ceiling)
+            win_rsi = sub.loc[sub["win"] == 1, "rsi_at_entry"].dropna()
+            opt_rsi = round(float(win_rsi.median()), 1) if len(win_rsi) >= 2 else None
+            # opt_min_rr: 25th-percentile R/R of winners (floor below which we shouldn't trade)
+            win_rr = sub.loc[sub["win"] == 1, "rr_realised"].dropna()
+            opt_min_rr = round(float(win_rr.quantile(0.25)), 2) if len(win_rr) >= 3 else None
+            return wins, losses, n, wr, avg_pnl, avg_rr, avg_slip, opt_rsi, opt_min_rr
+
+        rows_written = 0
+        now_ts = _dt.datetime.now(_IST).replace(tzinfo=None)
+
+        for dim_name, dim_col in DIMS:
+            if dim_col not in df.columns:
+                continue
+            # Per signal_type and "ALL"
+            for sig in ("BUY_ABOVE", "SELL_BELOW", "ALL"):
+                sub_sig = df if sig == "ALL" else df[df["signal_type"] == sig]
+                if sub_sig.empty:
+                    continue
+                for val, group in sub_sig.groupby(dim_col, dropna=True):
+                    if not val or str(val).strip() in ("", "UNKNOWN", "nan"):
+                        continue
+                    if len(group) < MIN_SAMPLES:
+                        continue
+                    wins, losses, total, wr, avg_pnl, avg_rr, avg_slip, opt_rsi, opt_min_rr = _bucket_stats(group)
+                    cur.execute("""
+                        INSERT INTO trade_patterns
+                            (kite_user_id, dimension, dimension_val, signal_type,
+                             wins, losses, total, avg_pnl_pct, avg_rr, avg_entry_slip,
+                             win_rate, opt_rsi, opt_min_rr, last_computed)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (kite_user_id, dimension, dimension_val, signal_type)
+                        DO UPDATE SET
+                            wins=EXCLUDED.wins, losses=EXCLUDED.losses, total=EXCLUDED.total,
+                            avg_pnl_pct=EXCLUDED.avg_pnl_pct, avg_rr=EXCLUDED.avg_rr,
+                            avg_entry_slip=EXCLUDED.avg_entry_slip, win_rate=EXCLUDED.win_rate,
+                            opt_rsi=EXCLUDED.opt_rsi, opt_min_rr=EXCLUDED.opt_min_rr,
+                            last_computed=EXCLUDED.last_computed
+                    """, [
+                        user_id, dim_name, str(val), sig,
+                        wins, losses, total, avg_pnl, avg_rr, avg_slip,
+                        wr, opt_rsi, opt_min_rr, now_ts,
+                    ])
+                    rows_written += 1
+
+        conn.commit()
+        return rows_written
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        release_conn(conn)
+
+
+def get_trade_patterns(user_id: str = "", dimension: str = "", signal_type: str = "") -> list[dict]:
+    """Return pattern rows, optionally filtered by dimension and/or signal_type."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        clauses = ["kite_user_id = %s"]
+        params: list = [user_id]
+        if dimension:
+            clauses.append("dimension = %s")
+            params.append(dimension)
+        if signal_type:
+            clauses.append("signal_type = %s")
+            params.append(signal_type)
+        cur.execute(
+            "SELECT dimension, dimension_val, signal_type, wins, losses, total, "
+            "       win_rate, avg_pnl_pct, avg_rr, avg_entry_slip, opt_rsi, opt_min_rr, last_computed "
+            "FROM trade_patterns WHERE " + " AND ".join(clauses)
+            + " ORDER BY dimension, win_rate DESC NULLS LAST",
+            params,
+        )
+        cols = ["dimension","dimension_val","signal_type","wins","losses","total",
+                "win_rate","avg_pnl_pct","avg_rr","avg_entry_slip","opt_rsi","opt_min_rr","last_computed"]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+    finally:
+        cur.close()
+        release_conn(conn)
+
+
+def get_sector_for_symbol(tradingsymbol: str) -> str | None:
+    """Best-effort sector lookup from market_intel_stocks (most recent run)."""
+    if not tradingsymbol:
+        return None
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT sector FROM market_intel_stocks "
+            "WHERE tradingsymbol = %s AND sector IS NOT NULL AND sector != '' "
+            "ORDER BY created_at DESC LIMIT 1",
+            [tradingsymbol],
+        )
+        row = cur.fetchone()
+        return str(row[0]).strip()[:100] if row else None
+    except Exception:
+        return None
+    finally:
+        cur.close()
+        release_conn(conn)
+
+
+def get_learned_signal_adjustment(
+    user_id: str,
+    symbol: str,
+    sector: str,
+    day_of_week: str,
+    nifty_direction: str,
+    signal_type: str = "ALL",
+    min_samples: int = 10,
+) -> dict:
+    """
+    Return the best learned win_rate and parameter adjustments for a given
+    trade context, drawn from the most specific matching pattern bucket.
+
+    Priority: symbol > sector > day_of_week+nifty_direction > nifty_direction
+    Falls back to None if no bucket has >= min_samples trades.
+
+    Returns dict with keys: win_rate, opt_rsi, opt_min_rr, source (which dimension matched), n
+    """
+    lookups = [
+        ("symbol",          symbol),
+        ("sector",          sector),
+        ("day_of_week",     day_of_week),
+        ("nifty_direction", nifty_direction),
+    ]
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        for dim, val in lookups:
+            if not val:
+                continue
+            cur.execute(
+                "SELECT win_rate, opt_rsi, opt_min_rr, total "
+                "FROM trade_patterns "
+                "WHERE kite_user_id=%s AND dimension=%s AND dimension_val=%s "
+                "  AND signal_type=%s AND total >= %s "
+                "ORDER BY last_computed DESC LIMIT 1",
+                [user_id, dim, val, signal_type, min_samples],
+            )
+            row = cur.fetchone()
+            if row:
+                return {"win_rate": row[0], "opt_rsi": row[1], "opt_min_rr": row[2],
+                        "source": dim, "n": row[3]}
+        return {}
+    finally:
+        cur.close()
+        release_conn(conn)
 
 
 # ─── Market Intel ─────────────────────────────────────────────────────────────

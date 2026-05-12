@@ -5857,6 +5857,8 @@ def _intraday_long_live():
                     and _paper_key not in st.session_state.get("paper_triggered", {})):
                 try:
                     _t2_val = float(r.get("intraday_t2") or r.get("intraday_r3") or 0)
+                    _ltp_ba  = float(r.get("ltp") or _trigger_price or 1)
+                    _atr_ba  = float(r.get("atr_14") or 0)
                     _pid = db.log_trade({
                         "trade_date":          datetime.now(_IST).date(),
                         "tradingsymbol":       sym,
@@ -5877,6 +5879,12 @@ def _intraday_long_live():
                         "notes":               f"📄 Paper — auto TRIGGERED @ ₹{_trigger_price:.2f} (conf {confidence}/10, ₹{_cap_this_trade:,})",
                         "is_paper_trade":      True,
                         "intraday_confidence": confidence,
+                        # Trade context for pattern learning
+                        "sector":          db.get_sector_for_symbol(sym),
+                        "nifty_pct_chg":   st.session_state.get("_nifty_intraday_pct"),
+                        "rsi_at_entry":    r.get("rsi_14"),
+                        "atr_ratio":       round(_atr_ba / _ltp_ba, 5) if _ltp_ba else None,
+                        "entry_hour":      datetime.now(_IST).hour,
                     })
                     st.session_state["paper_triggered"][_paper_key] = _pid
                     st.session_state["paper_open"][_pid] = {
@@ -6351,6 +6359,8 @@ def _intraday_short_live():
                     and _paper_key not in st.session_state.get("paper_triggered", {})):
                 try:
                     _t2_val_s = float(r.get("intraday_t2") or r.get("intraday_s3") or 0)
+                    _ltp_sb   = float(r.get("ltp") or _trigger_price or 1)
+                    _atr_sb   = float(r.get("atr_14") or 0)
                     _pid = db.log_trade({
                         "trade_date":          datetime.now(_IST).date(),
                         "tradingsymbol":       sym,
@@ -6371,6 +6381,12 @@ def _intraday_short_live():
                         "notes":               f"📄 Paper — auto TRIGGERED @ ₹{_trigger_price:.2f} (conf {confidence}/10, ₹{_cap_this_trade:,})",
                         "is_paper_trade":      True,
                         "intraday_confidence": confidence,
+                        # Trade context for pattern learning
+                        "sector":          db.get_sector_for_symbol(sym),
+                        "nifty_pct_chg":   st.session_state.get("_nifty_intraday_pct"),
+                        "rsi_at_entry":    r.get("rsi_14"),
+                        "atr_ratio":       round(_atr_sb / _ltp_sb, 5) if _ltp_sb else None,
+                        "entry_hour":      datetime.now(_IST).hour,
                     })
                     st.session_state["paper_triggered"][_paper_key] = _pid
                     st.session_state["paper_open"][_pid] = {
@@ -6956,6 +6972,145 @@ with tab_signals:
 # ============================================================
 # ALGORITHM READJUSTMENT DIALOG
 # ============================================================
+@st.dialog("🔍 Trade Post-Mortem", width="large")
+def _show_trade_postmortem_dialog(trade: dict) -> None:
+    """Recommended vs Executed analysis for a single closed trade."""
+    sym        = trade.get("tradingsymbol", "?")
+    sig        = trade.get("signal_type", "")
+    status     = trade.get("status", "")
+    rec_entry  = trade.get("rec_entry")
+    rec_stop   = trade.get("rec_stop")
+    rec_t1     = trade.get("rec_t1")
+    act_entry  = trade.get("actual_entry")
+    act_exit   = trade.get("actual_exit")
+    pnl_pct    = trade.get("pnl_pct")
+    rr         = trade.get("rr_realised")
+    slip       = trade.get("slippage_entry_pct")
+    conf       = trade.get("intraday_confidence")
+    sector     = trade.get("sector")
+    nifty_pct  = trade.get("nifty_pct_chg")
+    rsi_entry  = trade.get("rsi_at_entry")
+    atr_ratio  = trade.get("atr_ratio")
+    entry_hour = trade.get("entry_hour")
+
+    _is_long = sig in ("BUY_ABOVE", "BUY_ORB")
+    _mult = 1 if _is_long else -1
+
+    st.markdown(f"### {sym} · {sig} · {status}")
+
+    # ── Trade context ──────────────────────────────────────────────────────
+    _ctx = []
+    if sector:        _ctx.append(f"**Sector:** {sector}")
+    if entry_hour:    _ctx.append(f"**Session:** {'OPENING' if entry_hour<=9 else 'MORNING' if entry_hour<=11 else 'MIDDAY' if entry_hour<=13 else 'AFTERNOON'}")
+    if nifty_pct is not None:
+        _nd = "UP" if nifty_pct > 0.3 else "DOWN" if nifty_pct < -0.3 else "FLAT"
+        _ctx.append(f"**Nifty:** {_nd} ({nifty_pct:+.2f}%)")
+    if conf:          _ctx.append(f"**Confidence:** {conf}/10")
+    if rsi_entry:     _ctx.append(f"**RSI at entry:** {rsi_entry:.1f}")
+    if atr_ratio:     _ctx.append(f"**ATR ratio:** {atr_ratio:.4f}")
+    if _ctx:
+        st.caption("  ·  ".join(_ctx))
+
+    st.markdown("---")
+
+    # ── Recommended vs Executed comparison ───────────────────────────────
+    st.markdown("#### 📋 Recommended vs Executed")
+    _pm_rows = []
+
+    def _pct_diff(actual, reference, flip=False):
+        if actual and reference and reference != 0:
+            d = (actual - reference) / abs(reference) * 100
+            return d * (-1 if flip else 1)
+        return None
+
+    if rec_entry and act_entry:
+        _slip_calc = _pct_diff(act_entry, rec_entry, flip=_is_long)
+        _slip_lbl  = f"{_slip_calc:+.2f}%" if _slip_calc is not None else "—"
+        _slip_note = ("paid more than rec" if (_is_long and _slip_calc and _slip_calc > 0)
+                      else "received less than rec" if (not _is_long and _slip_calc and _slip_calc > 0)
+                      else "better than rec" if _slip_calc and _slip_calc < 0 else "—")
+        _pm_rows.append({
+            "Field": "Entry price",
+            "Recommended": f"₹{rec_entry:.2f}",
+            "Executed":    f"₹{act_entry:.2f}",
+            "Difference":  _slip_lbl,
+            "Note":        _slip_note,
+        })
+
+    if rec_stop and act_entry:
+        _stop_dist = abs(act_entry - rec_stop) / act_entry * 100
+        _pm_rows.append({
+            "Field": "Stop loss",
+            "Recommended": f"₹{rec_stop:.2f}",
+            "Executed":    f"₹{rec_stop:.2f}",
+            "Difference":  f"{_stop_dist:.2f}% from entry",
+            "Note":        "tight" if _stop_dist < 0.4 else "wide" if _stop_dist > 1.5 else "ok",
+        })
+
+    if rec_t1 and act_exit:
+        _t1_diff = _pct_diff(act_exit, rec_t1, flip=not _is_long)
+        _t1_lbl  = f"{_t1_diff:+.2f}%" if _t1_diff is not None else "—"
+        _t1_note = ("exited above T1" if (_is_long and _t1_diff and _t1_diff > 0)
+                    else "exited below T1" if (_is_long and _t1_diff and _t1_diff < 0)
+                    else "exited below rec T1" if (not _is_long and _t1_diff and _t1_diff < 0)
+                    else "exited above rec T1" if (not _is_long and _t1_diff and _t1_diff > 0)
+                    else "—")
+        _pm_rows.append({
+            "Field": "Exit vs T1",
+            "Recommended": f"₹{rec_t1:.2f}",
+            "Executed":    f"₹{act_exit:.2f}" if act_exit else "—",
+            "Difference":  _t1_lbl,
+            "Note":        _t1_note,
+        })
+
+    if _pm_rows:
+        st.dataframe(pd.DataFrame(_pm_rows), hide_index=True, use_container_width=True)
+
+    # ── Signal validity check ─────────────────────────────────────────────
+    st.markdown("#### 🎯 Signal Validity")
+    if act_entry and act_exit and rec_stop:
+        _directionally_correct = (act_exit > act_entry) if _is_long else (act_exit < act_entry)
+        _stop_triggered_early  = (
+            (status == "STOPPED_OUT") and
+            abs(act_exit - rec_stop) / max(rec_stop, 0.01) < 0.005
+        )
+        if _directionally_correct:
+            st.success("Signal direction was **correct** — price moved the right way.", icon="✅")
+        else:
+            st.error("Signal direction was **wrong** — price moved against the position.", icon="🔴")
+
+        if status == "STOPPED_OUT":
+            _overshoot = abs(act_exit - rec_stop) / max(rec_stop, 0.01) * 100
+            if _overshoot > 0.3:
+                st.warning(
+                    f"Stop was hit {_overshoot:.2f}% beyond `rec_stop` — possible slippage "
+                    "or fast market. Consider widening stop or using limit SL.",
+                    icon="⚠️",
+                )
+            elif _directionally_correct and rec_t1 and act_exit and act_entry:
+                _dist_to_t1  = abs(rec_t1 - act_entry)
+                _dist_to_stop = abs(rec_stop - act_entry)
+                if _dist_to_t1 > 0 and _dist_to_stop / _dist_to_t1 > 0.7:
+                    st.warning(
+                        "Stop was too close to entry relative to T1 — "
+                        "R/R was unfavourable and the signal direction was right. "
+                        "Consider a wider stop or lower position size.",
+                        icon="⚠️",
+                    )
+        elif status == "TARGET_HIT":
+            st.success("Target was hit — execution matched recommendation.", icon="🎯")
+
+    # ── Outcome metrics ───────────────────────────────────────────────────
+    st.markdown("#### 📈 Outcome")
+    _om1, _om2, _om3 = st.columns(3)
+    _om1.metric("P&L %",      f"{pnl_pct:+.2f}%" if pnl_pct is not None else "—")
+    _om2.metric("Realised R/R", f"{rr:.2f}×"      if rr is not None else "—")
+    _om3.metric("Entry slip",   f"{slip:+.2f}%"   if slip is not None else "—")
+
+    if st.button("Close", use_container_width=True):
+        st.rerun()
+
+
 @st.dialog("🔬 Algorithm Readjustment Insights", width="large")
 def _show_algo_readjust_dialog(uid: str) -> None:
     """Analyse archived paper trades and propose signal-config changes."""
@@ -7871,6 +8026,37 @@ def _activity_log_live():
             _xdf = _enrich_df(_xdf, inject_mtm=False)
             _render_trade_table(_xdf, key_sfx="arch")
 
+            # ── Per-trade Post-Mortem ──────────────────────────────────────
+            _closed_arch = _xdf[
+                _xdf["status"].isin(["CLOSED","TARGET_HIT","STOPPED_OUT"])
+            ].copy()
+            if not _closed_arch.empty:
+                st.markdown("---")
+                _pm_hdr, _pm_btn = st.columns([4, 1])
+                _pm_hdr.markdown("**🔍 Post-Mortem: Recommended vs Executed**")
+                _pm_labels = []
+                for _, _pm_r in _closed_arch.sort_values("logged_at", ascending=False).iterrows():
+                    _d = str((_pm_r.get("trade_date") or _pm_r.get("logged_at") or "")[:10])
+                    _pnl_s = (f"₹{float(_pm_r['pnl_amount']):+,.0f}"
+                              if _pm_r.get("pnl_amount") is not None and not _isna(_pm_r.get("pnl_amount"))
+                              else "?")
+                    _pm_labels.append(
+                        f"#{_pm_r['id']} · {_pm_r['tradingsymbol']} · "
+                        f"{_pm_r['signal_type']} · {_pm_r['status']} · {_d} · {_pnl_s}"
+                    )
+                _pm_id_map = dict(zip(_pm_labels, _closed_arch["id"].tolist()))
+                _sel_pm = st.selectbox(
+                    "Select trade for post-mortem",
+                    _pm_labels, label_visibility="collapsed",
+                    key="arch_postmortem_sel",
+                )
+                if _pm_btn.button("🔍 Analyse", type="secondary",
+                                  use_container_width=True, key="btn_postmortem"):
+                    _pm_trade_id = _pm_id_map.get(_sel_pm)
+                    if _pm_trade_id:
+                        _pm_row = _closed_arch[_closed_arch["id"] == _pm_trade_id].iloc[0].to_dict()
+                        _show_trade_postmortem_dialog(_pm_row)
+
             # ── Export archive ─────────────────────────────────────────────
             st.download_button(
                 "⬇️ Export archive as CSV",
@@ -7913,6 +8099,116 @@ def _activity_log_live():
                     _ins3.metric("Max slippage", f"{_slip.max():+.2f}%")
             else:
                 st.info("Need at least 3 closed archived trades to show strategy insights.", icon="📊")
+
+            # ── Pattern Learning Dashboard ──────────────────────────────────
+            st.markdown("---")
+            _pat_hdr_col, _pat_btn_col = st.columns([3, 1])
+            with _pat_hdr_col:
+                st.subheader("🧠 Pattern Learning")
+                st.caption(
+                    "Analyses every archived trade across 7 dimensions — stock, sector, "
+                    "day-of-week, market direction, confidence band, entry session, and "
+                    "volatility regime — to surface what actually works for your setup. "
+                    "Requires ≥5 trades per bucket."
+                )
+            with _pat_btn_col:
+                if st.button("🔄 Compute Patterns", type="primary",
+                             use_container_width=True, key="btn_compute_patterns",
+                             help="Re-analyse all archived trades and refresh the pattern table"):
+                    with st.spinner("Computing patterns…"):
+                        try:
+                            _n_pats = db.compute_trade_patterns(user_id=_uid)
+                            st.success(f"Done — {_n_pats} pattern buckets computed.")
+                            st.rerun()
+                        except Exception as _pe:
+                            st.error(f"Pattern computation failed: {_pe}")
+
+            _pats = db.get_trade_patterns(user_id=_uid)
+            if not _pats:
+                st.info(
+                    "No patterns computed yet. Click **Compute Patterns** after you have "
+                    "at least 5 archived trades.",
+                    icon="🧠",
+                )
+            else:
+                import pandas as _ppd
+                _pat_df = _ppd.DataFrame(_pats)
+
+                # Colour-code win_rate column
+                def _wr_color(v):
+                    if v is None or (isinstance(v, float) and _ppd.isna(v)):
+                        return ""
+                    if v >= 60: return "color:#22c55e;font-weight:600"
+                    if v <= 40: return "color:#ef4444;font-weight:600"
+                    return "color:#f59e0b"
+
+                # ── Dimension filter ────────────────────────────────────────
+                _dim_opts = sorted(_pat_df["dimension"].unique().tolist())
+                _sig_opts = ["ALL", "BUY_ABOVE", "SELL_BELOW"]
+                _pf1, _pf2 = st.columns(2)
+                _sel_dim = _pf1.selectbox(
+                    "Dimension", ["All"] + _dim_opts, key="pat_dim_filter"
+                )
+                _sel_sig = _pf2.selectbox(
+                    "Signal type", _sig_opts, key="pat_sig_filter"
+                )
+                _view = _pat_df.copy()
+                if _sel_dim != "All":
+                    _view = _view[_view["dimension"] == _sel_dim]
+                if _sel_sig:
+                    _view = _view[_view["signal_type"] == _sel_sig]
+                _view = _view.sort_values("win_rate", ascending=False, na_position="last")
+
+                _disp = _view[[
+                    "dimension", "dimension_val", "signal_type",
+                    "total", "wins", "losses", "win_rate",
+                    "avg_pnl_pct", "avg_rr", "avg_entry_slip",
+                    "opt_rsi", "opt_min_rr",
+                ]].copy()
+                _disp.columns = [
+                    "Dimension", "Value", "Signal",
+                    "Trades", "Wins", "Losses", "Win %",
+                    "Avg P&L %", "Avg R/R", "Avg Slip %",
+                    "Opt RSI", "Opt MinRR",
+                ]
+                _styled_pat = (
+                    _disp.style
+                    .format({
+                        "Win %":      lambda v: f"{v:.1f}%" if v == v else "—",
+                        "Avg P&L %":  lambda v: f"{v:+.2f}%" if v == v else "—",
+                        "Avg R/R":    lambda v: f"{v:.2f}×"  if v == v else "—",
+                        "Avg Slip %": lambda v: f"{v:+.3f}%" if v == v else "—",
+                        "Opt RSI":    lambda v: f"{v:.1f}"   if v == v else "—",
+                        "Opt MinRR":  lambda v: f"{v:.2f}×"  if v == v else "—",
+                    }, na_rep="—")
+                    .map(_wr_color, subset=["Win %"])
+                )
+                st.dataframe(_styled_pat, hide_index=True, use_container_width=True,
+                             height=min(600, 60 + len(_disp) * 38))
+
+                # ── Key insights summary ────────────────────────────────────
+                st.markdown("#### 💡 Key Signals from Patterns")
+                _insights = []
+                for _, _pr in _pat_df[_pat_df["total"] >= 8].iterrows():
+                    _wr_v = _pr.get("win_rate")
+                    if _wr_v is None:
+                        continue
+                    _label = f"{_pr['dimension']} = **{_pr['dimension_val']}** ({_pr['signal_type']})"
+                    if _wr_v >= 65:
+                        _insights.append(
+                            f"✅ {_label} — {_wr_v:.0f}% win rate over {_pr['total']} trades. "
+                            + (f"Opt RSI ≤{_pr['opt_rsi']:.0f}" if _pr.get('opt_rsi') else "")
+                        )
+                    elif _wr_v <= 38:
+                        _insights.append(
+                            f"🔴 {_label} — only {_wr_v:.0f}% win rate over {_pr['total']} trades. "
+                            "Consider avoiding or tightening filters."
+                        )
+                if _insights:
+                    for _ins in _insights[:12]:   # cap at 12 to avoid wall of text
+                        st.markdown(_ins)
+                else:
+                    st.caption("No strongly conclusive patterns yet — keep trading and re-compute.")
 
 
 # ============================================================
