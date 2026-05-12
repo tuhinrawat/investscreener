@@ -7490,9 +7490,8 @@ def _activity_log_live():
                 st.success("All open paper trades closed.")
                 st.rerun()
 
-    # ── Backfix hard-exit prices — shown after 3:10 PM if any trades were
-    # closed with stop-loss price instead of actual LTP ────────────────────────
-    if _past_310_act and _uid:
+    # ── Backfix hard-exit prices — shown whenever broken trades detected ────────
+    if _uid:
         try:
             _bf_broken = db.get_hard_exit_trades_today(user_id=_uid)
         except Exception:
@@ -7502,7 +7501,7 @@ def _activity_log_live():
             st.warning(
                 f"⚠️ **{len(_bf_broken)} trade(s)** were hard-exited at the stop-loss price "
                 f"instead of the actual market price: **{_bf_syms}**. "
-                "Click below to fetch today's closing prices and correct them.",
+                "Click below to correct them using today's closing price.",
                 icon="🔧",
             )
             if st.button("🔧 Fix Exit Prices with Closing LTP", type="primary",
@@ -7510,10 +7509,16 @@ def _activity_log_live():
                 _bf_kc = st.session_state.get("kite_client")
                 _bf_fixed = 0
                 _bf_errors = []
+
+                # Bulk-fetch stored LTPs from computed_metrics (no Kite auth needed)
+                _bf_all_syms = [t["tradingsymbol"] for t in _bf_broken]
+                _stored_ltps = db.get_stored_ltps(_bf_all_syms)
+
                 for _bft in _bf_broken:
                     _bft_sym = _bft["tradingsymbol"]
                     _closing_ltp = 0.0
-                    # Try OHLC batch first; fallback to WebSocket last-known price
+
+                    # Priority 1: Kite OHLC API (most accurate closing price)
                     try:
                         if _bf_kc and getattr(_bf_kc, "authenticated", False):
                             _ohlc_r = _bf_kc.get_ohlc_batch([f"NSE:{_bft_sym}"])
@@ -7522,19 +7527,27 @@ def _activity_log_live():
                             )
                     except Exception:
                         pass
+
+                    # Priority 2: computed_metrics stored LTP (last Quick Refresh price)
+                    if not _closing_ltp:
+                        _closing_ltp = _stored_ltps.get(_bft_sym, 0.0)
+
+                    # Priority 3: live WebSocket / session snapshot
                     if not _closing_ltp:
                         _closing_ltp = (
                             (_kc_module.get_all_ticker_prices() or {}).get(_bft_sym)
                             or st.session_state.get("_live_ltp", {}).get(_bft_sym, 0)
                         )
+
                     if not _closing_ltp:
-                        _bf_errors.append(f"{_bft_sym}: could not fetch LTP")
+                        _bf_errors.append(f"{_bft_sym}: could not find closing price")
                         continue
                     try:
                         db.refix_trade_exit(_bft["id"], float(_closing_ltp))
                         _bf_fixed += 1
                     except Exception as _bfe:
                         _bf_errors.append(f"{_bft_sym}: {_bfe}")
+
                 st.session_state["_actlog_stale"] = True
                 if _bf_fixed:
                     st.success(f"✅ Corrected exit prices for {_bf_fixed} trade(s).")

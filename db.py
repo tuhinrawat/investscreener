@@ -1010,11 +1010,29 @@ def close_trade(trade_id: int, actual_exit: float, status: str, notes: str = Non
             pass  # never let a capital-update failure block a trade close
 
 
+def get_stored_ltps(symbols: list[str]) -> dict[str, float]:
+    """Return last known LTP from computed_metrics for each symbol in the list."""
+    if not symbols:
+        return {}
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT tradingsymbol, ltp FROM computed_metrics "
+            "WHERE tradingsymbol = ANY(%s) AND ltp IS NOT NULL AND ltp > 0",
+            [symbols],
+        )
+        return {row[0]: float(row[1]) for row in cur.fetchall()}
+    finally:
+        cur.close()
+        release_conn(conn)
+
+
 def get_hard_exit_trades_today(user_id: str = "") -> list[dict]:
     """
-    Return today's closed trades where the exit price looks like the stop-loss
-    was used instead of LTP — i.e. notes contain '⏰' AND actual_exit rounds to
-    rec_stop within 0.5%.  These are candidates for a price backfix.
+    Return today's closed trades where actual_exit matches rec_stop within 1%
+    — the fingerprint of the stop-used-as-exit bug.  No notes filter so it
+    catches trades closed via any mechanism (hard exit, manual EOD, etc.).
     """
     import datetime as _dt
     _IST  = _dt.timezone(_dt.timedelta(hours=5, minutes=30))
@@ -1027,7 +1045,8 @@ def get_hard_exit_trades_today(user_id: str = "") -> list[dict]:
             "DATE(opened_at AT TIME ZONE 'Asia/Kolkata') = %s",
             "status IN ('CLOSED','STOPPED_OUT')",
             "actual_exit IS NOT NULL",
-            "notes LIKE '%%⏰%%'",
+            "rec_stop IS NOT NULL",
+            "rec_stop > 0",
         ]
         params: list = [today]
         if user_id:
@@ -1045,13 +1064,14 @@ def get_hard_exit_trades_today(user_id: str = "") -> list[dict]:
         results = []
         for r in rows:
             tid, sym, sig, qty, ae, ax, rs, pnl, is_paper, notes = r
-            # Flag if actual_exit is within 0.5% of rec_stop (stop was used as exit)
-            if rs and ax and abs(ax - rs) / max(rs, 0.01) < 0.005:
+            ax_f, rs_f = float(ax), float(rs)
+            # actual_exit within 1% of rec_stop = stop was used as exit price
+            if abs(ax_f - rs_f) / max(rs_f, 0.01) < 0.01:
                 results.append({
                     "id": tid, "tradingsymbol": sym, "signal_type": sig,
-                    "quantity": qty, "actual_entry": ae, "actual_exit": ax,
-                    "rec_stop": rs, "pnl_amount": pnl,
-                    "is_paper_trade": is_paper, "notes": notes,
+                    "quantity": qty, "actual_entry": ae, "actual_exit": ax_f,
+                    "rec_stop": rs_f, "pnl_amount": pnl,
+                    "is_paper_trade": is_paper, "notes": notes or "",
                 })
         return results
     finally:
