@@ -7582,9 +7582,10 @@ def _activity_log_live():
             "CLOSED":      "color:#3b82f6;font-weight:600",
         }.get(str(val).upper(), "")
 
-    def _enrich_df(df: pd.DataFrame, inject_mtm: bool = False) -> pd.DataFrame:
+    def _enrich_df(df: pd.DataFrame, inject_mtm: bool = False, ltp_snap: dict | None = None) -> pd.DataFrame:
         """Add trade_type, ltp, live MTM, charges, net P&L columns."""
         df = df.copy()
+        _ltp_src = ltp_snap if ltp_snap is not None else _live_ltp_now
         if "is_paper_trade" in df.columns:
             df["trade_type"] = df["is_paper_trade"].apply(
                 lambda v: "📄 Paper" if v is True or v == 1 else "💸 Real"
@@ -7592,12 +7593,12 @@ def _activity_log_live():
         else:
             df["trade_type"] = "💸 Real"
 
-        df["ltp"] = df["tradingsymbol"].map(lambda s: _live_ltp_now.get(s, None))
+        df["ltp"] = df["tradingsymbol"].map(lambda s: _ltp_src.get(s, None))
 
         if inject_mtm:
             _om = df["status"] == "OPEN"
             for _idx, _row in df[_om].iterrows():
-                _ltp_v = _live_ltp_now.get(str(_row.get("tradingsymbol") or ""), 0)
+                _ltp_v = _ltp_src.get(str(_row.get("tradingsymbol") or ""), 0)
                 if _ltp_v and not _isna(_row.get("actual_entry")) and _row.get("actual_entry"):
                     _ep   = float(_row["actual_entry"])
                     _qp   = float(_row.get("quantity", 0) or 0) if not _isna(_row.get("quantity")) else 0
@@ -7616,7 +7617,7 @@ def _activity_log_live():
             if str(row.get("signal_type", "")).upper() in ("BUY_ORB", "SELL_ORB"):
                 stype = "SCALP"
             if str(row.get("status","")) == "OPEN" and not exit_p:
-                exit_p = float(_live_ltp_now.get(str(row.get("tradingsymbol") or ""), 0) or 0)
+                exit_p = float(_ltp_src.get(str(row.get("tradingsymbol") or ""), 0) or 0)
             if entry and exit_p and qty:
                 return db.compute_trade_charges(entry, exit_p, qty, stype).get("total", 0.0)
             return 0.0
@@ -7728,8 +7729,10 @@ def _activity_log_live():
                 _rows = st.session_state.get("_actlog_open_rows")
                 if _rows is None or _rows.empty:
                     return
-                # Re-read enrich_df and render_trade_table from enclosing scope
-                _render_trade_table(_enrich_df(_rows, inject_mtm=True), key_sfx="act_open")
+                # Read fresh prices on every fragment run — bypasses the stale
+                # module-level _live_ltp_now snapshot from the last full render.
+                _fresh = _kc_module.get_all_ticker_prices() or st.session_state.get("_live_ltp", {})
+                _render_trade_table(_enrich_df(_rows, inject_mtm=True, ltp_snap=_fresh), key_sfx="act_open")
 
             _open_trades_mtm()
 
