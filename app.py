@@ -7996,53 +7996,48 @@ def _activity_log_live():
                     st.success(f"Trade #{_sel_id} closed as {_close_status} at ₹{_close_exit:.2f}")
                     st.rerun()
 
-        # ── Fix wrong exit prices ──────────────────────────────────────────
+        # ── Fix exit prices — replace actual_exit with Kite LTP for all CLOSED trades today
         if st.button("🔧 Fix Today's Exit Prices", key="_fix_exit_prices",
-                     help="For each closed trade today: fetches Kite last price, and if "
-                          "actual_exit matches rec_stop (stop used instead of LTP), corrects it"):
+                     help="Replaces actual_exit with current Kite LTP for every CLOSED trade today"):
             _fix_kc = st.session_state.get("kite_client")
             _fixed, _errors = 0, []
-
-            # Use _closed_rows already loaded above — no extra DB query needed
-            _fixable = _closed_rows[
-                (_closed_rows["status"] == "CLOSED") &
-                (_closed_rows["rec_stop"].notna()) &
-                (_closed_rows["actual_exit"].notna()) &
-                (
-                    ((_closed_rows["actual_exit"] - _closed_rows["rec_stop"]).abs()
-                     / _closed_rows["rec_stop"].clip(lower=0.01)) < 0.01
-                )
-            ]
-
+            _fixable = _closed_rows[_closed_rows["status"] == "CLOSED"]
             if _fixable.empty:
-                st.info("No exit-price mismatches found in today's closed trades.")
+                st.info("No CLOSED trades today to fix.")
             else:
+                # Batch-fetch all symbols in one OHLC call
+                _fix_syms = _fixable["tradingsymbol"].dropna().unique().tolist()
+                _fix_prices = {}
+                try:
+                    if _fix_kc and getattr(_fix_kc, "authenticated", False):
+                        _fix_ohlc = _fix_kc.get_ohlc_batch([f"NSE:{s}" for s in _fix_syms])
+                        for _fs in _fix_syms:
+                            _p = (_fix_ohlc.get(f"NSE:{_fs}") or {}).get("last_price")
+                            if _p:
+                                _fix_prices[_fs] = float(_p)
+                except Exception:
+                    pass
+                # Fill any missing from WebSocket
+                _ws_snap = _kc_module.get_all_ticker_prices() or {}
+                for _fs in _fix_syms:
+                    if _fs not in _fix_prices and _ws_snap.get(_fs):
+                        _fix_prices[_fs] = float(_ws_snap[_fs])
+
                 for _, _frow in _fixable.iterrows():
                     _ft_sym = _frow["tradingsymbol"]
-                    _ft_id  = int(_frow["id"])
-                    _ft_ltp = 0.0
-                    try:
-                        if _fix_kc and getattr(_fix_kc, "authenticated", False):
-                            _ft_ohlc = _fix_kc.get_ohlc_batch([f"NSE:{_ft_sym}"])
-                            _ft_ltp  = float(
-                                (_ft_ohlc.get(f"NSE:{_ft_sym}") or {}).get("last_price") or 0
-                            )
-                    except Exception:
-                        pass
+                    _ft_ltp = _fix_prices.get(_ft_sym)
                     if not _ft_ltp:
-                        _ft_ltp = (_kc_module.get_all_ticker_prices() or {}).get(_ft_sym, 0)
-                    if not _ft_ltp:
-                        _errors.append(f"{_ft_sym}: could not fetch price from Kite")
+                        _errors.append(f"{_ft_sym}: no price from Kite")
                         continue
                     try:
-                        db.refix_trade_exit(_ft_id, float(_ft_ltp))
+                        db.refix_trade_exit(int(_frow["id"]), _ft_ltp)
                         _fixed += 1
                     except Exception as _fe:
                         _errors.append(f"{_ft_sym}: {_fe}")
 
                 st.session_state["_actlog_stale"] = True
                 if _fixed:
-                    st.success(f"✅ Fixed {_fixed} trade(s).")
+                    st.success(f"✅ Updated exit prices for {_fixed} trade(s) to Kite LTP.")
                 if _errors:
                     st.error("; ".join(_errors))
                 st.rerun()
