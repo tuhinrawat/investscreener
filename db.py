@@ -21,6 +21,7 @@ Tables:
 """
 
 import os
+import time
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
@@ -81,44 +82,48 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
     return _pool
 
 
+def _fresh_conn() -> psycopg2.extensions.connection:
+    """Rebuild pool and return a brand-new connection."""
+    global _pool
+    try:
+        if _pool:
+            _pool.closeall()
+    except Exception:
+        pass
+    _pool = None
+    return _get_pool().getconn()
+
+
 def get_conn() -> psycopg2.extensions.connection:
     """
-    Borrow a connection from the pool.
-
-    Uses conn.closed (synchronous psycopg2 attribute — no network round-trip)
-    as a fast pre-check. Only falls back to a full SELECT 1 ping when the
-    connection appears open but may be stale (Neon idle timeout). Rebuilds the
-    entire pool on dead-connection detection.
+    Borrow a connection from the pool, guaranteed to be alive.
+    Proactively pings with SELECT 1 to catch Neon idle-timeout drops
+    before handing the connection to the caller.
     """
     global _pool
     pool = _get_pool()
     conn = pool.getconn()
+    # Fast closed check (no network)
     if conn.closed:
-        # Definitely dead — rebuild pool immediately
-        try:
-            pool.closeall()
-        except Exception:
-            pass
-        _pool = None
-        return _get_pool().getconn()
+        return _fresh_conn()
+    # Ping to catch SSL drops that haven't set conn.closed yet
     try:
-        # Fast transaction-state reset — no extra round-trip if already clean
-        conn.rollback()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.close()
+        conn.rollback()   # reset transaction state
     except Exception:
-        # rollback failed → connection is dead despite conn.closed == 0
         try:
-            pool.closeall()
+            conn.close()
         except Exception:
             pass
-        _pool = None
-        conn = _get_pool().getconn()
+        return _fresh_conn()
     return conn
 
 
 def release_conn(conn) -> None:
     """Return a connection to the pool (preferred over conn.close())."""
     try:
-        # Roll back any open transaction so the connection is clean for reuse
         try:
             conn.rollback()
         except Exception:
@@ -129,6 +134,32 @@ def release_conn(conn) -> None:
             conn.close()
         except Exception:
             pass
+
+
+def _with_retry(fn, *args, retries: int = 3, **kwargs):
+    """
+    Call fn(*args, **kwargs) and retry up to `retries` times on
+    OperationalError / InterfaceError (Neon SSL drops).
+    Forces pool rebuild between retries so each attempt gets a fresh socket.
+    """
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return fn(*args, **kwargs)
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
+            last_exc = exc
+            global _pool
+            try:
+                if _pool:
+                    _pool.closeall()
+            except Exception:
+                pass
+            _pool = None
+            if attempt < retries - 1:
+                time.sleep(0.5 * (attempt + 1))   # 0.5s, 1s back-off
+        except Exception as exc:
+            raise   # non-SSL errors propagate immediately
+    raise last_exc
 
 
 def _df_from_cursor(cur) -> pd.DataFrame:
@@ -1716,6 +1747,10 @@ def create_user(username: str, password_hash: str,
 
 def get_user_by_username(username: str) -> dict | None:
     """Return the full users row as a dict, or None if not found."""
+    return _with_retry(_get_user_by_username_impl, username)
+
+
+def _get_user_by_username_impl(username: str) -> dict | None:
     conn = get_conn()
     cur  = conn.cursor()
     try:
@@ -1769,13 +1804,13 @@ def create_session(user_id: int, session_token: str) -> None:
 
 
 def get_user_by_session(session_token: str) -> dict | None:
-    """
-    Validate a session token and return the matching users row.
-    Also bumps last_seen_at on the session.
-    Returns None if token not found.
-    """
+    """Validate a session token and return the matching users row."""
     if not session_token:
         return None
+    return _with_retry(_get_user_by_session_impl, session_token)
+
+
+def _get_user_by_session_impl(session_token: str) -> dict | None:
     conn = get_conn()
     cur  = conn.cursor()
     try:
