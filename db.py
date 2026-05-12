@@ -1043,7 +1043,7 @@ def get_hard_exit_trades_today(user_id: str = "") -> list[dict]:
     try:
         clauses = [
             "DATE(opened_at AT TIME ZONE 'Asia/Kolkata') = %s",
-            "status IN ('CLOSED','STOPPED_OUT')",
+            "status = 'CLOSED'",   # STOPPED_OUT = genuine stop hit, price is correct
             "actual_exit IS NOT NULL",
             "rec_stop IS NOT NULL",
             "rec_stop > 0",

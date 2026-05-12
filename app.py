@@ -7996,7 +7996,24 @@ def _activity_log_live():
         # ── Closed trades (static — no need to refresh every second) ──────────
         if not _closed_rows.empty:
             st.markdown("##### Closed today")
-            _render_trade_table(_enrich_df(_closed_rows, inject_mtm=False), key_sfx="act_closed")
+            # LTP: WebSocket first; if stale/empty after market close, hit Kite
+            # OHLC batch API for the latest traded price.
+            _cl_ltp_snap = _kc_module.get_all_ticker_prices() or {}
+            _cl_syms = _closed_rows["tradingsymbol"].dropna().tolist()
+            _missing = [s for s in _cl_syms if not _cl_ltp_snap.get(s)]
+            if _missing:
+                try:
+                    _cl_kc = st.session_state.get("kite_client")
+                    if _cl_kc and getattr(_cl_kc, "authenticated", False):
+                        _ohlc = _cl_kc.get_ohlc_batch([f"NSE:{s}" for s in _missing])
+                        for _ms in _missing:
+                            _p = (_ohlc.get(f"NSE:{_ms}") or {}).get("last_price")
+                            if _p:
+                                _cl_ltp_snap[_ms] = float(_p)
+                except Exception:
+                    pass
+            _render_trade_table(_enrich_df(_closed_rows, inject_mtm=False,
+                                           ltp_snap=_cl_ltp_snap), key_sfx="act_closed")
 
         # ── Open trades — live MTM refreshed every 1s ─────────────────────────
         if not _open_rows.empty:
