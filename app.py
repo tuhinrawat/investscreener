@@ -1218,7 +1218,7 @@ if require_all_positive:
 # ============================================================
 import time as _time_mod   # needed for TTL calculations here and in fragment
 
-@st.fragment(run_every=1)
+@st.fragment(run_every=2)
 def _market_pulse_header():
     """
     Compact always-visible metric row above the three main tabs.
@@ -2009,41 +2009,6 @@ def _market_pulse_header():
 
 
 _market_pulse_header()
-
-# ============================================================
-# GLOBAL LTP UPDATER — runs every 1s regardless of active tab
-# Reads WebSocket _TICKER_PRICES → session_state["_live_ltp"]
-# so Activity Log, Intraday positions, and Screener all get
-# fresh LTP even when the Trade Signals tab is not visible.
-# ============================================================
-@st.fragment(run_every=1)
-def _global_ltp_updater():
-    # Inline market-hours check — _is_market_open() is defined later in the file
-    _now_g = datetime.now(_IST)
-    if not (
-        _now_g.weekday() < 5
-        and _now_g.replace(hour=9,  minute=15, second=0, microsecond=0)
-            <= _now_g <=
-            _now_g.replace(hour=15, minute=30, second=0, microsecond=0)
-    ):
-        return
-    _snap = _kc_module.get_all_ticker_prices()
-    if not _snap:
-        return
-    if "_live_ltp" in st.session_state:
-        st.session_state["_prev_ltp"] = dict(st.session_state["_live_ltp"])
-    st.session_state["_live_ltp"]    = _snap
-    st.session_state["_live_ltp_ts"] = datetime.now(_IST)
-    _nf = _snap.get("NIFTY 50")
-    if _nf:
-        st.session_state["_nifty_live_ltp"] = float(_nf)
-        _nf_prev = st.session_state.get("_nifty_prev_close")
-        if _nf_prev and _nf_prev > 0:
-            st.session_state["_nifty_intraday_pct"] = round(
-                (float(_nf) - _nf_prev) / _nf_prev * 100, 3
-            )
-
-_global_ltp_updater()
 
 # ============================================================
 # TAB LAYOUT — Screener | Trade Signals | Activity Log
@@ -8164,6 +8129,22 @@ def _ticker_banner():
         _prices = st.session_state.get("_live_ltp", {})
 
     _mkt_open = _is_market_open()
+
+    # Sync WebSocket prices → session_state so all other fragments/tabs see
+    # fresh LTP without needing a separate _global_ltp_updater fragment.
+    if _ws_prices and _mkt_open:
+        if "_live_ltp" in st.session_state:
+            st.session_state["_prev_ltp"] = dict(st.session_state["_live_ltp"])
+        st.session_state["_live_ltp"]    = _ws_prices
+        st.session_state["_live_ltp_ts"] = datetime.now(_IST)
+        _nf = _ws_prices.get("NIFTY 50")
+        if _nf:
+            st.session_state["_nifty_live_ltp"] = float(_nf)
+            _nf_prev = st.session_state.get("_nifty_prev_close")
+            if _nf_prev and _nf_prev > 0:
+                st.session_state["_nifty_intraday_pct"] = round(
+                    (float(_nf) - _nf_prev) / _nf_prev * 100, 3
+                )
 
     if not _prices:
         # No WebSocket ticks yet — try fetching last-close prices from Kite REST API
