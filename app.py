@@ -4856,13 +4856,16 @@ def _live_signals_header():
         # ── Pass 2c: Scalp hard exit at 2:45 PM ──────────────────────────────
         # No once-per-day flag: scalp_open being non-empty is the retry gate.
         # This allows re-attempting close if close_trade failed on the first try.
+        _ws_snap_scalp = _kc_module.get_all_ticker_prices() or {}
         if _past_245_chk and st.session_state.get("scalp_open"):
             for _schid, _scht in list(st.session_state["scalp_open"].items()):
-                # Prefer live LTP; if stale/missing, use last known stop as a conservative exit
-                # rather than entry (which gives ₹0 P&L and is misleading).
-                _sch_ltp = (_live_ltp_now.get(_scht.get("sym", ""), 0)
-                            or _scht.get("stop", 0)
-                            or _scht.get("entry", 0))
+                # Prefer fresh WebSocket price; fall back to session LTP; last resort entry.
+                _sym_scalp = _scht.get("sym", "")
+                _sch_ltp = (
+                    _ws_snap_scalp.get(_sym_scalp)
+                    or _live_ltp_now.get(_sym_scalp)
+                    or _scht.get("entry", 0)
+                )
                 try:
                     db.close_trade(
                         _schid, _sch_ltp, "CLOSED",
@@ -4876,12 +4879,16 @@ def _live_signals_header():
         # ── Pass 3: Hard exit at 3:10 PM — close ALL remaining paper positions ─
         # Kite auto-squares MIS at 3:20 PM; we enforce 3:10 PM ourselves.
         # No once-per-day flag: paper_open being non-empty is the retry gate.
+        _ws_snap_hard = _kc_module.get_all_ticker_prices() or {}
         if _past_310_chk and st.session_state.get("paper_open"):
             for _hpid, _hpt in list(st.session_state["paper_open"].items()):
-                # Prefer live LTP; if stale/missing, use stop as conservative exit
-                _h_ltp = (_live_ltp_now.get(_hpt.get("sym", ""), 0)
-                          or _hpt.get("stop", 0)
-                          or _hpt.get("entry", 0))
+                # Prefer fresh WebSocket price; fall back to session LTP; last resort entry.
+                _sym_hard = _hpt.get("sym", "")
+                _h_ltp = (
+                    _ws_snap_hard.get(_sym_hard)
+                    or _live_ltp_now.get(_sym_hard)
+                    or _hpt.get("entry", 0)
+                )
                 try:
                     db.close_trade(
                         _hpid, _h_ltp, "CLOSED",
