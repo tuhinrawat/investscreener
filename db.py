@@ -1632,7 +1632,6 @@ def compute_trade_patterns(user_id: str = "") -> int:
     cur  = conn.cursor()
     try:
         clauses = [
-            "is_paper_trade = TRUE",
             "status IN ('TARGET_HIT','STOPPED_OUT','CLOSED')",
             "trade_date < %s",
         ]

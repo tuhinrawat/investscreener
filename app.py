@@ -5492,6 +5492,8 @@ def _intraday_scalp_live():
             if (_trade_mode == "paper"
                     and _sc_trig_key not in st.session_state.get("scalp_triggered", {})):
                 try:
+                    _ltp_sc_p = float(_ltp_now or 1)
+                    _atr_sc_p = float(_row.get("atr_14") or 0)
                     _scid = db.log_trade({
                         "trade_date":          datetime.now(_IST).date(),
                         "tradingsymbol":       _sym,
@@ -5515,6 +5517,11 @@ def _intraday_scalp_live():
                         ),
                         "is_paper_trade": True,
                         "intraday_confidence": _sc_conf,
+                        "sector":          db.get_sector_for_symbol(_sym),
+                        "nifty_pct_chg":   st.session_state.get("_nifty_intraday_pct"),
+                        "rsi_at_entry":    _row.get("rsi_14"),
+                        "atr_ratio":       round(_atr_sc_p / _ltp_sc_p, 5) if _ltp_sc_p else None,
+                        "entry_hour":      datetime.now(_IST).hour,
                     })
                     st.session_state["scalp_triggered"][_sc_trig_key] = _scid
                     st.session_state["scalp_open"][_scid] = {
@@ -5566,6 +5573,8 @@ def _intraday_scalp_live():
                                 )
                             except Exception:
                                 pass
+                        _ltp_sc_r = float(_ltp_now or 1)
+                        _atr_sc_r = float(_row.get("atr_14") or 0)
                         _scid_r = db.log_trade({
                             "trade_date":          datetime.now(_IST).date(),
                             "tradingsymbol":       _sym,
@@ -5592,6 +5601,11 @@ def _intraday_scalp_live():
                             ),
                             "is_paper_trade": False,
                             "intraday_confidence": _sc_conf,
+                            "sector":          db.get_sector_for_symbol(_sym),
+                            "nifty_pct_chg":   st.session_state.get("_nifty_intraday_pct"),
+                            "rsi_at_entry":    _row.get("rsi_14"),
+                            "atr_ratio":       round(_atr_sc_r / _ltp_sc_r, 5) if _ltp_sc_r else None,
+                            "entry_hour":      datetime.now(_IST).hour,
                         })
                         st.session_state["scalp_triggered"][_sc_trig_key] = _scid_r
                         st.session_state["scalp_open"][_scid_r] = {
@@ -5943,6 +5957,8 @@ def _intraday_long_live():
                                 )
                             except Exception:
                                 pass
+                        _ltp_rl  = float(r.get("ltp") or _trigger_price or 1)
+                        _atr_rl  = float(r.get("atr_14") or 0)
                         _rid = db.log_trade({
                             "trade_date":              datetime.now(_IST).date(),
                             "tradingsymbol":           sym,
@@ -5966,6 +5982,11 @@ def _intraday_long_live():
                             "notes":                   f"💸 Real — auto TRIGGERED @ ₹{_trigger_price:.2f} (conf {confidence}/10, ₹{_cap_this_trade:,}) | SL={_sl_oid} | trailing profit exit",
                             "is_paper_trade":          False,
                             "intraday_confidence":     confidence,
+                            "sector":          db.get_sector_for_symbol(sym),
+                            "nifty_pct_chg":   st.session_state.get("_nifty_intraday_pct"),
+                            "rsi_at_entry":    r.get("rsi_14"),
+                            "atr_ratio":       round(_atr_rl / _ltp_rl, 5) if _ltp_rl else None,
+                            "entry_hour":      datetime.now(_IST).hour,
                         })
                         st.session_state.setdefault("_real_companions", {})[_rid] = {
                             "sl": _sl_oid, "tgt": None
@@ -6439,6 +6460,8 @@ def _intraday_short_live():
                                 )
                             except Exception:
                                 pass
+                        _ltp_rls = float(r.get("ltp") or _trigger_price or 1)
+                        _atr_rls = float(r.get("atr_14") or 0)
                         _rid = db.log_trade({
                             "trade_date":              datetime.now(_IST).date(),
                             "tradingsymbol":           sym,
@@ -6462,6 +6485,11 @@ def _intraday_short_live():
                             "notes":                   f"💸 Real — auto TRIGGERED @ ₹{_trigger_price:.2f} (conf {confidence}/10, ₹{_cap_this_trade:,}) | SL={_sl_oid} | trailing profit exit",
                             "is_paper_trade":          False,
                             "intraday_confidence":     confidence,
+                            "sector":          db.get_sector_for_symbol(sym),
+                            "nifty_pct_chg":   st.session_state.get("_nifty_intraday_pct"),
+                            "rsi_at_entry":    r.get("rsi_14"),
+                            "atr_ratio":       round(_atr_rls / _ltp_rls, 5) if _ltp_rls else None,
+                            "entry_hour":      datetime.now(_IST).hour,
                         })
                         st.session_state.setdefault("_real_companions", {})[_rid] = {
                             "sl": _sl_oid, "tgt": None
