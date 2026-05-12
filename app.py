@@ -4543,7 +4543,10 @@ def _live_signals_header():
     # the hard-exit thresholds (2:45 PM for scalps, 3:10 PM for intraday) when
     # there are still open positions — covers the case where close_trade failed
     # during market hours and needs a retry after 3:30 PM market close.
-    _live_ltp_now      = st.session_state.get("_live_ltp", {})
+    # Always use the freshest WebSocket prices for any trade close decision.
+    # Session _live_ltp is a snapshot from the last render — WebSocket dict
+    # is updated in real-time by the ticker thread, so prefer it.
+    _live_ltp_now      = _kc_module.get_all_ticker_prices() or st.session_state.get("_live_ltp", {})
     _now_exit          = datetime.now(_IST)
     _past_245_chk      = (_now_exit.hour > 14 or (_now_exit.hour == 14 and _now_exit.minute >= 45))
     _past_310_chk      = (_now_exit.hour > 15 or (_now_exit.hour == 15 and _now_exit.minute >= 10))
@@ -4710,7 +4713,7 @@ def _live_signals_header():
                     _g_real_open = st.session_state.get("_gate_real_open", [])
                     for _gr in _g_real_open:
                         _gr_sym   = _gr.get("tradingsymbol", "")
-                        _gr_ltp   = _live_ltp_now.get(_gr_sym, 0)
+                        _gr_ltp   = (_kc_module.get_all_ticker_prices() or {}).get(_gr_sym) or _live_ltp_now.get(_gr_sym, 0)
                         _gr_entry = float(_gr.get("actual_entry") or 0)
                         _gr_qty   = int(_gr.get("quantity") or 0)
                         _gr_sig   = _gr.get("signal_type", "")
@@ -5083,9 +5086,9 @@ def _trading_mode_control():
 
         # 1. Close all open paper trades at LTP
         for _pid, _pt in list(st.session_state.get("paper_open", {}).items()):
-            _exit_p = _live_ltp_now.get(_pt.get("sym", ""), _pt.get("entry", 0))
+            _exit_p = (_kc_module.get_all_ticker_prices() or {}).get(_pt.get("sym", ""), 0)
             if not _exit_p:
-                _exit_p = _pt.get("entry", 0)
+                _exit_p = st.session_state.get("_live_ltp", {}).get(_pt.get("sym", ""), 0)
             try:
                 db.close_trade(_pid, float(_exit_p), "CLOSED", "🔴 Kill switch — closed at LTP")
                 st.session_state["paper_open"].pop(_pid, None)
@@ -5123,8 +5126,10 @@ def _trading_mode_control():
                 _errors.append(f"Real order query failed: {_e}")
 
         # 3. Close open scalp positions at LTP
+        _ks_ws = _kc_module.get_all_ticker_prices() or {}
         for _sc_pid, _sc_pt in list(st.session_state.get("scalp_open", {}).items()):
-            _sc_ltp_kill = st.session_state.get("_live_ltp", {}).get(_sc_pt.get("sym", ""), 0)
+            _sc_ltp_kill = (_ks_ws.get(_sc_pt.get("sym", ""))
+                            or st.session_state.get("_live_ltp", {}).get(_sc_pt.get("sym", ""), 0))
             if _sc_ltp_kill:
                 try:
                     db.close_trade(_sc_pid, _sc_ltp_kill, "CLOSED",
