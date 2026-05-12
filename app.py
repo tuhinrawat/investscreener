@@ -2011,6 +2011,34 @@ def _market_pulse_header():
 _market_pulse_header()
 
 # ============================================================
+# GLOBAL LTP UPDATER — runs every 1s regardless of active tab
+# Reads WebSocket _TICKER_PRICES → session_state["_live_ltp"]
+# so Activity Log, Intraday positions, and Screener all get
+# fresh LTP even when the Trade Signals tab is not visible.
+# ============================================================
+@st.fragment(run_every=1)
+def _global_ltp_updater():
+    if not _is_market_open():
+        return
+    _snap = _kc_module.get_all_ticker_prices()
+    if not _snap:
+        return
+    if "_live_ltp" in st.session_state:
+        st.session_state["_prev_ltp"] = dict(st.session_state["_live_ltp"])
+    st.session_state["_live_ltp"]    = _snap
+    st.session_state["_live_ltp_ts"] = datetime.now(_IST)
+    _nf = _snap.get("NIFTY 50")
+    if _nf:
+        st.session_state["_nifty_live_ltp"] = float(_nf)
+        _nf_prev = st.session_state.get("_nifty_prev_close")
+        if _nf_prev and _nf_prev > 0:
+            st.session_state["_nifty_intraday_pct"] = round(
+                (float(_nf) - _nf_prev) / _nf_prev * 100, 3
+            )
+
+_global_ltp_updater()
+
+# ============================================================
 # TAB LAYOUT — Screener | Trade Signals | Activity Log
 # ============================================================
 tab_screener, tab_signals, tab_activity = st.tabs([
@@ -4373,32 +4401,13 @@ def _live_signals_header():
 
     _ltp_err = None
     if _market_open and _signal_syms:
-        # ── Priority 1: WebSocket ticker (100-250 ms, no rate limit) ────────────
-        _ws_used = False
-        if _kc_module.is_ticker_alive():
-            try:
-                _ticker_snap = _kc_module.get_all_ticker_prices()
-                if _ticker_snap:
-                    if "_live_ltp" in st.session_state:
-                        st.session_state["_prev_ltp"] = dict(st.session_state["_live_ltp"])
-                    st.session_state["_live_ltp"]    = _ticker_snap
-                    st.session_state["_live_ltp_ts"] = datetime.now(_IST)
-                    # Nifty 50 direction gate from ticker
-                    _nf_ws = _ticker_snap.get("NIFTY 50")
-                    if _nf_ws:
-                        st.session_state["_nifty_live_ltp"] = float(_nf_ws)
-                        _nf_prev = st.session_state.get("_nifty_prev_close")
-                        if _nf_prev and _nf_prev > 0:
-                            st.session_state["_nifty_intraday_pct"] = round(
-                                (float(_nf_ws) - _nf_prev) / _nf_prev * 100, 3
-                            )
-                    _ws_used = True
-                    # Also update signal subscriptions if new symbols appeared
-                    _kc_module.update_ticker_subscriptions({})   # no-op placeholder
-            except Exception:
-                pass
+        # ── Priority 1: WebSocket ticker ─────────────────────────────────────
+        # _global_ltp_updater (runs outside tabs) already writes _live_ltp from
+        # the WebSocket every 1s.  We just check if it's alive; if so, skip the
+        # REST fallback entirely — avoids redundant work and API calls.
+        _ws_used = _kc_module.is_ticker_alive()
 
-        # ── Priority 2: REST fallback (when ticker is starting up or disconnected) ─
+        # ── Priority 2: REST fallback (ticker down or first startup) ─────────
         if not _ws_used:
             try:
                 # Prefer the already-constructed client from session state.
