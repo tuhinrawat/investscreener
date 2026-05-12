@@ -2017,7 +2017,7 @@ tab_screener, tab_signals, tab_activity = st.tabs([
     "📋 Screener", "🎯 Trade Signals", "📒 Activity Log"
 ])
 
-@st.fragment(run_every=1)
+@st.fragment(run_every=3)
 def _freshness_bar():
     """Live data-freshness status strip shown below the main tabs."""
     _fb_tz   = timezone(timedelta(hours=5, minutes=30))
@@ -5139,7 +5139,7 @@ def _trading_mode_control():
 
 
 # ── FRAGMENT 2b: paper-trade banner (auto-refresh, daily gate logic) ─────────
-@st.fragment(run_every=2)
+@st.fragment(run_every=3)
 def _intraday_paper_banner():
     """
     Renders the 'Paper Trades Today' dashboard strip and enforces the
@@ -5283,7 +5283,7 @@ def _intraday_paper_banner():
 # ── FRAGMENT 2d: scalping signals (ORB — Opening Range Breakout) ─────────────
 # Refreshes every 5 s (slower than intraday because candle fetches are heavier).
 # ORB is valid only after 9:30 AM (need 15-min opening range to be complete).
-@st.fragment(run_every=1)
+@st.fragment(run_every=2)
 def _intraday_scalp_live():
     """
     Scalp signal tab — Opening Range Breakout with 3 confirmations:
@@ -5722,7 +5722,7 @@ def _intraday_scalp_live():
 # ── FRAGMENT 2a: intraday LONG table (live status column) ────────────────────
 # Runs every 2 s inside the Long sub-tab. No st.tabs() here — the sub-tabs
 # that contain this fragment are created OUTSIDE in _signals_main().
-@st.fragment(run_every=1)
+@st.fragment(run_every=2)
 def _intraday_long_live():
     # Skip all work outside market hours — fragment still runs but is instant
     if not _is_market_open():
@@ -6215,7 +6215,7 @@ def _intraday_long_live():
 
 
 # ── FRAGMENT 2b: intraday SHORT table (live status column) ───────────────────
-@st.fragment(run_every=1)
+@st.fragment(run_every=2)
 def _intraday_short_live():
     # Skip all work outside market hours — fragment still runs but is instant
     if not _is_market_open():

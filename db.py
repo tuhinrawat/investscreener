@@ -96,22 +96,19 @@ def _fresh_conn() -> psycopg2.extensions.connection:
 
 def get_conn() -> psycopg2.extensions.connection:
     """
-    Borrow a connection from the pool, guaranteed to be alive.
-    Proactively pings with SELECT 1 to catch Neon idle-timeout drops
-    before handing the connection to the caller.
+    Borrow a connection from the pool.
+    Uses conn.closed as a fast (no network) pre-check, then attempts a
+    rollback() to reset transaction state.  Dead connections detected here
+    trigger a full pool rebuild.  Any SSL drop that slips through is caught
+    by _with_retry() at the call site.
     """
     global _pool
     pool = _get_pool()
     conn = pool.getconn()
-    # Fast closed check (no network)
     if conn.closed:
         return _fresh_conn()
-    # Ping to catch SSL drops that haven't set conn.closed yet
     try:
-        cur = conn.cursor()
-        cur.execute("SELECT 1")
-        cur.close()
-        conn.rollback()   # reset transaction state
+        conn.rollback()   # reset transaction state, no network if already clean
     except Exception:
         try:
             conn.close()
