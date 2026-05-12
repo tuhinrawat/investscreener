@@ -4940,7 +4940,21 @@ def _live_signals_header():
                         sl_oid  = _rt.get("kite_sl_order_id"),
                         tgt_oid = _rt.get("kite_target_order_id"),
                     )
-                    _fallback_ltp = _live_ltp_now.get(_rt_sym, 0)
+                    # Try OHLC API for the closing price — more reliable at 3:20 PM
+                    # than the stale WebSocket snapshot (market is closed).
+                    _fallback_ltp = 0.0
+                    try:
+                        _ohlc_q = _kc_sync.get_ohlc_batch([f"NSE:{_rt_sym}"])
+                        _fallback_ltp = float(
+                            (_ohlc_q.get(f"NSE:{_rt_sym}") or {}).get("last_price") or 0
+                        )
+                    except Exception:
+                        pass
+                    if not _fallback_ltp:
+                        _fallback_ltp = (
+                            (_kc_module.get_all_ticker_prices() or {}).get(_rt_sym)
+                            or _live_ltp_now.get(_rt_sym, 0)
+                        )
                     if _fallback_ltp:
                         try:
                             db.close_trade(
