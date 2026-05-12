@@ -1010,6 +1010,117 @@ def close_trade(trade_id: int, actual_exit: float, status: str, notes: str = Non
             pass  # never let a capital-update failure block a trade close
 
 
+def get_hard_exit_trades_today(user_id: str = "") -> list[dict]:
+    """
+    Return today's closed trades where the exit price looks like the stop-loss
+    was used instead of LTP — i.e. notes contain '⏰' AND actual_exit rounds to
+    rec_stop within 0.5%.  These are candidates for a price backfix.
+    """
+    import datetime as _dt
+    _IST  = _dt.timezone(_dt.timedelta(hours=5, minutes=30))
+    today = str(_dt.datetime.now(_IST).date())
+
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        clauses = [
+            "DATE(opened_at AT TIME ZONE 'Asia/Kolkata') = %s",
+            "status IN ('CLOSED','STOPPED_OUT')",
+            "actual_exit IS NOT NULL",
+            "notes LIKE '%%⏰%%'",
+        ]
+        params: list = [today]
+        if user_id:
+            clauses.append("kite_user_id = %s")
+            params.append(user_id)
+
+        cur.execute(
+            "SELECT id, tradingsymbol, signal_type, quantity, "
+            "       actual_entry, actual_exit, rec_stop, pnl_amount, "
+            "       is_paper_trade, notes "
+            "FROM trade_log WHERE " + " AND ".join(clauses),
+            params,
+        )
+        rows = cur.fetchall()
+        results = []
+        for r in rows:
+            tid, sym, sig, qty, ae, ax, rs, pnl, is_paper, notes = r
+            # Flag if actual_exit is within 0.5% of rec_stop (stop was used as exit)
+            if rs and ax and abs(ax - rs) / max(rs, 0.01) < 0.005:
+                results.append({
+                    "id": tid, "tradingsymbol": sym, "signal_type": sig,
+                    "quantity": qty, "actual_entry": ae, "actual_exit": ax,
+                    "rec_stop": rs, "pnl_amount": pnl,
+                    "is_paper_trade": is_paper, "notes": notes,
+                })
+        return results
+    finally:
+        cur.close()
+        release_conn(conn)
+
+
+def refix_trade_exit(trade_id: int, new_exit: float) -> dict:
+    """
+    Correct the exit price for an already-closed trade.  Updates P&L and,
+    for paper trades, adjusts user_capital by the difference so the balance
+    reflects the corrected outcome.
+    """
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT quantity, actual_entry, rec_entry, rec_stop, signal_type, "
+            "       pnl_amount, is_paper_trade, kite_user_id "
+            "FROM trade_log WHERE id = %s",
+            [trade_id],
+        )
+        row = cur.fetchone()
+        if not row:
+            return {}
+        qty, ae, re, rs, sig, old_pnl, is_paper, kite_uid = row
+
+        new_outcomes = _compute_outcomes(qty or 1, ae, new_exit, re, rs, sig or "")
+        new_pnl = new_outcomes.get("pnl_amount")
+
+        cur.execute("""
+            UPDATE trade_log
+            SET actual_exit   = %s,
+                pnl_amount    = %s,
+                pnl_pct       = %s,
+                rr_realised   = %s
+            WHERE id = %s
+        """, [
+            new_exit,
+            new_outcomes["pnl_amount"],
+            new_outcomes["pnl_pct"],
+            new_outcomes["rr_realised"],
+            trade_id,
+        ])
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        release_conn(conn)
+
+    # Adjust paper capital by the P&L delta (don't double-count full amount)
+    if is_paper and kite_uid and new_pnl is not None and old_pnl is not None:
+        delta = new_pnl - float(old_pnl)
+        if abs(delta) > 0.01:
+            try:
+                adjust_user_capital(kite_uid, delta)
+            except Exception:
+                pass
+
+    return {
+        "old_exit": float(row[1]) if row else 0,  # ae is actual_entry, not exit
+        "new_exit": new_exit,
+        "old_pnl":  float(old_pnl) if old_pnl is not None else 0,
+        "new_pnl":  new_pnl,
+    }
+
+
 def get_nifty50_tokens() -> dict:
     """
     Return {instrument_token: tradingsymbol} for Nifty 50 constituent stocks.

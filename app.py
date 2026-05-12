@@ -7457,17 +7457,19 @@ def _activity_log_live():
                 icon="⚠️",
             )
             if st.button("⏰ Force Close All Open Paper Trades (EOD)", type="primary", key="_eod_force_close"):
-                _ltp_snap = st.session_state.get("_live_ltp", {})
+                _ltp_snap = _kc_module.get_all_ticker_prices() or st.session_state.get("_live_ltp", {})
                 # Close from session state (in-memory)
                 for _fc_id, _fc_t in list(st.session_state.get("paper_open", {}).items()):
-                    _fc_ltp = _ltp_snap.get(_fc_t.get("sym", ""), 0) or _fc_t.get("stop", 0) or _fc_t.get("entry", 0)
+                    _fc_sym = _fc_t.get("sym", "")
+                    _fc_ltp = _ltp_snap.get(_fc_sym) or _fc_t.get("entry", 0)
                     try:
                         db.close_trade(_fc_id, _fc_ltp, "CLOSED", f"⏰ EOD manual force-close @ ₹{_fc_ltp:.2f}")
                         st.session_state["paper_open"].pop(_fc_id, None)
                     except Exception:
                         pass
                 for _fc_id, _fc_t in list(st.session_state.get("scalp_open", {}).items()):
-                    _fc_ltp = _ltp_snap.get(_fc_t.get("sym", ""), 0) or _fc_t.get("stop", 0) or _fc_t.get("entry", 0)
+                    _fc_sym = _fc_t.get("sym", "")
+                    _fc_ltp = _ltp_snap.get(_fc_sym) or _fc_t.get("entry", 0)
                     try:
                         db.close_trade(_fc_id, _fc_ltp, "CLOSED", f"⏰ EOD manual force-close @ ₹{_fc_ltp:.2f}")
                         st.session_state["scalp_open"].pop(_fc_id, None)
@@ -7476,16 +7478,68 @@ def _activity_log_live():
                 # Also close any DB-tracked open trades (in case session_state was reset)
                 try:
                     for _dbt in db.get_open_paper_trades(user_id=_uid):
-                        _dbt_ltp = _ltp_snap.get(_dbt.get("tradingsymbol", ""), 0) or 0
+                        _dbt_sym = _dbt.get("tradingsymbol", "")
+                        _dbt_ltp = _ltp_snap.get(_dbt_sym) or _dbt.get("actual_entry", 0)
                         try:
-                            db.close_trade(_dbt["id"], _dbt_ltp or _dbt.get("rec_stop", 0) or _dbt.get("actual_entry", 0),
-                                           "CLOSED", "⏰ EOD manual force-close (DB)")
+                            db.close_trade(_dbt["id"], _dbt_ltp, "CLOSED", "⏰ EOD manual force-close (DB)")
                         except Exception:
                             pass
                 except Exception:
                     pass
                 st.session_state["_actlog_stale"] = True
                 st.success("All open paper trades closed.")
+                st.rerun()
+
+    # ── Backfix hard-exit prices — shown after 3:10 PM if any trades were
+    # closed with stop-loss price instead of actual LTP ────────────────────────
+    if _past_310_act and _uid:
+        try:
+            _bf_broken = db.get_hard_exit_trades_today(user_id=_uid)
+        except Exception:
+            _bf_broken = []
+        if _bf_broken:
+            _bf_syms = ", ".join(t["tradingsymbol"] for t in _bf_broken)
+            st.warning(
+                f"⚠️ **{len(_bf_broken)} trade(s)** were hard-exited at the stop-loss price "
+                f"instead of the actual market price: **{_bf_syms}**. "
+                "Click below to fetch today's closing prices and correct them.",
+                icon="🔧",
+            )
+            if st.button("🔧 Fix Exit Prices with Closing LTP", type="primary",
+                         key="_bf_fix_exits"):
+                _bf_kc = st.session_state.get("kite_client")
+                _bf_fixed = 0
+                _bf_errors = []
+                for _bft in _bf_broken:
+                    _bft_sym = _bft["tradingsymbol"]
+                    _closing_ltp = 0.0
+                    # Try OHLC batch first; fallback to WebSocket last-known price
+                    try:
+                        if _bf_kc and getattr(_bf_kc, "authenticated", False):
+                            _ohlc_r = _bf_kc.get_ohlc_batch([f"NSE:{_bft_sym}"])
+                            _closing_ltp = float(
+                                (_ohlc_r.get(f"NSE:{_bft_sym}") or {}).get("last_price") or 0
+                            )
+                    except Exception:
+                        pass
+                    if not _closing_ltp:
+                        _closing_ltp = (
+                            (_kc_module.get_all_ticker_prices() or {}).get(_bft_sym)
+                            or st.session_state.get("_live_ltp", {}).get(_bft_sym, 0)
+                        )
+                    if not _closing_ltp:
+                        _bf_errors.append(f"{_bft_sym}: could not fetch LTP")
+                        continue
+                    try:
+                        db.refix_trade_exit(_bft["id"], float(_closing_ltp))
+                        _bf_fixed += 1
+                    except Exception as _bfe:
+                        _bf_errors.append(f"{_bft_sym}: {_bfe}")
+                st.session_state["_actlog_stale"] = True
+                if _bf_fixed:
+                    st.success(f"✅ Corrected exit prices for {_bf_fixed} trade(s).")
+                if _bf_errors:
+                    st.error("Errors: " + "; ".join(_bf_errors))
                 st.rerun()
 
     # ── PORTFOLIO SNAPSHOT — live Kite margin + holdings + positions ────────
