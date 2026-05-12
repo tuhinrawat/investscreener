@@ -7490,71 +7490,6 @@ def _activity_log_live():
                 st.success("All open paper trades closed.")
                 st.rerun()
 
-    # ── Backfix hard-exit prices — shown whenever broken trades detected ────────
-    if _uid:
-        try:
-            _bf_broken = db.get_hard_exit_trades_today(user_id=_uid)
-        except Exception:
-            _bf_broken = []
-        if _bf_broken:
-            _bf_syms = ", ".join(t["tradingsymbol"] for t in _bf_broken)
-            st.warning(
-                f"⚠️ **{len(_bf_broken)} trade(s)** were hard-exited at the stop-loss price "
-                f"instead of the actual market price: **{_bf_syms}**. "
-                "Click below to correct them using today's closing price.",
-                icon="🔧",
-            )
-            if st.button("🔧 Fix Exit Prices with Closing LTP", type="primary",
-                         key="_bf_fix_exits"):
-                _bf_kc = st.session_state.get("kite_client")
-                _bf_fixed = 0
-                _bf_errors = []
-
-                # Bulk-fetch stored LTPs from computed_metrics (no Kite auth needed)
-                _bf_all_syms = [t["tradingsymbol"] for t in _bf_broken]
-                _stored_ltps = db.get_stored_ltps(_bf_all_syms)
-
-                for _bft in _bf_broken:
-                    _bft_sym = _bft["tradingsymbol"]
-                    _closing_ltp = 0.0
-
-                    # Priority 1: Kite OHLC API (most accurate closing price)
-                    try:
-                        if _bf_kc and getattr(_bf_kc, "authenticated", False):
-                            _ohlc_r = _bf_kc.get_ohlc_batch([f"NSE:{_bft_sym}"])
-                            _closing_ltp = float(
-                                (_ohlc_r.get(f"NSE:{_bft_sym}") or {}).get("last_price") or 0
-                            )
-                    except Exception:
-                        pass
-
-                    # Priority 2: computed_metrics stored LTP (last Quick Refresh price)
-                    if not _closing_ltp:
-                        _closing_ltp = _stored_ltps.get(_bft_sym, 0.0)
-
-                    # Priority 3: live WebSocket / session snapshot
-                    if not _closing_ltp:
-                        _closing_ltp = (
-                            (_kc_module.get_all_ticker_prices() or {}).get(_bft_sym)
-                            or st.session_state.get("_live_ltp", {}).get(_bft_sym, 0)
-                        )
-
-                    if not _closing_ltp:
-                        _bf_errors.append(f"{_bft_sym}: could not find closing price")
-                        continue
-                    try:
-                        db.refix_trade_exit(_bft["id"], float(_closing_ltp))
-                        _bf_fixed += 1
-                    except Exception as _bfe:
-                        _bf_errors.append(f"{_bft_sym}: {_bfe}")
-
-                st.session_state["_actlog_stale"] = True
-                if _bf_fixed:
-                    st.success(f"✅ Corrected exit prices for {_bf_fixed} trade(s).")
-                if _bf_errors:
-                    st.error("Errors: " + "; ".join(_bf_errors))
-                st.rerun()
-
     # ── PORTFOLIO SNAPSHOT — live Kite margin + holdings + positions ────────
     # Cached for 60 s to avoid hitting Kite API on every fragment tick.
     _pf_kc = st.session_state.get("kite_client")
@@ -8060,6 +7995,49 @@ def _activity_log_live():
                     st.session_state["_actlog_stale"] = True
                     st.success(f"Trade #{_sel_id} closed as {_close_status} at ₹{_close_exit:.2f}")
                     st.rerun()
+
+        # ── Fix wrong exit prices ──────────────────────────────────────────
+        if st.button("🔧 Fix Today's Exit Prices", key="_fix_exit_prices",
+                     help="Fetches latest Kite price for every closed trade today and corrects "
+                          "any exit recorded at the stop-loss price instead of actual LTP"):
+            _fix_kc  = st.session_state.get("kite_client")
+            _fix_uid = _uid
+            _fixed, _skipped, _errors = 0, 0, []
+            try:
+                _today_closed = db.get_hard_exit_trades_today(user_id=_fix_uid)
+            except Exception as _fte:
+                _today_closed = []
+                _errors.append(str(_fte))
+            if not _today_closed:
+                st.info("No exit-price mismatches found for today's closed trades.")
+            else:
+                for _ft in _today_closed:
+                    _ft_sym = _ft["tradingsymbol"]
+                    _ft_ltp = 0.0
+                    try:
+                        if _fix_kc and getattr(_fix_kc, "authenticated", False):
+                            _ft_ohlc = _fix_kc.get_ohlc_batch([f"NSE:{_ft_sym}"])
+                            _ft_ltp  = float(
+                                (_ft_ohlc.get(f"NSE:{_ft_sym}") or {}).get("last_price") or 0
+                            )
+                    except Exception:
+                        pass
+                    if not _ft_ltp:
+                        _ft_ltp = (_kc_module.get_all_ticker_prices() or {}).get(_ft_sym, 0)
+                    if not _ft_ltp:
+                        _errors.append(f"{_ft_sym}: could not fetch price")
+                        continue
+                    try:
+                        db.refix_trade_exit(_ft["id"], float(_ft_ltp))
+                        _fixed += 1
+                    except Exception as _fe:
+                        _errors.append(f"{_ft_sym}: {_fe}")
+                st.session_state["_actlog_stale"] = True
+                if _fixed:
+                    st.success(f"✅ Fixed {_fixed} trade(s).")
+                if _errors:
+                    st.error("; ".join(_errors))
+                st.rerun()
 
         # ── Delete a trade ─────────────────────────────────────────────────
         with st.expander("🗑️ Delete a trade entry", expanded=False):
