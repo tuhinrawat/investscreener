@@ -2018,7 +2018,14 @@ _market_pulse_header()
 # ============================================================
 @st.fragment(run_every=1)
 def _global_ltp_updater():
-    if not _is_market_open():
+    # Inline market-hours check — _is_market_open() is defined later in the file
+    _now_g = datetime.now(_IST)
+    if not (
+        _now_g.weekday() < 5
+        and _now_g.replace(hour=9,  minute=15, second=0, microsecond=0)
+            <= _now_g <=
+            _now_g.replace(hour=15, minute=30, second=0, microsecond=0)
+    ):
         return
     _snap = _kc_module.get_all_ticker_prices()
     if not _snap:
