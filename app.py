@@ -7958,10 +7958,23 @@ def _activity_log_live():
                 _rows = st.session_state.get("_actlog_open_rows")
                 if _rows is None or _rows.empty:
                     return
-                # Read fresh prices on every fragment run — bypasses the stale
-                # module-level _live_ltp_now snapshot from the last full render.
-                _fresh = _kc_module.get_all_ticker_prices() or st.session_state.get("_live_ltp", {})
-                _render_trade_table(_enrich_df(_rows, inject_mtm=True, ltp_snap=_fresh), key_sfx="act_open")
+                _op_syms = _rows["tradingsymbol"].dropna().unique().tolist()
+                _op_ltp_snap = dict(_kc_module.get_all_ticker_prices() or {})
+                _op_ltp_snap.update(st.session_state.get("_live_ltp", {}))
+                # Kite OHLC fallback for any symbol still missing
+                _op_missing = [s for s in _op_syms if not _op_ltp_snap.get(s)]
+                if _op_missing:
+                    try:
+                        _op_kc = st.session_state.get("kite_client")
+                        if _op_kc and getattr(_op_kc, "authenticated", False):
+                            _op_ohlc = _op_kc.get_ohlc_batch([f"NSE:{s}" for s in _op_missing])
+                            for _ms in _op_missing:
+                                _p = (_op_ohlc.get(f"NSE:{_ms}") or {}).get("last_price")
+                                if _p:
+                                    _op_ltp_snap[_ms] = float(_p)
+                    except Exception:
+                        pass
+                _render_trade_table(_enrich_df(_rows, inject_mtm=True, ltp_snap=_op_ltp_snap), key_sfx="act_open")
 
             _open_trades_mtm()
 
