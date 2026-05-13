@@ -577,11 +577,38 @@ if (_kc_ticker_client and getattr(_kc_ticker_client, "authenticated", False)
                 _ticker_tok_map[int(_tr.instrument_token)] = str(_tr.tradingsymbol)
     except Exception:
         pass
+    # Add open-trade symbols so their LTP is always live even if not in scan
+    try:
+        _open_syms = [
+            r["tradingsymbol"]
+            for r in db.get_open_paper_trades(user_id=st.session_state.get("kite_user_id", ""))
+            if r.get("tradingsymbol")
+        ]
+        if _open_syms:
+            _open_tok_rows = db.get_tokens_for_symbols(_open_syms)
+            _ticker_tok_map.update(_open_tok_rows)
+    except Exception:
+        pass
     _kc_module.start_ticker(
         api_key=st.session_state.get("kite_api_key", ""),
         access_token=st.session_state.get("kite_access_token", ""),
         token_symbol_map=_ticker_tok_map,
     )
+elif (_kc_ticker_client and getattr(_kc_ticker_client, "authenticated", False)
+        and _kc_module.is_ticker_started()):
+    # Ticker already running — ensure any open-trade symbols are subscribed
+    try:
+        _open_syms_live = [
+            r["tradingsymbol"]
+            for r in db.get_open_paper_trades(user_id=st.session_state.get("kite_user_id", ""))
+            if r.get("tradingsymbol")
+        ]
+        if _open_syms_live:
+            _open_tok_live = db.get_tokens_for_symbols(_open_syms_live)
+            if _open_tok_live:
+                _kc_module.update_ticker_subscriptions(_open_tok_live)
+    except Exception:
+        pass
 
 # Convenience alias — current Kite user id for per-user DB filtering
 _cur_user_id: str = st.session_state.get("kite_user_id", "")

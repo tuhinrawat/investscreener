@@ -1091,6 +1091,25 @@ def refix_trade_exit(trade_id: int, new_exit: float) -> dict:
     }
 
 
+def get_tokens_for_symbols(symbols: list) -> dict:
+    """Return {instrument_token: tradingsymbol} for a given list of NSE symbols."""
+    if not symbols:
+        return {}
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT instrument_token, tradingsymbol FROM instruments "
+                "WHERE exchange = 'NSE' AND tradingsymbol = ANY(%s)",
+                [list(symbols)],
+            )
+            return {int(row[0]): str(row[1]) for row in cur.fetchall()}
+    except Exception:
+        return {}
+    finally:
+        put_conn(conn)
+
+
 def get_nifty50_tokens() -> dict:
     """
     Return {instrument_token: tradingsymbol} for Nifty 50 constituent stocks.
