@@ -1110,6 +1110,28 @@ def get_tokens_for_symbols(symbols: list) -> dict:
         put_conn(conn)
 
 
+def get_universe_tokens() -> dict:
+    """
+    Return {instrument_token: tradingsymbol} for every stock in the screener
+    universe (computed_metrics). Falls back to Nifty 50 if table is empty.
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT instrument_token, tradingsymbol FROM computed_metrics "
+                "WHERE instrument_token IS NOT NULL"
+            )
+            rows = cur.fetchall()
+            if rows:
+                return {int(r[0]): str(r[1]) for r in rows}
+    except Exception:
+        pass
+    finally:
+        put_conn(conn)
+    return get_nifty50_tokens()
+
+
 def get_nifty50_tokens() -> dict:
     """
     Return {instrument_token: tradingsymbol} for Nifty 50 constituent stocks.

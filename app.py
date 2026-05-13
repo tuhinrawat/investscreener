@@ -556,7 +556,7 @@ if "kite_client" not in st.session_state or not st.session_state["kite_client"]:
 
 # ── Start KiteTicker WebSocket (once per process, reconnects automatically) ──
 # We start the ticker whenever Kite is authenticated AND the ticker isn't alive.
-# Token map: signal symbols + all Nifty 50 stocks + NIFTY 50 / BANK NIFTY indices.
+# Token map: full screener universe (computed_metrics) + NIFTY 50/BANK indices.
 _kc_ticker_client = st.session_state.get("kite_client")
 if (_kc_ticker_client and getattr(_kc_ticker_client, "authenticated", False)
         and not _kc_module.is_ticker_started()):
@@ -564,29 +564,9 @@ if (_kc_ticker_client and getattr(_kc_ticker_client, "authenticated", False)
         config.NIFTY_50_TOKEN:   "NIFTY 50",
         config.NIFTY_BANK_TOKEN: "NIFTY BANK",
     }
-    # Add Nifty 50 constituent stocks
+    # Full screener universe — covers all scan candidates, open trades, signals
     try:
-        _ticker_tok_map.update(db.get_nifty50_tokens())
-    except Exception:
-        pass
-    # Add current signal symbols (so live signals get WebSocket prices too)
-    try:
-        _sbase = st.session_state.get("_signals_base_df")
-        if _sbase is not None and not _sbase.empty and "instrument_token" in _sbase.columns:
-            for _tr in _sbase[["instrument_token", "tradingsymbol"]].dropna().itertuples(index=False):
-                _ticker_tok_map[int(_tr.instrument_token)] = str(_tr.tradingsymbol)
-    except Exception:
-        pass
-    # Add open-trade symbols so their LTP is always live even if not in scan
-    try:
-        _open_syms = [
-            r["tradingsymbol"]
-            for r in db.get_open_paper_trades(user_id=st.session_state.get("kite_user_id", ""))
-            if r.get("tradingsymbol")
-        ]
-        if _open_syms:
-            _open_tok_rows = db.get_tokens_for_symbols(_open_syms)
-            _ticker_tok_map.update(_open_tok_rows)
+        _ticker_tok_map.update(db.get_universe_tokens())
     except Exception:
         pass
     _kc_module.start_ticker(
@@ -594,21 +574,6 @@ if (_kc_ticker_client and getattr(_kc_ticker_client, "authenticated", False)
         access_token=st.session_state.get("kite_access_token", ""),
         token_symbol_map=_ticker_tok_map,
     )
-elif (_kc_ticker_client and getattr(_kc_ticker_client, "authenticated", False)
-        and _kc_module.is_ticker_started()):
-    # Ticker already running — ensure any open-trade symbols are subscribed
-    try:
-        _open_syms_live = [
-            r["tradingsymbol"]
-            for r in db.get_open_paper_trades(user_id=st.session_state.get("kite_user_id", ""))
-            if r.get("tradingsymbol")
-        ]
-        if _open_syms_live:
-            _open_tok_live = db.get_tokens_for_symbols(_open_syms_live)
-            if _open_tok_live:
-                _kc_module.update_ticker_subscriptions(_open_tok_live)
-    except Exception:
-        pass
 
 # Convenience alias — current Kite user id for per-user DB filtering
 _cur_user_id: str = st.session_state.get("kite_user_id", "")
