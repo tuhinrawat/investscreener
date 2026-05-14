@@ -231,6 +231,9 @@ SCALP_TARGET_MULT      = 1.5   # target  = breakout + 1.5 × ORB_range
 SCALP_STOP_MULT        = 0.5   # stop    = breakout – 0.5 × ORB_range (tight)
 SCALP_STOP_FLOOR_PCT   = 0.002 # minimum stop = 0.2% below breakout (prevents sub-paise stops)
 SCALP_MIN_RR           = 1.8   # minimum R/R to emit a scalp signal
+SCALP_MIN_ORB_ATR_MULT = 0.5   # minimum ORB range as ATR multiple; raise to 0.75 if false breaks persist
+SCALP_STOP_ATR_MULT    = 1.5   # ATR stop floor; reduce to 1.0 (not lower) only if too restrictive
+SCALP_BREAKOUT_VOLUME_MULT = 1.5  # breakout candle volume must be >= this × ORB-window average candle volume
 
 # Scalping requires ≥ this many of the 3 internal confirmations to auto-trade
 SCALP_MIN_CONFIRMATIONS = 2    # ORB breakout + VWAP alignment + RSI momentum
@@ -246,6 +249,9 @@ SCALP_HARD_EXIT_TIME   = (14, 45)  # (hour, minute) in IST — hard exit all sca
 # show unfavourable slippage on rapid entries/exits.
 SCALP_MIN_PRICE        = 300.0    # ₹300 minimum LTP to qualify for a scalp entry
 SCALP_MIN_TURNOVER_CR  = 50.0     # ₹50 Cr minimum avg daily turnover (screener metric)
+SCALP_MIN_AVG_DAILY_VOLUME = 500_000   # minimum 20D average volume for scalp universe
+SCALP_MIN_MARKET_CAP_CR    = 5_000     # minimum market cap in crore INR (if available)
+SCALP_REQUIRE_FNO_LISTED   = True      # scalp only F&O listed underlyings
 
 # VWAP band — price must be within this % of VWAP to count as "near VWAP" alignment
 VWAP_BAND_PCT          = 0.5   # within 0.5% of VWAP counts as VWAP pull-to trade

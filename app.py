@@ -5384,6 +5384,29 @@ def _intraday_scalp_live():
     import signals as _sig_mod  # noqa: PLC0415
 
     _scalp_confirm_map = st.session_state.setdefault("_scalp_confirm_since", {})
+    _scalp_skip_log = st.session_state.setdefault("_scalp_skip_log", [])
+
+    # Cache F&O underlyings once per session (NFO FUT contracts).
+    _fno_underlyings = st.session_state.get("_fno_underlyings")
+    if _fno_underlyings is None:
+        _fno_underlyings = set()
+        try:
+            _nfo_rows = _kc_scalp.get_instruments("NFO") or []
+            for _ir in _nfo_rows:
+                if str(_ir.get("instrument_type") or "").upper() != "FUT":
+                    continue
+                _nm = str(_ir.get("name") or "").strip().upper()
+                _ts = str(_ir.get("tradingsymbol") or "").strip().upper()
+                if _nm:
+                    _fno_underlyings.add(_nm)
+                # Fallback extraction from tradingsymbol for index futures naming styles.
+                if _ts and _ts.startswith("NIFTY"):
+                    _fno_underlyings.add("NIFTY")
+                elif _ts and _ts.startswith("BANKNIFTY"):
+                    _fno_underlyings.add("BANKNIFTY")
+        except Exception:
+            _fno_underlyings = set()
+        st.session_state["_fno_underlyings"] = _fno_underlyings
 
     for _, _row in _scalp_cands.iterrows():
         _sym = str(_row.get("tradingsymbol", ""))
@@ -5404,6 +5427,28 @@ def _intraday_scalp_live():
         _avg_turnover_cr = float(_row.get("avg_turnover_cr") or 0)
         if _avg_turnover_cr > 0 and _avg_turnover_cr < config.SCALP_MIN_TURNOVER_CR:
             continue
+        _avg_vol = float(_row.get("avg_volume") or 0)
+        if _avg_vol < config.SCALP_MIN_AVG_DAILY_VOLUME:
+            _scalp_skip_log.append({
+                "symbol": _sym,
+                "reason": f"LIQUIDITY_GATE_VOLUME — avg_volume {_avg_vol:.0f} < {config.SCALP_MIN_AVG_DAILY_VOLUME}",
+            })
+            continue
+        _mcap_cr = float(_row.get("market_cap_cr") or 0)
+        if _mcap_cr > 0 and _mcap_cr < config.SCALP_MIN_MARKET_CAP_CR:
+            _scalp_skip_log.append({
+                "symbol": _sym,
+                "reason": f"LIQUIDITY_GATE_MCAP — mcap {_mcap_cr:.0f}Cr < {config.SCALP_MIN_MARKET_CAP_CR}Cr",
+            })
+            continue
+        if config.SCALP_REQUIRE_FNO_LISTED:
+            _sym_u = _sym.upper()
+            if _sym_u not in _fno_underlyings:
+                _scalp_skip_log.append({
+                    "symbol": _sym,
+                    "reason": "LIQUIDITY_GATE_FNO — not in NFO FUT underlyings",
+                })
+                continue
 
         # ── Fetch / cache 5-min candles (30 s TTL) ───────────────────────────
         # Indicators (ORB, VWAP, RSI) are recomputed only when candles change —
@@ -5447,23 +5492,71 @@ def _intraday_scalp_live():
 
         if not _orb_data:
             continue
-
-        _scalp_sig = _sig_mod.scalping_signal(
-            current_ltp      = _ltp_now,
-            orb_high         = _orb_data["orb_high"],
-            orb_low          = _orb_data["orb_low"],
-            orb_range        = _orb_data["orb_range"],
-            vwap_price       = _vwap_price,
-            rsi_5min         = _rsi_5m,
-            atr              = float(_row.get("atr_14") or 0) or None,
-            nifty_pct_change = _nifty_pct,
-            daily_vol_ratio  = _vol_ratio,
-        )
+        if _orb_data.get("orb_window_incomplete"):
+            _scalp_sig = {
+                "scalp_signal": "WATCH",
+                "scalp_direction": None,
+                "scalp_entry": None,
+                "scalp_stop": None,
+                "scalp_t1": None,
+                "scalp_rr": None,
+                "scalp_confirmations": 0,
+                "scalp_orb_high": _orb_data.get("orb_high"),
+                "scalp_orb_low": _orb_data.get("orb_low"),
+                "scalp_vwap": _vwap_price,
+                "scalp_reason": "ORB_WINDOW_INCOMPLETE",
+                "scalp_confidence": None,
+            }
+        else:
+            _scalp_sig = _sig_mod.scalping_signal(
+                current_ltp      = _ltp_now,
+                orb_high         = _orb_data["orb_high"],
+                orb_low          = _orb_data["orb_low"],
+                orb_range        = _orb_data["orb_range"],
+                vwap_price       = _vwap_price,
+                rsi_5min         = _rsi_5m,
+                atr              = float(_row.get("atr_14") or 0) or None,
+                nifty_pct_change = _nifty_pct,
+                daily_vol_ratio  = _vol_ratio,
+            )
 
         _status  = _scalp_sig.get("scalp_signal") or "INSIDE_ORB"
         _dir     = _scalp_sig.get("scalp_direction") or ""
         _confs   = _scalp_sig.get("scalp_confirmations") or 0
         _sc_conf = _scalp_sig.get("scalp_confidence") or 0
+        _sc_reason = str(_scalp_sig.get("scalp_reason") or "")
+        _atr_14 = float(_row.get("atr_14") or 0) or 0.0
+        _orb_range = float(_orb_data.get("orb_range") or 0) if _orb_data else 0.0
+
+        _orb_start_t = pd.to_datetime("09:15").time()
+        _orb_end_t = pd.to_datetime("09:45").time()
+        _tm = pd.to_datetime(_candles_df["date"], errors="coerce").dt.time if "date" in _candles_df.columns else None
+        if _tm is not None:
+            _orb_candles = _candles_df[(_tm >= _orb_start_t) & (_tm <= _orb_end_t)]
+        else:
+            _orb_candles = pd.DataFrame()
+        _latest_candle = _candles_df.iloc[-1] if not _candles_df.empty else None
+        _breakout_candle_vol = float(_latest_candle.get("volume", 0)) if _latest_candle is not None else 0.0
+        _avg_orb_volume = float(_orb_candles["volume"].mean()) if (not _orb_candles.empty and "volume" in _orb_candles.columns) else 0.0
+        _vol_ratio_break = (_breakout_candle_vol / _avg_orb_volume) if _avg_orb_volume > 0 else None
+        _nifty_gate = (
+            "NIFTY_BULLISH" if _nifty_pct >= config.NIFTY_GATE_PCT
+            else "NIFTY_BEARISH" if _nifty_pct <= -config.NIFTY_GATE_PCT
+            else None
+        )
+        def _scalp_obs_blob(_entry_for_obs: float) -> str:
+            _atr_term = round(config.SCALP_STOP_ATR_MULT * _atr_14, 2) if _atr_14 > 0 else 0.0
+            _stop_obs = (_entry_for_obs + _atr_term) if _status == "SHORT" else (_entry_for_obs - _atr_term)
+            _ratio_txt = f"{(_orb_range / _atr_14):.3f}" if _atr_14 > 0 else "0.000"
+            _vol_txt = f"{_vol_ratio_break:.2f}" if _vol_ratio_break is not None else "—"
+            return (
+                f"orb_range={_orb_range:.2f} | orb_range_atr_ratio={_ratio_txt}"
+                f" | breakout_candle_vol={_breakout_candle_vol:.0f}"
+                f" | avg_orb_volume={_avg_orb_volume:.0f}"
+                f" | vol_ratio={_vol_txt}"
+                f" | nifty_gate={_nifty_gate or 'NONE'}"
+                f" | stop_atr_based={_stop_obs:.2f}"
+            )
 
         # ── Confirmation timer (10 s sustained breakout) ──────────────────────
         _sc_key_long  = f"_sc_long_{_sym}"
@@ -5493,6 +5586,9 @@ def _intraday_scalp_live():
             )
         elif _status == "WATCH":
             _status_label = "👁 WATCH"
+        elif _status == "BLOCKED":
+            _status_label = "🛑 BLOCKED"
+            _scalp_skip_log.append({"symbol": _sym, "reason": _sc_reason})
         else:
             _status_label = "⬜ INSIDE"
 
@@ -5503,12 +5599,25 @@ def _intraday_scalp_live():
         )
 
         # ── Signal type for DB ────────────────────────────────────────────────
-        _sc_sig_type   = "BUY_ORB" if _status == "LONG" else "SELL_ORB"
+        _sc_sig_type   = "BUY_ORB" if _status == "LONG" else ("SELL_ORB" if _status == "SHORT" else "")
         _sc_trig_key   = (_today_str, _sym, _sc_sig_type)
         _entry_px      = _scalp_sig.get("scalp_entry") or _ltp_now
         _stop_px       = _scalp_sig.get("scalp_stop")  or 0
         _t1_px         = _scalp_sig.get("scalp_t1")    or 0
         _pqty          = max(1, int(config.SCALP_CAP_PER_TRADE / (_entry_px or 1)))
+        _breakout_vol_ok = (
+            _avg_orb_volume > 0 and
+            _breakout_candle_vol >= _avg_orb_volume * config.SCALP_BREAKOUT_VOLUME_MULT
+        )
+        if (_status in ("LONG", "SHORT") and _sc_confirmed and not _breakout_vol_ok):
+            _status = "WATCH"
+            _status_label = "👁 WATCH"
+            _sc_reason = (
+                f"LOW_VOLUME_BREAKOUT — breakout vol {_breakout_candle_vol:.0f} < "
+                f"{config.SCALP_BREAKOUT_VOLUME_MULT:.1f}× ORB avg {_avg_orb_volume:.0f}"
+            )
+            _scalp_sig["scalp_reason"] = _sc_reason
+            _scalp_skip_log.append({"symbol": _sym, "reason": _sc_reason})
 
         # ── Auto-trade when confirmed + within limits ─────────────────────────
         if (_status in ("LONG", "SHORT") and _sc_confirmed
@@ -5540,7 +5649,8 @@ def _intraday_scalp_live():
                         "status":              "OPEN",
                         "notes": (
                             f"⚡ Scalp paper — {_status} ORB auto-triggered @ ₹{_ltp_now:.2f} "
-                            f"(confs {_confs}/3, score {_sc_conf}/10, qty {_pqty})"
+                            f"(confs {_confs}/3, score {_sc_conf}/10, qty {_pqty}) | "
+                            f"{_scalp_obs_blob(_entry_px)}"
                         ),
                         "is_paper_trade": True,
                         "intraday_confidence": _sc_conf,
@@ -5624,7 +5734,8 @@ def _intraday_scalp_live():
                             "status":              "OPEN",
                             "notes": (
                                 f"⚡ Scalp real — {_status} ORB @ ₹{_ltp_now:.2f} "
-                                f"(confs {_confs}/3, score {_sc_conf}/10) | Kite {_sc_oid}"
+                                f"(confs {_confs}/3, score {_sc_conf}/10) | Kite {_sc_oid} | "
+                                f"{_scalp_obs_blob(_entry_px)}"
                             ),
                             "is_paper_trade": False,
                             "intraday_confidence": _sc_conf,
@@ -5662,14 +5773,15 @@ def _intraday_scalp_live():
             "Direction":  _dir or "—",
             "Confirms":   f"{_confs}/3" if _confs else "—",
             "Conf":       f"{_sc_conf}/10",
-            "ORB High":   f"₹{_orb_data['orb_high']:,.2f}",
-            "ORB Low":    f"₹{_orb_data['orb_low']:,.2f}",
+            "ORB High":   f"₹{float(_orb_data.get('orb_high')):,.2f}" if _orb_data.get("orb_high") else "—",
+            "ORB Low":    f"₹{float(_orb_data.get('orb_low')):,.2f}" if _orb_data.get("orb_low") else "—",
             "VWAP":       f"₹{_vwap_price:,.2f}" if _vwap_price else "—",
             "5m RSI":     f"{_rsi_5m:.0f}" if _rsi_5m else "—",
             "Entry":      f"₹{_entry_px:,.2f}" if _entry_px else "—",
             "Stop":       f"₹{_stop_px:,.2f}"  if _stop_px  else "—",
             "Target":     f"₹{_t1_px:,.2f}"    if _t1_px    else "—",
             "R/R":        f"{_scalp_sig.get('scalp_rr', 0):.1f}×" if _scalp_sig.get("scalp_rr") else "—",
+            "Reason":     _sc_reason[:120] if _sc_reason else "—",
         })
 
     if not _scalp_results:

@@ -344,10 +344,7 @@ def vwap_std(df_5min: pd.DataFrame, multiplier: float = 1.0) -> dict | None:
 
 def opening_range(df_5min: pd.DataFrame, minutes: int = 15) -> dict | None:
     """
-    Opening Range = the high and low of the first `minutes` after market open (9:15 AM).
-
-    For a standard 5-min candle feed:
-      minutes=15 → first 3 candles (9:15, 9:20, 9:25)
+    Opening Range = high/low of the 9:15–9:45 AM 5-min window (inclusive).
 
     Returns {"orb_high": H, "orb_low": L, "orb_mid": M, "orb_range": R}
     or None if fewer candles exist than the window requires.
@@ -358,10 +355,31 @@ def opening_range(df_5min: pd.DataFrame, minutes: int = 15) -> dict | None:
     """
     if df_5min is None or df_5min.empty:
         return None
-    candles_needed = minutes // 5
-    if len(df_5min) < candles_needed:
+    df = df_5min.copy()
+    if "date" not in df.columns:
         return None
-    window = df_5min.head(candles_needed)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    if df.empty:
+        return None
+
+    # Structural ORB window: 9:15–9:45 (inclusive, 5-min candles only).
+    orb_start = pd.to_datetime("09:15:00").time()
+    orb_end = pd.to_datetime("09:45:00").time()
+    tm = df["date"].dt.time
+    window = df[(tm >= orb_start) & (tm <= orb_end)]
+    if len(window) < 6:
+        return {
+            "orb_high": None,
+            "orb_low": None,
+            "orb_mid": None,
+            "orb_range": None,
+            "orb_candles": int(len(window)),
+            "orb_window_start": "09:15",
+            "orb_window_end": "09:45",
+            "orb_window_incomplete": True,
+        }
+
     orb_high  = float(window["high"].max())
     orb_low   = float(window["low"].min())
     orb_range = orb_high - orb_low
@@ -371,6 +389,10 @@ def opening_range(df_5min: pd.DataFrame, minutes: int = 15) -> dict | None:
         "orb_low":   round(orb_low,   2),
         "orb_mid":   orb_mid,
         "orb_range": round(orb_range, 2),
+        "orb_candles": int(len(window)),
+        "orb_window_start": "09:15",
+        "orb_window_end": "09:45",
+        "orb_window_incomplete": False,
     }
 
 

@@ -762,11 +762,39 @@ def scalping_signal(
     # alone erodes the edge. Require ≥ ₹300 LTP.
     if current_ltp < _cfg.SCALP_MIN_PRICE:
         return dict(_SCALP_NULL)
+    if atr is None or atr <= 0:
+        return dict(_SCALP_NULL)
+
+    # Structural gate: ignore ultra-narrow ORB windows relative to volatility.
+    _min_orb_atr = _cfg.SCALP_MIN_ORB_ATR_MULT
+    if orb_range < atr * _min_orb_atr:
+        return {
+            **_SCALP_NULL,
+            "scalp_signal": "WATCH",
+            "scalp_reason": (
+                f"ORB_TOO_NARROW — range {orb_range:.2f} < "
+                f"{_min_orb_atr:.2f}× ATR ({atr:.2f})"
+            ),
+            "scalp_orb_high": orb_high,
+            "scalp_orb_low": orb_low,
+            "scalp_confirmations": 0,
+        }
 
     min_conf = _cfg.SCALP_MIN_CONFIRMATIONS
 
     # ── LONG scalp: breakout above ORB high ──────────────────────────────
     if current_ltp > orb_high:
+        # Hard regime gate — avoid long scalps when Nifty tape is bearish.
+        if nifty_pct_change <= -_cfg.NIFTY_GATE_PCT:
+            return {
+                **_SCALP_NULL,
+                "scalp_signal": "BLOCKED",
+                "scalp_direction": "LONG",
+                "scalp_confirmations": 0,
+                "scalp_orb_high": orb_high,
+                "scalp_orb_low": orb_low,
+                "scalp_reason": "NIFTY_BEARISH — long scalp hard-blocked by regime gate",
+            }
         confirmations = []
         conf_notes    = []
 
@@ -814,8 +842,9 @@ def scalping_signal(
         entry  = round(orb_high, 2)
         target = round(entry + _cfg.SCALP_TARGET_MULT * orb_range, 2)
         raw_stop = entry - _cfg.SCALP_STOP_MULT * orb_range
+        atr_stop = entry - _cfg.SCALP_STOP_ATR_MULT * atr
         floor_stop = entry * (1 - _cfg.SCALP_STOP_FLOOR_PCT)
-        stop   = round(min(raw_stop, floor_stop), 2)
+        stop   = round(min(raw_stop, atr_stop, floor_stop), 2)
         risk   = entry - stop
         rr     = round((target - entry) / risk, 2) if risk > 0 else 0
 
@@ -866,6 +895,17 @@ def scalping_signal(
 
     # ── SHORT scalp: breakdown below ORB low ─────────────────────────────
     if current_ltp < orb_low:
+        # Hard regime gate — avoid short scalps when Nifty tape is bullish.
+        if nifty_pct_change >= _cfg.NIFTY_GATE_PCT:
+            return {
+                **_SCALP_NULL,
+                "scalp_signal": "BLOCKED",
+                "scalp_direction": "SHORT",
+                "scalp_confirmations": 0,
+                "scalp_orb_high": orb_high,
+                "scalp_orb_low": orb_low,
+                "scalp_reason": "NIFTY_BULLISH — short scalp hard-blocked by regime gate",
+            }
         confirmations = []
         conf_notes    = []
 
@@ -912,8 +952,9 @@ def scalping_signal(
         entry   = round(orb_low, 2)
         target  = round(entry - _cfg.SCALP_TARGET_MULT * orb_range, 2)
         raw_stop = entry + _cfg.SCALP_STOP_MULT * orb_range
+        atr_stop = entry + _cfg.SCALP_STOP_ATR_MULT * atr
         floor_stop = entry * (1 + _cfg.SCALP_STOP_FLOOR_PCT)
-        stop    = round(max(raw_stop, floor_stop), 2)
+        stop    = round(max(raw_stop, atr_stop, floor_stop), 2)
         risk    = stop - entry
         rr      = round((entry - target) / risk, 2) if risk > 0 else 0
 
