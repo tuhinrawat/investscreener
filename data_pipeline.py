@@ -557,6 +557,17 @@ def full_rescan(progress_callback=None, client: "KiteClient | None" = None) -> d
     # Step 5: Compute everything
     metrics_df = compute_metrics_for_universe(filtered)
 
+    # Step 4.5: Pre-select intraday candidates for tomorrow's 6-pillar scan.
+    # Runs after Step 5 so that computed metrics (atr_14, composite_score, ema_200)
+    # are available. Persists a shortlist to the intraday_candidates table.
+    if not metrics_df.empty:
+        try:
+            candidates_df = select_intraday_candidates(metrics_df)
+            db.replace_intraday_candidates(candidates_df)
+            print(f"✓ Step 4.5: {len(candidates_df)} intraday candidates saved for tomorrow's 6-pillar scan")
+        except Exception as _cand_err:
+            print(f"⚠ Step 4.5 (candidate pre-selection) failed: {_cand_err} — continuing")
+
     # Step 6: Persist
     if not metrics_df.empty:
         db.replace_metrics(metrics_df)
@@ -769,4 +780,623 @@ def refresh_signals_only(progress_callback=None, user_id: str = "") -> dict:
             "rsi_sell_min": _rsi_sell_min,
             "min_rr":       _min_rr,
         },
+    }
+
+
+# ============================================================
+# 6-PILLAR INTRADAY SIGNAL SYSTEM
+# ============================================================
+
+def select_intraday_candidates(metrics_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Step 4.5 — run after compute_metrics_for_universe().
+
+    From the liquidity-passed universe, select the top N stocks for
+    tomorrow's 5-min intraday scan based on ATR% >= minimum threshold
+    and highest composite_score.  Pre-computes P2 (daily structure score)
+    using values already in metrics_df so intraday_scan() doesn't need
+    to re-derive it from the DB.
+    """
+    df = metrics_df.copy()
+
+    # ATR% uses ltp as the price reference (post-market, ltp = yesterday's close)
+    df["atr_pct"] = df.apply(
+        lambda r: (r["atr_14"] / r["ltp"] * 100)
+        if r.get("atr_14") and r.get("ltp") and r["ltp"] > 0
+        else None,
+        axis=1,
+    )
+
+    eligible = df[df["atr_pct"].notna() & (df["atr_pct"] >= config.INTRADAY_MIN_ATR_PCT)].copy()
+
+    candidates = (
+        eligible
+        .nlargest(config.INTRADAY_MAX_CANDIDATES, "composite_score")
+        [["tradingsymbol", "instrument_token", "ltp", "atr_14", "atr_pct",
+          "ema_20", "ema_200", "composite_score", "rs_vs_nifty_3m",
+          "trend_score", "rsi_14"]]
+        .copy()
+        .reset_index(drop=True)
+    )
+
+    def _p2(row) -> int:
+        s   = 0
+        ltp = row["ltp"] or 0
+        e20 = row["ema_20"] or 0
+        e200 = row["ema_200"] or 0
+        if not ltp:
+            return 0
+        if ltp > e20:              s += 2
+        if ltp > e200:             s += 2
+        if e20 > e200:             s += 1
+        if ltp < e200:             s -= 3
+        return max(-3, s)
+
+    candidates["p2_score_precomputed"] = candidates.apply(_p2, axis=1)
+    return candidates
+
+
+# ── 6-pillar scoring functions ────────────────────────────────────────────────
+
+def _score_p1(adx_val: float, plus_di: float, minus_di: float,
+               is_buy: bool) -> tuple[int, bool]:
+    """Pillar 1 — Trend Strength (ADX/DMI). Returns (score, adx_gate_passed)."""
+    score = 0
+    if adx_val > 35:
+        score += 5
+    elif adx_val > 25:
+        score += 4
+    elif adx_val > 20:
+        score += 2
+    if is_buy and plus_di > minus_di:
+        score += 2
+    if not is_buy and minus_di > plus_di:
+        score += 2
+    return score, adx_val >= 20
+
+
+def _score_p2(ltp: float, ema_20d: float, ema_200d: float, is_buy: bool) -> int:
+    """Pillar 2 — Long-Term Structure (daily EMAs, pre-computed)."""
+    s = 0
+    if is_buy:
+        if ltp > ema_20d:    s += 2
+        if ltp > ema_200d:   s += 2
+        if ema_20d > ema_200d: s += 1
+        if ltp < ema_200d:   s -= 3
+    else:
+        if ltp < ema_20d:    s += 2
+        if ltp < ema_200d:   s += 2
+        if ema_20d < ema_200d: s += 1
+        if ltp > ema_200d:   s -= 3
+    return s
+
+
+def _score_p3(ema9: float, ema21: float, ema50: float,
+               st_bull_5m: bool, st_bull_15m: bool, is_buy: bool) -> int:
+    """Pillar 3 — Intraday Trend Direction (5-min EMAs + Supertrend)."""
+    s = 0
+    if is_buy:
+        if st_bull_5m:                        s += 2
+        if ema9 > ema21 and ema21 > ema50:    s += 2
+        if st_bull_15m:                       s += 1
+    else:
+        if not st_bull_5m:                    s += 2
+        if ema9 < ema21 and ema21 < ema50:    s += 2
+        if not st_bull_15m:                   s += 1
+    return s
+
+
+def _score_p4(rsi5: float, macd_hist: float, macd_hist_prev: float,
+               macd_line: float, signal_line: float, is_buy: bool) -> int:
+    """Pillar 4 — Momentum Acceleration (RSI + MACD histogram)."""
+    s = 0
+    if is_buy:
+        if 50 <= rsi5 <= 65:            s += 2
+        if rsi5 > 70:                   s -= 2
+        if macd_hist > macd_hist_prev:  s += 2
+        if macd_line > signal_line:     s += 1
+    else:
+        if 35 <= rsi5 <= 50:            s += 2
+        if rsi5 < 30:                   s -= 2
+        if macd_hist < macd_hist_prev:  s += 2
+        if macd_line < signal_line:     s += 1
+    return s
+
+
+def _score_p5(volume: float, avg_vol_20: float,
+               obv_series: "pd.Series", is_buy: bool) -> int:
+    """Pillar 5 — Volume Flow (OBV + surge)."""
+    import numpy as np
+    vol_surge  = volume > avg_vol_20 * config.INTRADAY_VOL_MULT
+    obv_rising = obv_series.iloc[-1] > obv_series.iloc[-4]  if len(obv_series) >= 4  else False
+    obv_new_hi = (obv_series.iloc[-1] > obv_series.iloc[-11:-1].max()
+                  if len(obv_series) >= 11 else False)
+    s = 0
+    if is_buy:
+        if vol_surge:   s += 2
+        if obv_rising:  s += 2
+        if obv_new_hi:  s += 1
+        if not obv_rising: s -= 3
+    else:
+        obv_falling = obv_series.iloc[-1] < obv_series.iloc[-4] if len(obv_series) >= 4 else False
+        obv_new_lo  = (obv_series.iloc[-1] < obv_series.iloc[-11:-1].min()
+                       if len(obv_series) >= 11 else False)
+        if vol_surge:    s += 2
+        if obv_falling:  s += 2
+        if obv_new_lo:   s += 1
+        if not obv_falling: s -= 3
+    return s
+
+
+def _score_p6(close: float, orh: float, orl: float, vwap: float,
+               news_catalyst: bool, is_buy: bool) -> int:
+    """Pillar 6 — Structural Trigger (ORB + VWAP)."""
+    s = 0
+    if is_buy:
+        if close > orh:  s += 2
+        if close > vwap: s += 2
+        if news_catalyst: s += 1
+        if close > orh and close < vwap: s -= 3
+    else:
+        if close < orl:  s += 2
+        if close < vwap: s += 2
+        if news_catalyst: s += 1
+        if close < orl and close > vwap: s -= 3
+    return s
+
+
+def _compute_grade(total_score: int, adx_gate: bool) -> str:
+    if not adx_gate:
+        return "D"
+    if total_score >= config.INTRADAY_GRADE_APLUS: return "A+"
+    if total_score >= config.INTRADAY_GRADE_A:     return "A"
+    if total_score >= config.INTRADAY_GRADE_B:     return "B"
+    if total_score >= config.INTRADAY_GRADE_C:     return "C"
+    return "D"
+
+
+def _compute_supertrend(df: pd.DataFrame, atr_period: int = 10,
+                         multiplier: float = 3.0) -> bool:
+    """
+    Compute Supertrend on the given OHLCV DataFrame.
+    Returns True if the most recent candle is in a bullish Supertrend.
+    Requires columns: high, low, close.
+    """
+    import numpy as np
+    n = len(df)
+    if n < atr_period + 2:
+        return True  # not enough data — default neutral/bullish
+
+    df = df.copy().reset_index(drop=True)
+    # True Range
+    df["prev_close"] = df["close"].shift(1)
+    df["tr"] = df[["high", "low", "prev_close"]].apply(
+        lambda r: max(
+            r["high"] - r["low"],
+            abs(r["high"] - (r["prev_close"] or r["low"])),
+            abs(r["low"]  - (r["prev_close"] or r["high"])),
+        ),
+        axis=1,
+    )
+    df["atr"] = df["tr"].ewm(span=atr_period, adjust=False).mean()
+
+    df["basic_ub"] = (df["high"] + df["low"]) / 2 + multiplier * df["atr"]
+    df["basic_lb"] = (df["high"] + df["low"]) / 2 - multiplier * df["atr"]
+
+    final_ub = [0.0] * n
+    final_lb = [0.0] * n
+    st_bull  = [True] * n
+
+    for i in range(1, n):
+        # Final Upper Band
+        if df["basic_ub"].iloc[i] < final_ub[i-1] or df["close"].iloc[i-1] > final_ub[i-1]:
+            final_ub[i] = df["basic_ub"].iloc[i]
+        else:
+            final_ub[i] = final_ub[i-1]
+
+        # Final Lower Band
+        if df["basic_lb"].iloc[i] > final_lb[i-1] or df["close"].iloc[i-1] < final_lb[i-1]:
+            final_lb[i] = df["basic_lb"].iloc[i]
+        else:
+            final_lb[i] = final_lb[i-1]
+
+        # Direction
+        if df["close"].iloc[i] <= final_ub[i]:
+            st_bull[i] = False
+        elif df["close"].iloc[i] >= final_lb[i]:
+            st_bull[i] = True
+        else:
+            st_bull[i] = st_bull[i-1]
+
+    return st_bull[-1]
+
+
+# ── Main intraday scan orchestrator ───────────────────────────────────────────
+
+def intraday_scan(client=None, progress_callback=None) -> dict:
+    """
+    Run 6-pillar intraday signal computation on the pre-selected candidate list.
+
+    Timing : Call after 9:45 AM IST (ORB window closed).
+    Runtime: ~2–4 min for 40 stocks (5-min + 15-min candle fetches via Kite).
+
+    Returns a summary dict for UI display.
+    """
+    import numpy as np
+
+    t0  = time.time()
+    IST = timezone(timedelta(hours=5, minutes=30))
+    now = datetime.now(tz=IST)
+
+    # ── Step A: Guard — Kite client ──────────────────────────────────────────
+    if client is None:
+        return {"error": "Kite client not initialised. Please log in first."}
+
+    # ── Step B: Validate timing ──────────────────────────────────────────────
+    orb_close  = now.replace(hour=9,  minute=45, second=0, microsecond=0)
+    hard_cutoff = now.replace(hour=11, minute=30, second=0, microsecond=0)
+    market_close = now.replace(hour=15, minute=15, second=0, microsecond=0)
+
+    if now < orb_close:
+        return {
+            "error": f"Too early. ORB window closes at 9:45 AM IST. Current time: {now.strftime('%H:%M')}"
+        }
+    if now > market_close:
+        return {"error": "Market closed. Intraday signals are only valid during market hours."}
+
+    late_warning = now > hard_cutoff
+
+    # ── Step C: Load candidates ──────────────────────────────────────────────
+    candidates = db.load_intraday_candidates()
+    if candidates.empty:
+        return {"error": "No candidates found. Run Full Rescan first to build the candidate list."}
+
+    # ── Step D: Fetch Nifty regime context ───────────────────────────────────
+    today_date = now.date()
+    today_9am  = datetime.combine(today_date, datetime.min.time()).replace(
+        hour=9, minute=0, second=0
+    )
+    nifty_pct_chg = 0.0
+    try:
+        nifty_candles = client.get_historical(
+            instrument_token=config.NIFTY_50_TOKEN,
+            from_date=today_9am,
+            to_date=now.replace(tzinfo=None),
+            interval="5minute",
+        )
+        if nifty_candles and len(nifty_candles) >= 2:
+            nf_open  = float(nifty_candles[0]["open"])
+            nf_last  = float(nifty_candles[-1]["close"])
+            if nf_open > 0:
+                nifty_pct_chg = (nf_last - nf_open) / nf_open * 100
+    except Exception as _ne:
+        print(f"⚠ Nifty 5-min fetch failed: {_ne}")
+
+    # ── Step E: Scan each candidate ──────────────────────────────────────────
+    signals = []
+    total_cands = len(candidates)
+
+    for idx, cand in candidates.iterrows():
+        sym   = cand["tradingsymbol"]
+        token = int(cand["instrument_token"])
+
+        if progress_callback:
+            progress_callback(idx, total_cands, sym)
+        else:
+            print(f"  [{idx+1}/{total_cands}] {sym}")
+
+        try:
+            # Fetch 5-min candles (75 bars covers full session + prior context)
+            candles_5m = client.get_historical(
+                instrument_token=token,
+                from_date=today_9am,
+                to_date=now.replace(tzinfo=None),
+                interval="5minute",
+            )
+            if not candles_5m or len(candles_5m) < config.INTRADAY_ORB_CANDLES + 3:
+                signals.append(_no_signal_row(sym, token, reason="Insufficient 5-min candles"))
+                continue
+
+            df5 = pd.DataFrame(candles_5m)
+            df5["date"] = pd.to_datetime(df5["date"])
+
+            # Fetch 15-min candles for HTF Supertrend only
+            candles_15m = client.get_historical(
+                instrument_token=token,
+                from_date=today_9am,
+                to_date=now.replace(tzinfo=None),
+                interval="15minute",
+            )
+            df15 = pd.DataFrame(candles_15m) if candles_15m else pd.DataFrame()
+            if not df15.empty:
+                df15["date"] = pd.to_datetime(df15["date"])
+
+            # ── ORH / ORL ────────────────────────────────────────────────────
+            today_str = str(today_date)
+            session_df = df5[df5["date"].dt.date.astype(str) == today_str].copy()
+            orb_candles = session_df.head(config.INTRADAY_ORB_CANDLES)
+
+            if len(orb_candles) < config.INTRADAY_ORB_CANDLES:
+                signals.append(_no_signal_row(sym, token, reason="ORB window not yet complete"))
+                continue
+
+            orh = float(orb_candles["high"].max())
+            orl = float(orb_candles["low"].min())
+
+            # ── 5-min indicators (computed on full df5 for EWM stability) ────
+            df5 = df5.copy().reset_index(drop=True)
+            df5["prev_close"] = df5["close"].shift(1)
+            df5["tr"] = df5.apply(
+                lambda r: max(
+                    r["high"] - r["low"],
+                    abs(r["high"] - (r["prev_close"] if pd.notna(r["prev_close"]) else r["low"])),
+                    abs(r["low"]  - (r["prev_close"] if pd.notna(r["prev_close"]) else r["high"])),
+                ), axis=1,
+            )
+            atr5_series = df5["tr"].ewm(span=14, adjust=False).mean()
+            atr5 = float(atr5_series.iloc[-1])
+
+            # RSI(14) on 5-min
+            delta_c = df5["close"].diff()
+            gain_c  = delta_c.clip(lower=0).ewm(span=14, adjust=False).mean()
+            loss_c  = (-delta_c.clip(upper=0)).ewm(span=14, adjust=False).mean()
+            rs5     = gain_c / loss_c.replace(0, float("nan"))
+            rsi5    = float(100 - (100 / (1 + rs5)).iloc[-1])
+
+            # MACD(12, 26, 9) on 5-min
+            ema12       = df5["close"].ewm(span=12, adjust=False).mean()
+            ema26       = df5["close"].ewm(span=26, adjust=False).mean()
+            macd_line_s = ema12 - ema26
+            signal_line_s = macd_line_s.ewm(span=9, adjust=False).mean()
+            macd_hist_s   = macd_line_s - signal_line_s
+            macd_hist_val  = float(macd_hist_s.iloc[-1])
+            macd_hist_prev = float(macd_hist_s.iloc[-2]) if len(macd_hist_s) >= 2 else 0.0
+            macd_line_val  = float(macd_line_s.iloc[-1])
+            sig_line_val   = float(signal_line_s.iloc[-1])
+
+            # ADX(14) and ±DI on 5-min
+            df5["high_diff"] = df5["high"].diff()
+            df5["low_diff"]  = df5["low"].shift(1) - df5["low"]
+            df5["plus_dm"]   = df5["high_diff"].where(
+                (df5["high_diff"] > df5["low_diff"]) & (df5["high_diff"] > 0), 0)
+            df5["minus_dm"]  = df5["low_diff"].where(
+                (df5["low_diff"] > df5["high_diff"]) & (df5["low_diff"] > 0), 0)
+            atr14_sm  = df5["tr"].ewm(span=14, adjust=False).mean()
+            plus_di_s = 100 * df5["plus_dm"].ewm(span=14, adjust=False).mean() / atr14_sm.replace(0, float("nan"))
+            minus_di_s= 100 * df5["minus_dm"].ewm(span=14, adjust=False).mean() / atr14_sm.replace(0, float("nan"))
+            dx_s      = (100 * (plus_di_s - minus_di_s).abs() /
+                         (plus_di_s + minus_di_s).replace(0, float("nan")))
+            adx_val   = float(dx_s.ewm(span=14, adjust=False).mean().iloc[-1])
+            plus_di_val  = float(plus_di_s.iloc[-1])
+            minus_di_val = float(minus_di_s.iloc[-1])
+
+            # Session-only indicators (use session_df for VWAP, EMAs, OBV)
+            session_df = session_df.copy().reset_index(drop=True)
+            session_df["ema9"]  = session_df["close"].ewm(span=9,  adjust=False).mean()
+            session_df["ema21"] = session_df["close"].ewm(span=21, adjust=False).mean()
+            session_df["ema50"] = session_df["close"].ewm(span=50, adjust=False).mean()
+
+            session_df["tp"]      = (session_df["high"] + session_df["low"] + session_df["close"]) / 3
+            session_df["cum_vol"] = session_df["volume"].cumsum()
+            session_df["cum_tpv"] = (session_df["tp"] * session_df["volume"]).cumsum()
+            session_df["vwap"]    = session_df["cum_tpv"] / session_df["cum_vol"].replace(0, float("nan"))
+
+            session_df["price_diff"] = session_df["close"].diff().fillna(0)
+            session_df["obv"] = (np.sign(session_df["price_diff"]) * session_df["volume"]).cumsum()
+
+            avg_vol_20  = float(session_df["volume"].rolling(20, min_periods=1).mean().iloc[-1])
+            current_vol = float(session_df["volume"].iloc[-1])
+
+            latest = session_df.iloc[-1]
+            close  = float(latest["close"])
+            vwap   = float(latest["vwap"]) if pd.notna(latest["vwap"]) else close
+            ema9   = float(latest["ema9"])
+            ema21  = float(latest["ema21"])
+            ema50  = float(latest["ema50"])
+
+            # Supertrend on 5-min and 15-min
+            st_bull_5m  = _compute_supertrend(
+                df5, config.INTRADAY_ST_ATR_PERIOD, config.INTRADAY_ST_MULTIPLIER)
+            st_bull_15m = (_compute_supertrend(
+                df15, config.INTRADAY_ST_ATR_PERIOD, config.INTRADAY_ST_MULTIPLIER)
+                if not df15.empty else True)
+
+            # ── Gap invalidation ─────────────────────────────────────────────
+            prev_close_px = float(cand.get("ltp") or close)
+            today_open_px = float(orb_candles["open"].iloc[0])
+            atr_pct_val   = (atr5 / close * 100) if close > 0 else 0.0
+            gap_pct = abs(today_open_px - prev_close_px) / prev_close_px * 100 if prev_close_px > 0 else 0
+            gap_invalidated = gap_pct > (atr_pct_val * 1.5)
+
+            # ── Determine signal direction ───────────────────────────────────
+            buy_candidate   = close > orh and close > vwap
+            short_candidate = close < orl and close < vwap
+
+            signal_direction = None
+            if buy_candidate:
+                signal_direction = "BUY"
+            elif short_candidate:
+                signal_direction = "SHORT"
+
+            # ── 3-candle confirmation: scan full session ──────────────────────
+            confirmation_found = False
+            entry_price        = None
+            c1_idx             = None
+
+            for ci in range(len(session_df) - 2):
+                c1 = session_df.iloc[ci]
+                c2 = session_df.iloc[ci + 1]
+                c3 = session_df.iloc[ci + 2]
+                c1_vol = float(c1["volume"])
+                if signal_direction == "BUY":
+                    if (float(c1["close"]) > orh and
+                            c1_vol > avg_vol_20 * config.INTRADAY_VOL_MULT and
+                            float(c2["close"]) > orh):
+                        confirmation_found = True
+                        entry_price = float(c3["open"])
+                        c1_idx = ci
+                elif signal_direction == "SHORT":
+                    if (float(c1["close"]) < orl and
+                            c1_vol > avg_vol_20 * config.INTRADAY_VOL_MULT and
+                            float(c2["close"]) < orl):
+                        confirmation_found = True
+                        entry_price = float(c3["open"])
+                        c1_idx = ci
+
+            # Use the most recent valid pattern
+            # (loop above overwrites — last found = most recent)
+
+            # Staleness check: signal from more than INTRADAY_STALE_CANDLES bars ago
+            if confirmation_found and c1_idx is not None:
+                bars_ago = len(session_df) - 1 - c1_idx
+                if bars_ago > config.INTRADAY_STALE_CANDLES:
+                    signals.append(_no_signal_row(
+                        sym, token,
+                        reason=f"ORB signal stale — breakout occurred {bars_ago * 5} min ago (>{config.INTRADAY_STALE_CANDLES * 5} min threshold)",
+                    ))
+                    continue
+
+            if not confirmation_found or entry_price is None:
+                signals.append(_no_signal_row(
+                    sym, token,
+                    reason="No valid 3-candle ORB confirmation in this session",
+                ))
+                continue
+
+            # ── Score all 6 pillars ──────────────────────────────────────────
+            is_buy = signal_direction == "BUY"
+
+            p1, adx_gate = _score_p1(adx_val, plus_di_val, minus_di_val, is_buy)
+            p2 = int(cand.get("p2_score_precomputed") or 0)
+            p3 = _score_p3(ema9, ema21, ema50, st_bull_5m, st_bull_15m, is_buy)
+            p4 = _score_p4(rsi5, macd_hist_val, macd_hist_prev, macd_line_val, sig_line_val, is_buy)
+            p5 = _score_p5(current_vol, avg_vol_20, session_df["obv"], is_buy)
+            p6 = _score_p6(close, orh, orl, vwap, news_catalyst=False, is_buy=is_buy)
+
+            total_score = p1 + p2 + p3 + p4 + p5 + p6
+            if gap_invalidated:
+                total_score = max(0, total_score - 3)
+
+            grade       = _compute_grade(total_score, adx_gate)
+            final_signal = signal_direction if grade != "D" else "NO_SIGNAL"
+
+            # ── Entry / stop / targets ───────────────────────────────────────
+            stop_loss = t1 = t2 = t3 = rr_at_t2 = None
+            reason = ""
+            if final_signal != "NO_SIGNAL":
+                atr_pct_val = (atr5 / entry_price * 100) if entry_price > 0 else 0
+                if atr_pct_val < config.INTRADAY_MIN_ATR_PCT:
+                    final_signal = "NO_SIGNAL"
+                    reason = (f"ATR% {atr_pct_val:.2f}% < "
+                              f"minimum {config.INTRADAY_MIN_ATR_PCT}%")
+                else:
+                    if is_buy:
+                        stop_loss = max(orl, entry_price - atr5 * config.INTRADAY_ATR_SL_MULT)
+                        t1 = entry_price * (1 + config.INTRADAY_T1_PCT)
+                        t2 = entry_price * (1 + config.INTRADAY_T2_PCT)
+                        t3 = entry_price * (1 + config.INTRADAY_T3_PCT)
+                    else:
+                        stop_loss = min(orh, entry_price + atr5 * config.INTRADAY_ATR_SL_MULT)
+                        t1 = entry_price * (1 - config.INTRADAY_T1_PCT)
+                        t2 = entry_price * (1 - config.INTRADAY_T2_PCT)
+                        t3 = entry_price * (1 - config.INTRADAY_T3_PCT)
+
+                    stop_dist = abs(entry_price - stop_loss)
+                    stop_pct  = stop_dist / entry_price * 100 if entry_price > 0 else 0
+                    rr_at_t2  = abs(t2 - entry_price) / stop_dist if stop_dist > 0 else 0
+
+                    if rr_at_t2 < config.INTRADAY_MIN_RR:
+                        final_signal = "NO_SIGNAL"
+                        reason = f"R:R at T2 {rr_at_t2:.2f} < minimum {config.INTRADAY_MIN_RR}"
+                    elif stop_pct > 1.0:
+                        final_signal = "NO_SIGNAL"
+                        reason = f"Stop% {stop_pct:.2f}% too wide — R:R broken"
+
+            if final_signal != "NO_SIGNAL":
+                breakeven_stop = (entry_price - 1.0) if is_buy else (entry_price + 1.0)
+                trail_after_t2 = t1
+                valid_until    = now.replace(hour=15, minute=15, second=0,
+                                             microsecond=0).isoformat()
+            else:
+                breakeven_stop = trail_after_t2 = valid_until = None
+
+            signals.append({
+                "tradingsymbol":    sym,
+                "instrument_token": token,
+                "signal":           final_signal,
+                "grade":            grade,
+                "total_score":      total_score,
+                "p1_adx":           p1,
+                "p2_daily":         p2,
+                "p3_trend":         p3,
+                "p4_momentum":      p4,
+                "p5_volume":        p5,
+                "p6_trigger":       p6,
+                "entry":            entry_price,
+                "stop_loss":        stop_loss,
+                "t1":               t1,
+                "t2":               t2,
+                "t3":               t3,
+                "t1_shares_pct":    0.40,
+                "t2_shares_pct":    0.35,
+                "t3_shares_pct":    0.25,
+                "breakeven_stop":   breakeven_stop,
+                "trail_after_t2":   trail_after_t2,
+                "orh":              orh,
+                "orl":              orl,
+                "atr5":             atr5,
+                "atr_pct":          atr_pct_val,
+                "rr_at_t2":         rr_at_t2,
+                "adx_gate":         adx_gate,
+                "gap_invalidated":  gap_invalidated,
+                "news_catalyst":    False,
+                "reason":           reason,
+                "valid_until":      valid_until,
+                "signal_generated_at": _now_ist().isoformat(),
+            })
+
+            time.sleep(0.4)  # stay within Kite's ~2.5 req/sec limit
+
+        except Exception as _e:
+            print(f"  ⚠ {sym}: {_e}")
+            signals.append(_no_signal_row(sym, token, reason=str(_e)[:200]))
+            continue
+
+    signals_df = pd.DataFrame(signals)
+    if not signals_df.empty:
+        db.replace_intraday_signals(signals_df)
+
+    buy_count   = int((signals_df["signal"] == "BUY").sum())   if not signals_df.empty else 0
+    short_count = int((signals_df["signal"] == "SHORT").sum()) if not signals_df.empty else 0
+    total_sigs  = buy_count + short_count
+
+    return {
+        "signals_found":  total_sigs,
+        "buy_signals":    buy_count,
+        "short_signals":  short_count,
+        "total_scanned":  len(signals),
+        "late_warning":   late_warning,
+        "nifty_pct_chg":  round(nifty_pct_chg, 2),
+        "elapsed_sec":    round(time.time() - t0, 1),
+    }
+
+
+def _no_signal_row(tradingsymbol: str, instrument_token: int, reason: str = "") -> dict:
+    """Return a minimal NO_SIGNAL dict for a stock that couldn't be scored."""
+    return {
+        "tradingsymbol":    tradingsymbol,
+        "instrument_token": instrument_token,
+        "signal":           "NO_SIGNAL",
+        "grade":            "D",
+        "total_score":      0,
+        "p1_adx": 0, "p2_daily": 0, "p3_trend": 0,
+        "p4_momentum": 0, "p5_volume": 0, "p6_trigger": 0,
+        "entry": None, "stop_loss": None,
+        "t1": None, "t2": None, "t3": None,
+        "t1_shares_pct": 0.40, "t2_shares_pct": 0.35, "t3_shares_pct": 0.25,
+        "breakeven_stop": None, "trail_after_t2": None,
+        "orh": None, "orl": None, "atr5": None, "atr_pct": None,
+        "rr_at_t2": None, "adx_gate": False, "gap_invalidated": False,
+        "news_catalyst": False, "reason": reason, "valid_until": None,
+        "signal_generated_at": _now_ist().isoformat(),
     }

@@ -264,3 +264,43 @@ VWAP_BAND_PCT          = 0.5   # within 0.5% of VWAP counts as VWAP pull-to trad
 # Set to False to revert to warning-only behaviour.
 # ============================================================
 INTRADAY_REGIME_GATE   = True
+
+# ============================================================
+# 6-PILLAR INTRADAY SIGNAL SYSTEM
+# Independent of the pivot-based system above.
+# Runs on 5-min candles during market hours via intraday_scan().
+# ============================================================
+
+# Candidate pre-selection (Step 4.5 in full_rescan)
+INTRADAY_MIN_ATR_PCT       = 1.0    # minimum ATR% to qualify for 5-min scan
+INTRADAY_MAX_CANDIDATES    = 40     # max stocks to run 5-min candle fetch on
+
+# Opening Range Breakout window
+INTRADAY_ORB_CANDLES       = 6      # 6 × 5 min = 30-min ORB window (9:15–9:44)
+
+# Stop-loss and targets
+INTRADAY_ATR_SL_MULT       = 0.75   # stop = entry ± ATR5 × this
+INTRADAY_T1_PCT            = 0.005  # +0.5% first target  (exit 40%)
+INTRADAY_T2_PCT            = 0.010  # +1.0% second target (exit 35%)
+INTRADAY_T3_PCT            = 0.018  # +1.8% runner target (hold 25%)
+INTRADAY_MIN_RR            = 1.5    # minimum R:R at T2 to emit a live signal
+
+# Volume confirmation
+INTRADAY_VOL_MULT          = 1.5    # volume surge = current vol > avg_20 × this
+
+# 3-candle confirmation
+INTRADAY_CONFIRMATION_BARS = 3      # number of candles required for confirmation
+INTRADAY_STALE_CANDLES     = 9      # signal older than this many 5-min bars = stale (45 min)
+
+# Hard exit time (all signals invalidated after this)
+INTRADAY_HARD_EXIT_TIME    = "15:15"  # IST
+
+# Supertrend parameters (used for both 5-min and 15-min)
+INTRADAY_ST_ATR_PERIOD     = 10
+INTRADAY_ST_MULTIPLIER     = 3.0
+
+# Grade thresholds (do not change without re-calibrating against backtest data)
+INTRADAY_GRADE_APLUS       = 27
+INTRADAY_GRADE_A           = 24
+INTRADAY_GRADE_B           = 19
+INTRADAY_GRADE_C           = 13

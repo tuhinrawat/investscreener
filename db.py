@@ -495,6 +495,62 @@ def init_schema():
                 ON signal_log (kite_user_id, trade_date DESC)
         """)
 
+        # ── 6-Pillar intraday signal system (added post-launch) ───────────────
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS intraday_candidates (
+                tradingsymbol           VARCHAR         PRIMARY KEY,
+                instrument_token        BIGINT          NOT NULL,
+                ltp                     DOUBLE PRECISION,
+                atr_14                  DOUBLE PRECISION,
+                atr_pct                 DOUBLE PRECISION,
+                ema_20                  DOUBLE PRECISION,
+                ema_200                 DOUBLE PRECISION,
+                composite_score         DOUBLE PRECISION,
+                rs_vs_nifty_3m          DOUBLE PRECISION,
+                trend_score             DOUBLE PRECISION,
+                rsi_14                  DOUBLE PRECISION,
+                p2_score_precomputed    INTEGER,
+                updated_at              TIMESTAMP       DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS intraday_signals (
+                tradingsymbol           VARCHAR         PRIMARY KEY,
+                instrument_token        BIGINT,
+                signal                  VARCHAR,
+                grade                   VARCHAR,
+                total_score             INTEGER,
+                p1_adx                  INTEGER,
+                p2_daily                INTEGER,
+                p3_trend                INTEGER,
+                p4_momentum             INTEGER,
+                p5_volume               INTEGER,
+                p6_trigger              INTEGER,
+                entry                   DOUBLE PRECISION,
+                stop_loss               DOUBLE PRECISION,
+                t1                      DOUBLE PRECISION,
+                t2                      DOUBLE PRECISION,
+                t3                      DOUBLE PRECISION,
+                t1_shares_pct           DOUBLE PRECISION    DEFAULT 0.40,
+                t2_shares_pct           DOUBLE PRECISION    DEFAULT 0.35,
+                t3_shares_pct           DOUBLE PRECISION    DEFAULT 0.25,
+                breakeven_stop          DOUBLE PRECISION,
+                trail_after_t2          DOUBLE PRECISION,
+                orh                     DOUBLE PRECISION,
+                orl                     DOUBLE PRECISION,
+                atr5                    DOUBLE PRECISION,
+                atr_pct                 DOUBLE PRECISION,
+                rr_at_t2                DOUBLE PRECISION,
+                adx_gate                BOOLEAN,
+                gap_invalidated         BOOLEAN             DEFAULT FALSE,
+                news_catalyst           BOOLEAN             DEFAULT FALSE,
+                reason                  VARCHAR,
+                valid_until             TIMESTAMP,
+                signal_generated_at     TIMESTAMP           DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # One-time migration: UTC → IST shift on logged_at
         cur.execute("SELECT value FROM _db_meta WHERE key = 'logged_at_utc_to_ist_done'")
         if not cur.fetchone():
@@ -2766,6 +2822,158 @@ def update_ai_keys(user_id: int, openrouter_key: str, openai_key: str) -> None:
         conn.commit()
     except Exception:
         conn.rollback()
+    finally:
+        cur.close()
+        release_conn(conn)
+
+
+# ── 6-Pillar intraday signal helpers ──────────────────────────────────────────
+
+def replace_intraday_candidates(df: pd.DataFrame) -> None:
+    """Persist the pre-selected candidate list produced by Step 4.5 of full_rescan()."""
+    if df.empty:
+        return
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute("DELETE FROM intraday_candidates")
+        keep_cols = [
+            "tradingsymbol", "instrument_token", "ltp", "atr_14", "atr_pct",
+            "ema_20", "ema_200", "composite_score", "rs_vs_nifty_3m",
+            "trend_score", "rsi_14", "p2_score_precomputed",
+        ]
+        keep = [c for c in keep_cols if c in df.columns]
+        df_clean = df[keep].copy()
+        col_list     = ", ".join(keep)
+        rows = [
+            tuple(None if pd.isna(v) else v for v in row)
+            for row in df_clean.itertuples(index=False, name=None)
+        ]
+        psycopg2.extras.execute_values(
+            cur,
+            f"INSERT INTO intraday_candidates ({col_list}) VALUES %s",
+            rows,
+            page_size=200,
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        release_conn(conn)
+
+
+def load_intraday_candidates() -> pd.DataFrame:
+    """Load the pre-selected candidate list for the 6-pillar scan."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT * FROM intraday_candidates ORDER BY composite_score DESC NULLS LAST"
+        )
+        return _df_from_cursor(cur)
+    finally:
+        cur.close()
+        release_conn(conn)
+
+
+def replace_intraday_signals(df: pd.DataFrame) -> None:
+    """Persist intraday_scan() results — full table replace."""
+    if df.empty:
+        return
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'intraday_signals' ORDER BY ordinal_position"
+        )
+        table_cols = [r[0] for r in cur.fetchall()]
+        keep = [c for c in df.columns if c in table_cols]
+        df_clean = df[keep].copy()
+
+        cur.execute("DELETE FROM intraday_signals")
+        if df_clean.empty:
+            conn.commit()
+            return
+
+        col_list = ", ".join(keep)
+        rows = [
+            tuple(None if pd.isna(v) else v for v in row)
+            for row in df_clean.itertuples(index=False, name=None)
+        ]
+        psycopg2.extras.execute_values(
+            cur,
+            f"INSERT INTO intraday_signals ({col_list}) VALUES %s",
+            rows,
+            page_size=200,
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        release_conn(conn)
+
+
+def load_intraday_signals(include_no_signal: bool = False) -> pd.DataFrame:
+    """Load 6-pillar signal results, ordered by total_score descending."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        where = "" if include_no_signal else "WHERE signal != 'NO_SIGNAL'"
+        cur.execute(
+            f"SELECT * FROM intraday_signals {where} ORDER BY total_score DESC NULLS LAST"
+        )
+        return _df_from_cursor(cur)
+    finally:
+        cur.close()
+        release_conn(conn)
+
+
+def update_news_catalyst(tradingsymbol: str, enable: bool) -> None:
+    """
+    Toggle the news_catalyst flag for one symbol and recompute p6_trigger,
+    total_score, and grade atomically in the DB.
+
+    enable=True  → add +1 to p6 and total; enable=False → subtract 1.
+    adx_gate=FALSE rows are always graded 'D' regardless of score.
+    """
+    delta = 1 if enable else -1
+    conn  = get_conn()
+    cur   = conn.cursor()
+    try:
+        cur.execute(
+            """
+            UPDATE intraday_signals
+            SET
+                news_catalyst = %(enable)s,
+                p6_trigger    = p6_trigger + %(delta)s,
+                total_score   = total_score + %(delta)s,
+                grade         = CASE
+                    WHEN adx_gate = FALSE               THEN 'D'
+                    WHEN total_score + %(delta)s >= 27  THEN 'A+'
+                    WHEN total_score + %(delta)s >= 24  THEN 'A'
+                    WHEN total_score + %(delta)s >= 19  THEN 'B'
+                    WHEN total_score + %(delta)s >= 13  THEN 'C'
+                    ELSE 'D'
+                  END
+            WHERE tradingsymbol = %(sym)s
+              AND news_catalyst  = %(current)s
+            """,
+            {
+                "enable":  enable,
+                "delta":   delta,
+                "sym":     tradingsymbol,
+                "current": not enable,
+            },
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         cur.close()
         release_conn(conn)

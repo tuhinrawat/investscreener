@@ -1073,6 +1073,44 @@ if st.sidebar.button("🔄 Full Rescan (~3-5 min)", use_container_width=True,
         import traceback
         st.sidebar.code(traceback.format_exc())
 
+# ─── 6-Pillar Intraday Scan button ───────────────────────────
+st.sidebar.markdown("---")
+if st.sidebar.button("⚡ 6-Pillar Intraday Scan", use_container_width=True,
+                     help="Runs the 6-pillar intraday signal system on pre-selected candidates "
+                          "(5-min candles via Kite). Call after 9:45 AM during market hours. "
+                          "Requires Full Rescan to have been run first."):
+    _scan_progress = st.sidebar.progress(0)
+    _scan_status   = st.sidebar.empty()
+
+    def _6p_progress(idx, total, symbol):
+        _scan_progress.progress((idx + 1) / total)
+        _scan_status.caption(f"{idx+1}/{total}: {symbol}")
+
+    try:
+        _6p_result = data_pipeline.intraday_scan(
+            client=st.session_state.get("kite_client"),
+            progress_callback=_6p_progress,
+        )
+        _scan_progress.progress(1.0)
+        if "error" in _6p_result:
+            st.sidebar.error(f"⛔ {_6p_result['error']}")
+        else:
+            _scan_status.caption("Done")
+            _lbl = (f"✓ {_6p_result['signals_found']} signals "
+                    f"({_6p_result['buy_signals']} BUY · {_6p_result['short_signals']} SHORT) "
+                    f"from {_6p_result['total_scanned']} stocks "
+                    f"in {_6p_result['elapsed_sec']}s")
+            st.sidebar.success(_lbl)
+            if _6p_result.get("late_warning"):
+                st.sidebar.warning("⚠ Running after 11:30 AM — trend context may be degraded")
+            st.session_state["_6p_scan_ts"]   = datetime.now(_IST)
+            st.session_state["_6p_cache_bust"] = st.session_state.get("_6p_cache_bust", 0) + 1
+            st.rerun()
+    except Exception as _6p_err:
+        st.sidebar.error(f"Failed: {_6p_err}")
+        import traceback as _tb
+        st.sidebar.code(_tb.format_exc())
+
 st.sidebar.markdown("---")
 
 # ─── Kite connection status + key management ────────────────
@@ -2310,8 +2348,8 @@ if not st.session_state.get("_signal_outcomes_checked"):
 # ============================================================
 # TAB LAYOUT — Screener | Trade Signals | Activity Log
 # ============================================================
-tab_screener, tab_signals, tab_activity = st.tabs([
-    "📋 Screener", "🎯 Trade Signals", "📒 Activity Log"
+tab_screener, tab_signals, tab_6pillar, tab_activity = st.tabs([
+    "📋 Screener", "🎯 Trade Signals", "⚡ 6-Pillar Intraday", "📒 Activity Log"
 ])
 
 @st.fragment(run_every=3)
@@ -9357,6 +9395,192 @@ def _activity_log_live():
                                      hide_index=True, use_container_width=True)
                     else:
                         st.caption("No data yet.")
+
+
+# ============================================================
+# 6-PILLAR INTRADAY SIGNALS TAB
+# ============================================================
+with tab_6pillar:
+    _6p_bust = st.session_state.get("_6p_cache_bust", 0)
+
+    @st.fragment(run_every=30)
+    def _6pillar_tab_live():
+        import pandas as pd
+
+        IST_6P = timezone(timedelta(hours=5, minutes=30))
+        now_6p = datetime.now(IST_6P)
+
+        st.subheader("⚡ 6-Pillar Intraday Signals")
+        st.caption(
+            "Independent execution-layer signals using 5-min ORB + 6 scored pillars. "
+            "Run **⚡ 6-Pillar Intraday Scan** from the sidebar after 9:45 AM."
+        )
+
+        # ── Last scan info ────────────────────────────────────────────────────
+        last_scan_ts = st.session_state.get("_6p_scan_ts")
+        if last_scan_ts:
+            mins_ago = int((now_6p - last_scan_ts).total_seconds() / 60)
+            st.markdown(
+                f'<span style="font-size:12px;color:#64748b">Last scan: '
+                f'{last_scan_ts.strftime("%H:%M:%S")} IST '
+                f'({mins_ago} min ago)</span>',
+                unsafe_allow_html=True,
+            )
+
+        # ── Load signals ─────────────────────────────────────────────────────
+        try:
+            sigs = db.load_intraday_signals(include_no_signal=False)
+        except Exception as _load_err:
+            st.error(f"Could not load intraday signals: {_load_err}")
+            return
+
+        if sigs.empty:
+            st.info(
+                "No intraday signals yet.\n\n"
+                "1. Ensure you have run **Full Rescan** at least once (post-market) to populate the candidate list.\n"
+                "2. After 9:45 AM during market hours, click **⚡ 6-Pillar Intraday Scan** in the sidebar.",
+                icon="ℹ️",
+            )
+            return
+
+        # ── Inject live LTP ──────────────────────────────────────────────────
+        live_ltp = st.session_state.get("_live_ltp", {})
+        sigs = sigs.copy()
+        sigs["_db_entry"]  = sigs["entry"].copy()
+        for col in ("entry", "stop_loss", "t1", "t2", "t3"):
+            if col in sigs.columns:
+                sigs[f"_orig_{col}"] = sigs[col].copy()
+
+        sigs["LTP"] = sigs["tradingsymbol"].apply(
+            lambda s: live_ltp.get(s, sigs.loc[sigs["tradingsymbol"] == s, "entry"].values[0]
+                                   if len(sigs.loc[sigs["tradingsymbol"] == s]) else None)
+        )
+
+        # ── Grade badge ──────────────────────────────────────────────────────
+        GRADE_COLOR = {"A+": "#16a34a", "A": "#22c55e", "B": "#3b82f6", "C": "#f59e0b", "D": "#ef4444"}
+
+        def _grade_chip(g):
+            bg = GRADE_COLOR.get(g, "#6b7280")
+            return (f'<span style="background:{bg};color:#fff;font-weight:700;'
+                    f'padding:2px 8px;border-radius:8px;font-size:12px">{g}</span>')
+
+        # ── Split BUY / SHORT ─────────────────────────────────────────────────
+        buy_df   = sigs[sigs["signal"] == "BUY"].sort_values("total_score", ascending=False)
+        short_df = sigs[sigs["signal"] == "SHORT"].sort_values("total_score", ascending=False)
+
+        # ── Display columns ───────────────────────────────────────────────────
+        DISPLAY_COLS = [
+            "tradingsymbol", "grade", "total_score",
+            "p1_adx", "p2_daily", "p3_trend", "p4_momentum", "p5_volume", "p6_trigger",
+            "LTP", "entry", "stop_loss", "t1", "t2", "t3",
+            "atr_pct", "rr_at_t2", "adx_gate", "gap_invalidated",
+        ]
+
+        def _render_signal_table(df_in, signal_label, signal_color):
+            if df_in.empty:
+                st.caption(f"No {signal_label} signals.")
+                return
+            df_disp = df_in[[c for c in DISPLAY_COLS if c in df_in.columns]].copy()
+
+            # Rename for display
+            df_disp.rename(columns={
+                "tradingsymbol": "Symbol",
+                "total_score": "Score",
+                "p1_adx": "P1-ADX", "p2_daily": "P2-Daily", "p3_trend": "P3-Trend",
+                "p4_momentum": "P4-Mom", "p5_volume": "P5-Vol", "p6_trigger": "P6-Trig",
+                "stop_loss": "SL", "atr_pct": "ATR%", "rr_at_t2": "R:R@T2",
+                "adx_gate": "ADX✓", "gap_invalidated": "Gap⚠",
+            }, inplace=True)
+
+            num_fmts = {c: "%.2f" for c in ("LTP", "entry", "SL", "t1", "t2", "t3", "ATR%", "R:R@T2")}
+
+            col_cfg = {
+                "Symbol": st.column_config.TextColumn("Symbol", width=90),
+                "grade":  st.column_config.TextColumn("Grade", width=55),
+                "Score":  st.column_config.NumberColumn("Score", format="%d", width=55),
+                "P1-ADX": st.column_config.NumberColumn("P1", format="%d", width=40),
+                "P2-Daily": st.column_config.NumberColumn("P2", format="%d", width=40),
+                "P3-Trend": st.column_config.NumberColumn("P3", format="%d", width=40),
+                "P4-Mom":   st.column_config.NumberColumn("P4", format="%d", width=40),
+                "P5-Vol":   st.column_config.NumberColumn("P5", format="%d", width=40),
+                "P6-Trig":  st.column_config.NumberColumn("P6", format="%d", width=40),
+                "LTP":    st.column_config.NumberColumn("LTP ₹", format="%.2f"),
+                "entry":  st.column_config.NumberColumn("Entry ₹", format="%.2f"),
+                "SL":     st.column_config.NumberColumn("SL ₹", format="%.2f"),
+                "t1":     st.column_config.NumberColumn("T1 ₹", format="%.2f"),
+                "t2":     st.column_config.NumberColumn("T2 ₹", format="%.2f"),
+                "t3":     st.column_config.NumberColumn("T3 ₹", format="%.2f"),
+                "ATR%":   st.column_config.NumberColumn("ATR%", format="%.2f"),
+                "R:R@T2": st.column_config.NumberColumn("R:R", format="%.2f"),
+                "ADX✓":   st.column_config.CheckboxColumn("ADX✓", width=50),
+                "Gap⚠":   st.column_config.CheckboxColumn("Gap⚠", width=50),
+            }
+
+            def _style_row(row):
+                return [f"color:{signal_color}" if col == "Symbol" else "" for col in row.index]
+
+            st.dataframe(
+                df_disp.style.apply(_style_row, axis=1),
+                column_config=col_cfg,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        _buy_tab, _short_tab = st.tabs([
+            f"🟢 BUY  ({len(buy_df)})",
+            f"🔴 SHORT  ({len(short_df)})",
+        ])
+
+        with _buy_tab:
+            _render_signal_table(buy_df, "BUY", "#22c55e")
+
+        with _short_tab:
+            _render_signal_table(short_df, "SHORT", "#ef4444")
+
+        # ── News catalyst toggles ─────────────────────────────────────────────
+        st.markdown("---")
+        st.caption("📰 **News Catalyst** — toggle to add +1 to P6 and recalculate grade:")
+        all_sigs = pd.concat([buy_df, short_df], ignore_index=True)
+        if not all_sigs.empty and "tradingsymbol" in all_sigs.columns:
+            _nc_cols = st.columns(min(len(all_sigs), 6))
+            for _nc_i, _nc_row in all_sigs.iterrows():
+                _nc_sym  = _nc_row.get("tradingsymbol") or _nc_row.get("Symbol", "")
+                _nc_cur  = bool(_nc_row.get("news_catalyst", False))
+                _nc_col  = _nc_cols[_nc_i % len(_nc_cols)]
+                if _nc_col.checkbox(
+                    _nc_sym, value=_nc_cur,
+                    key=f"nc_{_nc_sym}_{_6p_bust}"
+                ) != _nc_cur:
+                    try:
+                        db.update_news_catalyst(_nc_sym, not _nc_cur)
+                        st.rerun()
+                    except Exception as _nc_err:
+                        st.error(f"Failed to update news catalyst: {_nc_err}")
+
+        # ── Score legend ─────────────────────────────────────────────────────
+        with st.expander("📐 Grade Legend & Pillar Definitions", expanded=False):
+            st.markdown("""
+**Grades**: A+ ≥27 · A ≥24 · B ≥19 · C ≥13 · D <13 (ADX gate=FALSE forces D)
+
+| Pillar | What it measures | Max pts |
+|--------|-----------------|---------|
+| P1 ADX | Trend strength (ADX/DMI on 5-min) | 7 |
+| P2 Daily | Structure vs daily EMA20/200 | 5 |
+| P3 Trend | Intraday direction (5-min EMAs + Supertrend) | 5 |
+| P4 Momentum | RSI(14) + MACD histogram on 5-min | 5 |
+| P5 Volume | OBV flow + volume surge on 5-min | 5 |
+| P6 Trigger | ORB breakout + VWAP position + news | 5 |
+
+**ADX Gate**: If ADX < 20, all signals for this stock are graded D regardless of score.
+
+**Gap Invalidation**: If today's open gapped >1.5× ATR% vs prior close, score is penalised −3.
+
+**3-Candle Confirmation**: C1 breaks ORH/ORL with volume surge, C2 holds, C3 is entry.
+
+**Staleness**: Signal older than 45 minutes (9 bars) is discarded as NO_SIGNAL.
+            """)
+
+    _6pillar_tab_live()
 
 
 # ============================================================
