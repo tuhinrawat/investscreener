@@ -4371,14 +4371,40 @@ def _live_signals_header():
         (base_df["scale_signal"] == "INITIAL_ENTRY")
     )
     _signal_syms = base_df.loc[_has_signal_mask, "tradingsymbol"].dropna().unique().tolist()
+    # Keep LTP live even when no fresh actionable signals exist but trades are open.
+    _open_syms = []
+    try:
+        _open_syms.extend([v.get("sym") for v in st.session_state.get("paper_open", {}).values() if v.get("sym")])
+        _open_syms.extend([v.get("sym") for v in st.session_state.get("scalp_open", {}).values() if v.get("sym")])
+    except Exception:
+        pass
+    _signal_syms = sorted({*map(str, _signal_syms), *map(str, _open_syms)})
 
     _ltp_err = None
     if _market_open and _signal_syms:
         # ── Priority 1: WebSocket ticker ─────────────────────────────────────
-        # _global_ltp_updater (runs outside tabs) already writes _live_ltp from
-        # the WebSocket every 1s.  We just check if it's alive; if so, skip the
-        # REST fallback entirely — avoids redundant work and API calls.
+        # Snapshot fresh WS prices into session state every tick. This keeps
+        # all Trade Signals fragments in sync at 1s cadence without REST calls.
         _ws_used = _kc_module.is_ticker_alive()
+        if _ws_used:
+            _ws_prices = _kc_module.get_all_ticker_prices() or {}
+            if _ws_prices:
+                _filtered_ws = {s: float(_ws_prices[s]) for s in _signal_syms if s in _ws_prices}
+                if _filtered_ws:
+                    if "_live_ltp" in st.session_state:
+                        st.session_state["_prev_ltp"] = dict(st.session_state["_live_ltp"])
+                    st.session_state["_live_ltp"] = _filtered_ws
+                    st.session_state["_live_ltp_ts"] = datetime.now(_IST)
+
+                    # Keep Nifty intraday regime input updated from WS snapshot.
+                    _nifty_ltp_f = _ws_prices.get("NIFTY 50")
+                    if _nifty_ltp_f:
+                        _nifty_ltp_f = float(_nifty_ltp_f)
+                        st.session_state["_nifty_live_ltp"] = _nifty_ltp_f
+                        _nf_prev = st.session_state.get("_nifty_prev_close")
+                        if _nf_prev and _nf_prev > 0:
+                            _nifty_pct = (_nifty_ltp_f - _nf_prev) / _nf_prev * 100
+                            st.session_state["_nifty_intraday_pct"] = round(_nifty_pct, 3)
 
         # ── Priority 2: REST fallback (ticker down or first startup) ─────────
         if not _ws_used:
