@@ -564,9 +564,9 @@ if (_kc_ticker_client and getattr(_kc_ticker_client, "authenticated", False)
         config.NIFTY_50_TOKEN:   "NIFTY 50",
         config.NIFTY_BANK_TOKEN: "NIFTY BANK",
     }
-    # Full screener universe — covers all scan candidates, open trades, signals
+    # Full NSE stock universe (~2.7k symbols) for consistent LTP everywhere.
     try:
-        _ticker_tok_map.update(db.get_universe_tokens())
+        _ticker_tok_map.update(db.get_all_nse_stock_tokens())
     except Exception:
         pass
     _kc_module.start_ticker(
@@ -574,6 +574,19 @@ if (_kc_ticker_client and getattr(_kc_ticker_client, "authenticated", False)
         access_token=st.session_state.get("kite_access_token", ""),
         token_symbol_map=_ticker_tok_map,
     )
+
+# Keep the running ticker subscribed to the full stock universe even across
+# reruns/auth refreshes where start_ticker() doesn't re-run.
+if _kc_ticker_client and getattr(_kc_ticker_client, "authenticated", False):
+    _full_sync_date = st.session_state.get("_ticker_full_sync_date")
+    if _full_sync_date != _today_str:
+        try:
+            _full_map = db.get_all_nse_stock_tokens()
+            if _full_map:
+                _kc_module.update_ticker_subscriptions(_full_map)
+        except Exception:
+            pass
+        st.session_state["_ticker_full_sync_date"] = _today_str
 
 # Convenience alias — current Kite user id for per-user DB filtering
 _cur_user_id: str = st.session_state.get("kite_user_id", "")
@@ -4389,7 +4402,32 @@ def _live_signals_header():
         if _ws_used:
             _ws_prices = _kc_module.get_all_ticker_prices() or {}
             if _ws_prices:
+                # Ensure every visible signal/open-trade symbol is subscribed.
+                try:
+                    _need_syms = [s for s in _signal_syms if s not in _ws_prices]
+                    if _need_syms:
+                        _tok_map_add = db.get_tokens_for_symbols(_need_syms)
+                        if _tok_map_add:
+                            _kc_module.update_ticker_subscriptions(_tok_map_add)
+                except Exception:
+                    pass
+
                 _filtered_ws = {s: float(_ws_prices[s]) for s in _signal_syms if s in _ws_prices}
+                # If WS is alive but some symbols still haven't received ticks yet,
+                # backfill them via REST so LTP columns never freeze at stale DB values.
+                _missing_syms = [s for s in _signal_syms if s not in _filtered_ws]
+                if _missing_syms:
+                    try:
+                        _fc_miss = st.session_state.get("kite_client")
+                        if _fc_miss and _fc_miss.authenticated:
+                            _miss_ltp = _fc_miss.get_ltp_batch([f"NSE:{s}" for s in _missing_syms])
+                            for _k, _v in (_miss_ltp or {}).items():
+                                _sym_k = _k.split(":", 1)[-1]
+                                if _sym_k in _missing_syms and _v:
+                                    _filtered_ws[_sym_k] = float(_v)
+                    except Exception:
+                        pass
+
                 if _filtered_ws:
                     if "_live_ltp" in st.session_state:
                         st.session_state["_prev_ltp"] = dict(st.session_state["_live_ltp"])

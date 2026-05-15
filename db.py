@@ -133,6 +133,14 @@ def release_conn(conn) -> None:
             pass
 
 
+def put_conn(conn) -> None:
+    """
+    Backward-compatible alias used by older helper functions.
+    Prefer release_conn() in new code.
+    """
+    release_conn(conn)
+
+
 def _with_retry(fn, *args, retries: int = 3, **kwargs):
     """
     Call fn(*args, **kwargs) and retry up to `retries` times on
@@ -1130,6 +1138,35 @@ def get_universe_tokens() -> dict:
     finally:
         put_conn(conn)
     return get_nifty50_tokens()
+
+
+def get_all_nse_stock_tokens() -> dict:
+    """
+    Return {instrument_token: tradingsymbol} for the full NSE stock universe.
+
+    Uses the instruments master and filters to cash-equity stocks:
+      exchange='NSE', segment='NSE', instrument_type='EQ'
+    Falls back to get_universe_tokens() if the master is unavailable.
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT instrument_token, tradingsymbol FROM instruments "
+                "WHERE exchange = 'NSE' "
+                "AND COALESCE(segment, '') = 'NSE' "
+                "AND COALESCE(instrument_type, '') = 'EQ' "
+                "AND instrument_token IS NOT NULL "
+                "AND COALESCE(tradingsymbol, '') <> ''"
+            )
+            rows = cur.fetchall()
+            if rows:
+                return {int(r[0]): str(r[1]) for r in rows}
+    except Exception:
+        pass
+    finally:
+        put_conn(conn)
+    return get_universe_tokens()
 
 
 def get_nifty50_tokens() -> dict:
