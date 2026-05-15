@@ -186,28 +186,30 @@ _stc_boot.html("""
   var p = window.parent;
   if (p.__ltp_patcher_installed__) return;
   p.__ltp_patcher_installed__ = true;
-  p.__ltp__      = p.__ltp__      || {};
-  p.__prev_ltp__ = p.__prev_ltp__ || {};
+  p.__ltp__       = p.__ltp__       || {};
+  p.__prev_ltp__  = p.__prev_ltp__  || {};
+  p.__positions__ = p.__positions__ || {};
 
-  function _patch() {
+  // ── LTP text patcher: updates any [data-symbol] element ──────────────────
+  function _patchLtp() {
     var prices = p.__ltp__;
-    var prev   = p.__prev_ltp__;
     if (!prices || !Object.keys(prices).length) return;
     var cells = p.document.querySelectorAll('[data-symbol]');
     cells.forEach(function(el) {
       var sym = el.getAttribute('data-symbol');
       var ltp = prices[sym];
       if (ltp === undefined || ltp === null) return;
-      var oldTxt = parseFloat(el.getAttribute('data-ltp-val') || '0');
-      var fmt = ltp >= 1000 ? ltp.toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2})
-                            : ltp.toFixed(2);
-      if (Math.abs(ltp - oldTxt) > 0.001) {
+      var oldVal = parseFloat(el.getAttribute('data-ltp-val') || '0');
+      var fmt = ltp >= 1000
+        ? ltp.toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2})
+        : ltp.toFixed(2);
+      if (Math.abs(ltp - oldVal) > 0.001) {
         el.textContent = '\u20B9' + fmt;
         el.setAttribute('data-ltp-val', ltp);
         el.classList.remove('ltp-up', 'ltp-down');
-        if (ltp > oldTxt && oldTxt > 0) {
+        if (ltp > oldVal && oldVal > 0) {
           el.classList.add('ltp-up');
-        } else if (ltp < oldTxt && oldTxt > 0) {
+        } else if (ltp < oldVal && oldVal > 0) {
           el.classList.add('ltp-down');
         }
         clearTimeout(el._ltpFlashTimer);
@@ -218,7 +220,32 @@ _stc_boot.html("""
     });
   }
 
-  setInterval(_patch, 500);
+  // ── Live P&L badge: updates [data-pnl-badge] elements from __positions__ ─
+  // Each position entry: {entry, direction (+1/-1), qty, stop, cap}
+  // Renders live MTM P&L using current window.__ltp__ prices.
+  function _patchPnl() {
+    var prices = p.__ltp__;
+    var positions = p.__positions__;
+    if (!prices || !positions) return;
+    var badges = p.document.querySelectorAll('[data-pnl-badge]');
+    badges.forEach(function(el) {
+      var totalMtm = 0;
+      Object.keys(positions).forEach(function(sym) {
+        var pos = positions[sym];
+        var ltp = prices[sym];
+        if (!ltp || !pos.entry || !pos.qty) return;
+        totalMtm += pos.direction * (ltp - pos.entry) * pos.qty;
+      });
+      var sign  = totalMtm >= 0 ? '+' : '';
+      var color = totalMtm >= 0 ? '#22c55e' : '#ef4444';
+      var fmt = Math.abs(totalMtm) >= 1000
+        ? totalMtm.toLocaleString('en-IN', {minimumFractionDigits:0, maximumFractionDigits:0})
+        : totalMtm.toFixed(0);
+      el.innerHTML = '<span style="color:' + color + ';font-weight:700">MTM: \u20B9' + sign + fmt + '</span>';
+    });
+  }
+
+  setInterval(function() { _patchLtp(); _patchPnl(); }, 500);
 })();
 </script>
 """, height=0, scrolling=False)
@@ -2085,7 +2112,16 @@ def _global_ltp_updater():
     Single writer for _live_ltp — runs every 1 s on all tabs.
     Also pushes prices into window.__ltp__ so the JS DOM patcher can update
     any [data-symbol] cell in the page without a Streamlit rerun.
+
+    streamlit-autorefresh (Web Worker) is used as a secondary keepalive so
+    this fragment fires every 1 s even when the browser tab is in background.
+    Browsers throttle ordinary JS timers (used by run_every) in inactive tabs,
+    but Web Workers are exempt from that throttle.
     """
+    # Web Worker keepalive — fires even in background tabs (browsers can't throttle it)
+    if _HAS_AUTOREFRESH:
+        _st_autorefresh(interval=1000, key="global_ltp_ar", debounce=False)
+
     _kc_live = st.session_state.get("kite_client")
     if not (_kc_live and getattr(_kc_live, "authenticated", False)):
         return
@@ -4356,6 +4392,93 @@ def _is_market_open() -> bool:
     return market_open <= now <= market_close
 
 
+# ── Live LTP chip helpers ─────────────────────────────────────────────────────
+
+def _ltp_chip(symbol: str, ltp: "float | None" = None,
+              style: str = "font-size:1.1rem;font-weight:700") -> str:
+    """
+    Returns an HTML <span data-symbol="SYM"> element.
+    The JS DOM patcher updates its textContent every 500ms from window.__ltp__
+    so it reflects the latest WebSocket price without a Streamlit rerun.
+
+    Always pass the current ltp from session state as the initial value —
+    the patcher will keep it current between reruns.
+    """
+    init = f"₹{ltp:,.2f}" if ltp else "—"
+    val  = ltp or 0
+    return (
+        f'<span data-symbol="{symbol}" data-ltp-val="{val}" '
+        f'style="{style};color:#94a3b8;font-family:monospace">'
+        f'{init}</span>'
+    )
+
+
+def _positions_ltp_strip(positions: dict, ltp_map: dict) -> None:
+    """
+    Renders a horizontal strip of live LTP chips for every open position.
+    Each chip has data-symbol so the JS DOM patcher updates it at 500ms.
+    Also injects window.__positions__ so a JS interval can compute live P&L.
+    """
+    if not positions:
+        return
+    import json as _json_ps
+    import streamlit.components.v1 as _stc_ps
+
+    chips_html = ""
+    pos_data = {}
+    for pid, pos in positions.items():
+        sym     = pos.get("sym", "")
+        entry   = float(pos.get("entry") or 0)
+        ltp_now = float(ltp_map.get(sym) or 0)
+        direction = -1 if pos.get("signal_type", "") in ("SELL_BELOW", "SELL_ORB") else 1
+        cap     = float(pos.get("cap") or 0)
+        qty     = max(1, int(cap / entry)) if entry > 0 else 0
+        stop    = float(pos.get("stop") or 0)
+
+        # Distance to stop as %
+        if entry > 0 and stop > 0:
+            dist_stop_pct = abs(ltp_now - stop) / entry * 100 if ltp_now else 0
+            stop_col = "#ef4444" if (
+                (direction == 1 and ltp_now and ltp_now <= stop * 1.003) or
+                (direction == -1 and ltp_now and ltp_now >= stop * 0.997)
+            ) else "#64748b"
+        else:
+            dist_stop_pct = 0
+            stop_col = "#64748b"
+
+        chip = (
+            f'<span style="display:inline-flex;flex-direction:column;align-items:center;'
+            f'background:#0f172a;border:1px solid #1e293b;border-radius:6px;'
+            f'padding:4px 10px;gap:2px;min-width:80px">'
+            f'<span style="font-size:0.7rem;color:#64748b;font-weight:600">{sym}</span>'
+            f'{_ltp_chip(sym, ltp_now, "font-size:0.92rem;font-weight:700")}'
+            f'<span style="font-size:0.65rem;color:{stop_col}">stop ₹{stop:,.2f}</span>'
+            f'</span>'
+        )
+        chips_html += chip
+
+        pos_data[sym] = {
+            "entry": entry, "direction": direction, "qty": qty,
+            "stop": stop, "cap": cap,
+        }
+
+    pos_json = _json_ps.dumps(pos_data)
+
+    # Inject positions into window so JS can compute live P&L
+    _stc_ps.html(f"""
+<script>
+(function() {{
+  window.parent.__positions__ = {pos_json};
+}})();
+</script>""", height=0, scrolling=False)
+
+    st.markdown(
+        f'<div style="display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 12px 0">'
+        f'{chips_html}</div>',
+        unsafe_allow_html=True,
+    )
+
+
 # ── Shared styling helpers (used by signal tabs and intraday fragments) ───────
 def _conf_color(val):
     """Color-code the Conf column by tier: green=STRONG, yellow=MODERATE, orange=MARGINAL, red=LOW."""
@@ -5288,7 +5411,7 @@ def _trading_mode_control():
 
 
 # ── FRAGMENT 2b: paper-trade banner (auto-refresh, daily gate logic) ─────────
-@st.fragment(run_every=3)
+@st.fragment(run_every=1)
 def _intraday_paper_banner():
     """
     Renders the 'Paper Trades Today' dashboard strip and enforces the
@@ -5396,7 +5519,7 @@ def _intraday_paper_banner():
     if _n_today > 0 or _n_open > 0 or True:   # always show banner
         st.markdown(
             f'<div style="background:#0f172a;border:1px solid #334155;border-radius:8px;'
-            f'padding:10px 18px;margin-bottom:10px;display:flex;flex-wrap:wrap;'
+            f'padding:10px 18px;margin-bottom:6px;display:flex;flex-wrap:wrap;'
             f'gap:20px;align-items:center">'
             f'<span style="font-size:0.8rem;color:#94a3b8;white-space:nowrap">'
             f'📄 <b>Paper Trades Today</b></span>'
@@ -5406,6 +5529,7 @@ def _intraday_paper_banner():
             f'Live P&amp;L: ₹{_total_pnl:+,.0f} '
             f'(<span style="font-size:0.8em">{_total_ret:+.2f}%</span>)'
             f'</span>'
+            f'<span data-pnl-badge style="font-size:0.82rem;color:#94a3b8"></span>'
             f'<span style="font-size:0.75rem;color:#64748b;white-space:nowrap">'
             f'Balance: <b style="color:#e2e8f0">₹{_cap:,.0f}</b> · '
             f'Deployed: ₹{_capital_deployed:,} · '
@@ -5414,6 +5538,10 @@ def _intraday_paper_banner():
             f'</div>',
             unsafe_allow_html=True,
         )
+
+    # ── Per-position live LTP chips (data-symbol → JS patcher updates at 500ms) ──
+    if _n_open > 0:
+        _positions_ltp_strip(_open_pt, _live_ltp_now)
 
     # ── Block banner ──────────────────────────────────────────────────────────
     if _blocked:
@@ -5430,9 +5558,8 @@ def _intraday_paper_banner():
 
 
 # ── FRAGMENT 2d: scalping signals (ORB — Opening Range Breakout) ─────────────
-# Refreshes every 5 s (slower than intraday because candle fetches are heavier).
-# ORB is valid only after 9:30 AM (need 15-min opening range to be complete).
-@st.fragment(run_every=2)
+# Refreshes every 1 s for accurate breakout detection and auto-entry.
+@st.fragment(run_every=1)
 def _intraday_scalp_live():
     """
     Scalp signal tab — Opening Range Breakout with 3 confirmations:
@@ -5504,6 +5631,12 @@ def _intraday_scalp_live():
     _mc2.metric("Slots Left",    _sc_slots_left,   help=f"Max {config.SCALP_MAX_POSITIONS} concurrent scalp positions")
     _mc3.metric("Cap Deployed",  f"₹{_sc_cap_deployed:,}", help=f"₹{config.SCALP_CAP_PER_TRADE:,} per trade")
     _mc4.metric("Mode",          _trade_mode.upper(), help="Trading mode: Paper / Real / Off")
+
+    # Live LTP chips for open scalp positions (data-symbol → 500ms JS updates)
+    _scalp_open_now = st.session_state.get("scalp_open", {})
+    if _scalp_open_now:
+        _sc_ltp_map = st.session_state.get("_live_ltp", {})
+        _positions_ltp_strip(_scalp_open_now, _sc_ltp_map)
 
     if _ltp_stale_sc:
         st.info("⏸ Prices stale — waiting for refresh. Auto-scalp paused.", icon="🔄")
@@ -5995,9 +6128,8 @@ def _intraday_scalp_live():
 
 
 # ── FRAGMENT 2a: intraday LONG table (live status column) ────────────────────
-# Runs every 2 s inside the Long sub-tab. No st.tabs() here — the sub-tabs
-# that contain this fragment are created OUTSIDE in _signals_main().
-@st.fragment(run_every=2)
+# Runs every 1 s — contains auto-entry trigger and CONFIRMING countdown.
+@st.fragment(run_every=1)
 def _intraday_long_live():
     # Skip all work outside market hours — fragment still runs but is instant
     if not _is_market_open():
@@ -6505,7 +6637,7 @@ def _intraday_long_live():
 
 
 # ── FRAGMENT 2b: intraday SHORT table (live status column) ───────────────────
-@st.fragment(run_every=2)
+@st.fragment(run_every=1)
 def _intraday_short_live():
     # Skip all work outside market hours — fragment still runs but is instant
     if not _is_market_open():
