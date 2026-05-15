@@ -1032,7 +1032,7 @@ if st.sidebar.button("🔄 Full Rescan (~3-5 min)", use_container_width=True,
     progress_bar = st.sidebar.progress(0)
     status = st.sidebar.empty()
 
-    # ── Pre-validate token before starting a 3-5 min scan ────────────────
+    # ── Pre-validate token + historical data access before 3-5 min scan ──
     _fr_client = st.session_state.get("kite_client")
     if _fr_client is None:
         st.sidebar.error("⛔ Kite client not initialised. Please authenticate Kite first.")
@@ -1042,6 +1042,14 @@ if st.sidebar.button("🔄 Full Rescan (~3-5 min)", use_container_width=True,
         st.sidebar.error(
             f"⛔ **Token invalid — scan aborted.**\n\n{_tok_err}\n\n"
             f"➡ Sign out from the sidebar and re-authenticate Kite to get a fresh token."
+        )
+        st.stop()
+    # Separately probe the historical data endpoint — needs its own add-on subscription
+    with st.sidebar.status("Probing historical data API…", expanded=False):
+        _hist_ok, _hist_err = _fr_client.validate_historical_access()
+    if not _hist_ok:
+        st.sidebar.error(
+            f"⛔ **Historical data API not accessible — scan aborted.**\n\n{_hist_err}"
         )
         st.stop()
 
@@ -1153,15 +1161,19 @@ if _kc_live and _kc_live.authenticated:
         unsafe_allow_html=True,
     )
     if st.sidebar.button("🔍 Test Kite Token", use_container_width=True,
-                         help="Makes one live API call to confirm the token is valid before scanning."):
+                         help="Tests both the auth token AND historical data access before scanning."):
         _tv_ok, _tv_err = _kc_live.validate_token()
-        if _tv_ok:
-            st.sidebar.success("✓ Token is valid — ready to scan.")
-        else:
+        if not _tv_ok:
             st.sidebar.error(
-                f"⛔ Token INVALID.\n\n{_tv_err}\n\n"
+                f"⛔ Auth token INVALID.\n\n{_tv_err}\n\n"
                 "Sign out and re-authenticate Kite to get a fresh token."
             )
+        else:
+            _th_ok, _th_err = _kc_live.validate_historical_access()
+            if _th_ok:
+                st.sidebar.success("✓ Token valid · Historical data API accessible — ready to scan.")
+            else:
+                st.sidebar.error(f"⛔ Auth token OK but historical data FAILED:\n\n{_th_err}")
 else:
     st.sidebar.markdown(
         '<div style="font-size:12px;color:#f59e0b;padding:2px 0 4px 0;">'

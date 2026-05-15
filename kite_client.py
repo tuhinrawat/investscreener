@@ -198,12 +198,8 @@ class KiteClient:
 
     def validate_token(self) -> tuple[bool, str]:
         """
-        Make a live API call to verify the access token is actually accepted
-        by Zerodha's servers right now.
-
+        Validates the access token with kite.profile() (auth + basic API).
         Returns (True, "") if valid, (False, reason) if invalid.
-        Use this before starting any long-running scan to avoid wasting 3-5
-        minutes only to fail on the first real API call.
         """
         if self.kite is None or not self.authenticated:
             return False, "Kite client not initialised or not authenticated."
@@ -218,6 +214,60 @@ class KiteClient:
                 return False, ("Access token rejected by Zerodha. "
                                "Please sign out and re-authenticate Kite from the sidebar.")
             return False, f"Token validation failed: {e}"
+
+    def validate_historical_access(self) -> tuple[bool, str]:
+        """
+        Probe the historical data API with one known-good instrument (RELIANCE,
+        token 738561) for a single day.  This is a DIFFERENT API endpoint than
+        profile — it requires the 'Historical Data' add-on subscription on the
+        Kite Connect app and can fail even when validate_token() passes.
+
+        Returns (True, "") if historical data is accessible, (False, detailed_reason) otherwise.
+        """
+        if self.kite is None or not self.authenticated:
+            return False, "Kite client not initialised."
+        from datetime import datetime, date, timedelta
+        probe_token = 738561   # NSE:RELIANCE — always active, high volume
+        # Use last completed trading day (yesterday or Friday if weekend)
+        today = date.today()
+        probe_date = today - timedelta(days=1)
+        # Skip weekends
+        if probe_date.weekday() == 6:   # Sunday
+            probe_date -= timedelta(days=2)
+        elif probe_date.weekday() == 5: # Saturday
+            probe_date -= timedelta(days=1)
+        from_dt = datetime.combine(probe_date, datetime.min.time())
+        to_dt   = datetime.combine(probe_date, datetime.max.time().replace(microsecond=0))
+        exc_cls = ""
+        exc_msg = ""
+        try:
+            candles = self.kite.historical_data(
+                instrument_token=probe_token,
+                from_date=from_dt,
+                to_date=to_dt,
+                interval="day",
+            )
+            if candles is not None:   # empty list on a holiday is still OK
+                return True, ""
+            return False, "Historical data call returned None — unexpected response."
+        except Exception as e:
+            exc_cls = type(e).__name__
+            exc_msg = str(e)
+        # Classify the error
+        msg_low = exc_msg.lower()
+        if "permission" in msg_low or "subscription" in msg_low or "plan" in msg_low:
+            return False, (
+                f"[{exc_cls}] Historical Data subscription not active on this Kite Connect app. "
+                "Go to kite.trade → Apps → your app → add 'Historical Data' add-on."
+            )
+        if "token" in msg_low or "unauthori" in msg_low or "invalid" in msg_low:
+            return False, (
+                f"[{exc_cls}] Access token rejected by historical data endpoint: {exc_msg}. "
+                "Sign out and re-authenticate Kite."
+            )
+        if "rate" in msg_low or "429" in msg_low:
+            return False, f"[{exc_cls}] Rate limited — wait 30 seconds and try again."
+        return False, f"[{exc_cls}] {exc_msg}"
 
     # ----------------------------------------------------------
     # INSTRUMENTS — full master list of NSE securities

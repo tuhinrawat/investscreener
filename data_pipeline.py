@@ -334,7 +334,7 @@ def fetch_historical_for_universe(
         except Exception as e:
             fail_count += 1
             if fail_count == 1:
-                first_error = str(e)
+                first_error = f"[{type(e).__name__}] {e}"
             continue
 
     # Final DB flush
@@ -349,8 +349,10 @@ def fetch_historical_for_universe(
         raise RuntimeError(
             f"All {fail_count} historical data fetches failed. "
             f"First error: {first_error}. "
-            "This is usually an expired Kite access token — "
-            "please re-authenticate Kite from the sidebar."
+            "Possible causes: (1) expired/invalid Kite access token — re-authenticate; "
+            "(2) Historical Data add-on not active on your Kite Connect app; "
+            "(3) API key does not have permission for historical data. "
+            "Use the 'Test Kite Token' button in the sidebar to diagnose."
         )
     return success_count
 
