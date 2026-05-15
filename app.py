@@ -46,6 +46,7 @@ import ai_analyst as _ai
 import market_intel as _mi
 from kite_client import KiteClient
 import kite_client as _kc_module
+import ws_manager as _ws_manager
 
 # IST timezone constant — defined once here so every fragment and helper can use
 # it without depending on execution order (fragments run before the body reaches
@@ -165,10 +166,62 @@ st.markdown(
     }
     /* Keep the custom component iframes invisible (they're 0-height utility iframes) */
     iframe[title="kite_ls"] { display: none !important; }
+    /* Flash classes applied by the JS DOM patcher for price changes */
+    .ltp-up   { color: #22c55e !important; }
+    .ltp-down { color: #ef4444 !important; }
     </style>
     """,
     unsafe_allow_html=True,
 )
+
+# ── JS DOM patcher — injected once per page load ──────────────────────────────
+# Sets up window.__ltp__ dict and a 500ms setInterval that patches every
+# element with [data-symbol] attr.  Color-flashes green on rise, red on drop,
+# fades to neutral after 2 s.  The _global_ltp_updater fragment writes fresh
+# prices into window.__ltp__ via a 0-height iframe on every tick.
+import streamlit.components.v1 as _stc_boot  # noqa: E402
+_stc_boot.html("""
+<script>
+(function() {
+  var p = window.parent;
+  if (p.__ltp_patcher_installed__) return;
+  p.__ltp_patcher_installed__ = true;
+  p.__ltp__      = p.__ltp__      || {};
+  p.__prev_ltp__ = p.__prev_ltp__ || {};
+
+  function _patch() {
+    var prices = p.__ltp__;
+    var prev   = p.__prev_ltp__;
+    if (!prices || !Object.keys(prices).length) return;
+    var cells = p.document.querySelectorAll('[data-symbol]');
+    cells.forEach(function(el) {
+      var sym = el.getAttribute('data-symbol');
+      var ltp = prices[sym];
+      if (ltp === undefined || ltp === null) return;
+      var oldTxt = parseFloat(el.getAttribute('data-ltp-val') || '0');
+      var fmt = ltp >= 1000 ? ltp.toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2})
+                            : ltp.toFixed(2);
+      if (Math.abs(ltp - oldTxt) > 0.001) {
+        el.textContent = '\u20B9' + fmt;
+        el.setAttribute('data-ltp-val', ltp);
+        el.classList.remove('ltp-up', 'ltp-down');
+        if (ltp > oldTxt && oldTxt > 0) {
+          el.classList.add('ltp-up');
+        } else if (ltp < oldTxt && oldTxt > 0) {
+          el.classList.add('ltp-down');
+        }
+        clearTimeout(el._ltpFlashTimer);
+        el._ltpFlashTimer = setTimeout(function() {
+          el.classList.remove('ltp-up', 'ltp-down');
+        }, 2000);
+      }
+    });
+  }
+
+  setInterval(_patch, 500);
+})();
+</script>
+""", height=0, scrolling=False)
 
 # ── Browser localStorage (per-user, per-domain) ──────────────────────
 # ls_get / ls_set / ls_delete persist values in the user's own browser.
@@ -554,9 +607,9 @@ if "kite_client" not in st.session_state or not st.session_state["kite_client"]:
     if _kc.authenticated:
         st.session_state["kite_client"] = _kc
 
-# ── Start KiteTicker WebSocket (once per process, reconnects automatically) ──
-# We start the ticker whenever Kite is authenticated AND the ticker isn't alive.
-# Token map: full screener universe (computed_metrics) + NIFTY 50/BANK indices.
+# ── Start KiteTicker WebSocket via ws_manager (auto-reconnect + batch sub) ──
+# ws_manager.start() is idempotent — does nothing if already running.
+# It wraps kite_client's ticker with a keeper thread and 500-token batch subs.
 _kc_ticker_client = st.session_state.get("kite_client")
 if (_kc_ticker_client and getattr(_kc_ticker_client, "authenticated", False)
         and not _kc_module.is_ticker_started()):
@@ -569,22 +622,20 @@ if (_kc_ticker_client and getattr(_kc_ticker_client, "authenticated", False)
         _ticker_tok_map.update(db.get_all_nse_stock_tokens())
     except Exception:
         pass
-    _kc_module.start_ticker(
+    _ws_manager.start(
         api_key=st.session_state.get("kite_api_key", ""),
         access_token=st.session_state.get("kite_access_token", ""),
         token_symbol_map=_ticker_tok_map,
     )
 
-# Keep the running ticker subscribed to the full stock universe even across
-# reruns/auth refreshes where start_ticker() doesn't re-run.
+# Once per calendar day: merge any new tokens added since session started.
 if _kc_ticker_client and getattr(_kc_ticker_client, "authenticated", False):
     _today_sync = datetime.now(_IST).date().isoformat()
-    _full_sync_date = st.session_state.get("_ticker_full_sync_date")
-    if _full_sync_date != _today_sync:
+    if st.session_state.get("_ticker_full_sync_date") != _today_sync:
         try:
             _full_map = db.get_all_nse_stock_tokens()
             if _full_map:
-                _kc_module.update_ticker_subscriptions(_full_map)
+                _ws_manager.add_symbols(_full_map)
         except Exception:
             pass
         st.session_state["_ticker_full_sync_date"] = _today_sync
@@ -888,6 +939,7 @@ if st.sidebar.button("📡 Refresh Signals (~30s)", use_container_width=True,
                     for k, v in _pre_tune.items()
                 )
             st.session_state["_last_metrics_update_ts"] = datetime.now(_IST)
+            st.session_state["_metrics_cache_bust"] = st.session_state.get("_metrics_cache_bust", 0) + 1
             st.sidebar.success(
                 f"✓ {_sig_result['signals_updated']} signals refreshed "
                 f"({_sig_result['errors']} errors) in {_sig_result['elapsed_sec']}s\n"
@@ -938,6 +990,7 @@ if st.sidebar.button("🔄 Full Rescan (~3-5 min)", use_container_width=True,
         progress_bar.progress(1.0)
         status.caption("Done")
         st.session_state["_last_metrics_update_ts"] = datetime.now(_IST)
+        st.session_state["_metrics_cache_bust"] = st.session_state.get("_metrics_cache_bust", 0) + 1
         st.sidebar.success(
             f"✓ {result['metrics_computed']} stocks scored "
             f"in {result['elapsed_sec']}s"
@@ -1123,7 +1176,14 @@ st.sidebar.subheader("Filters")
 # ============================================================
 # LOAD DATA
 # ============================================================
-df = db.load_metrics()
+# Cache the heavy DB read for 2 minutes so 1-Hz reruns don't hammer Neon.
+# The cache is bypassed when the user runs a manual scan (bust key below).
+@st.cache_data(ttl=120, show_spinner=False)
+def _load_metrics_cached(_bust: int = 0) -> "pd.DataFrame":
+    return db.load_metrics()
+
+_metrics_bust = st.session_state.get("_metrics_cache_bust", 0)
+df = _load_metrics_cached(_bust=_metrics_bust)
 # Keep df in session_state so the live-signal fragment always sees the latest
 # base data (entry/stop/pivot levels) even across fragment-only reruns.
 st.session_state["_signals_base_df"] = df
@@ -2021,6 +2081,11 @@ _market_pulse_header()
 # live prices without depending on Trade Signals fragments being active.
 @st.fragment(run_every=1)
 def _global_ltp_updater():
+    """
+    Single writer for _live_ltp — runs every 1 s on all tabs.
+    Also pushes prices into window.__ltp__ so the JS DOM patcher can update
+    any [data-symbol] cell in the page without a Streamlit rerun.
+    """
     _kc_live = st.session_state.get("kite_client")
     if not (_kc_live and getattr(_kc_live, "authenticated", False)):
         return
@@ -2033,11 +2098,12 @@ def _global_ltp_updater():
     if not _mkt_open:
         return
 
-    _ws_prices = _kc_module.get_all_ticker_prices() or {}
+    _ws_prices = _ws_manager.get_prices() or {}
     if _ws_prices:
         _old = st.session_state.get("_live_ltp", {})
         st.session_state["_prev_ltp"] = dict(_old) if _old else {}
-        st.session_state["_live_ltp"] = {str(k): float(v) for k, v in _ws_prices.items()}
+        _new_ltp = {str(k): float(v) for k, v in _ws_prices.items()}
+        st.session_state["_live_ltp"] = _new_ltp
         st.session_state["_live_ltp_ts"] = _now
 
         _nifty_ltp = _ws_prices.get("NIFTY 50")
@@ -2048,9 +2114,20 @@ def _global_ltp_updater():
             if _nf_prev and _nf_prev > 0:
                 _nifty_pct = (_nifty_ltp_f - _nf_prev) / _nf_prev * 100
                 st.session_state["_nifty_intraday_pct"] = round(_nifty_pct, 3)
-        return
 
-    # Strict realtime mode: no REST fallback writes for global LTP cache.
+        # Push prices into window.__ltp__ so the JS DOM patcher applies
+        # them to [data-symbol] cells without waiting for a Streamlit rerun.
+        import json as _json_ltp
+        import streamlit.components.v1 as _stc_ltp
+        _prices_json = _json_ltp.dumps(_new_ltp)
+        _stc_ltp.html(f"""
+<script>
+(function(){{
+  var p = window.parent;
+  p.__prev_ltp__ = Object.assign({{}}, p.__ltp__ || {{}});
+  p.__ltp__      = {_prices_json};
+}})();
+</script>""", height=0, scrolling=False)
 
 
 _global_ltp_updater()
@@ -8850,201 +8927,65 @@ _fetch_fx_commodity()
 @st.fragment(run_every=1)
 def _ticker_banner():
     """
-    Renders a fixed-position scrolling ticker at the very bottom of the
-    viewport.  Reads from the WebSocket price dict (sub-second latency)
-    when the ticker is alive, falling back to session-state REST prices.
+    Pure-JS ticker banner.
 
-    Styling notes:
-      • position:fixed so it never scrolls out of view.
-      • animation uses translateX so the GPU handles the scroll (no reflow).
-      • Content is duplicated so the loop is seamless (no gap at the end).
-      • padding-bottom on .main ensures the last widget isn't hidden behind
-        the banner.
+    Python side runs ONCE per session to inject:
+      1. CSS keyframes and banner styles
+      2. window.__tb_config__ with Nifty50 symbol list and extra data
+      3. A setInterval(1000) that reads window.__ltp__ and refreshes
+         the scrolling content in-place — CSS animation state is preserved.
+
+    Subsequent price updates reach the banner via window.__ltp__ without
+    any Streamlit reruns or Python involvement.
     """
-    # ── Choose price source ───────────────────────────────────────────────
-    # WebSocket dict retains the last-received prices even after market closes
-    # (prices are only cleared on start_ticker() — i.e. next login).
-    # So we ALWAYS read the ticker dict first (not gated by is_ticker_alive),
-    # falling back to session-state REST cache only if the dict is truly empty
-    # (first login, no ticks ever received this session).
-    _ws_prices = _kc_module.get_all_ticker_prices() or {}
-    _prices = _ws_prices
-
-    _mkt_open = _is_market_open()
-
-    # Single-writer rule: global updater owns session LTP writes.
-
-    if not _prices:
-            _banner_msg = "⚠&nbsp;No live websocket ticks yet"
-            import streamlit.components.v1 as _stc
-            _stc.html(f"""
-<script>
-(function(){{
-  var p=window.parent.document;
-  if(!p.getElementById('__tb_style')){{
-    var s=p.createElement('style');s.id='__tb_style';
-    s.textContent='#__tb{{position:fixed;bottom:0;left:0;right:0;height:34px;background:#060d18;border-top:1px solid #1e3a5f;z-index:9999;display:flex;align-items:center;padding:0 12px}}section.main .block-container{{padding-bottom:44px!important}}';
-    p.head.appendChild(s);
-  }}
-  var el=p.getElementById('__tb');
-  if(!el){{el=p.createElement('div');el.id='__tb';p.body.appendChild(el);}}
-  el.innerHTML='<span style="color:#475569;font-size:12px;font-family:monospace">{_banner_msg}</span>';
-}})();
-</script>
-""", height=0, scrolling=False)
-            return
-
-    _prev = st.session_state.get("_prev_ltp", {})
-    # _mkt_open already computed above (before the early-return block)
-
-    def _fmt_item(sym: str, ltp: float, css_class: str = "tb-stk") -> str:
-        prev = _prev.get(sym, ltp)
-        if prev and prev != ltp:
-            pct   = (ltp - prev) / prev * 100
-            col   = "#22c55e" if pct >= 0 else "#ef4444"
-            badge = f'&nbsp;<span style="color:{col}">{"▲" if pct >= 0 else "▼"}{abs(pct):.2f}%</span>'
-        else:
-            # Frozen price (market closed) — show no change badge, dim colour
-            col   = "#64748b" if not _mkt_open else "#94a3b8"
-            badge = ""
-        return (
-            f'<span class="{css_class}">'
-            f'{sym}&nbsp;<span style="color:{col}">{ltp:,.2f}{badge}</span>'
-            f'</span>'
-        )
-
-    items: list = []
-
-    # ── 1. Key indices ─────────────────────────────────────────────────────
-    for _idx_sym in ("NIFTY 50", "NIFTY BANK"):
-        _ltp = _prices.get(_idx_sym)
-        if _ltp:
-            items.append(_fmt_item(_idx_sym, _ltp, "tb-idx"))
-
-    # ── 2. Nifty 50 constituent stocks (alphabetical for easy scanning) ───
-    for _sym in sorted(config.NIFTY50_SYMBOLS):
-        _ltp = _prices.get(_sym)
-        if _ltp:
-            items.append(_fmt_item(_sym, _ltp, "tb-stk"))
-
-    # ── 3. USD/INR ────────────────────────────────────────────────────────
-    _usd = st.session_state.get("_usdinr_ltp")
-    if _usd:
-        items.append(
-            f'<span class="tb-fx">💱&nbsp;USD/INR&nbsp;'
-            f'<span style="color:#f59e0b">₹{_usd:.2f}</span></span>'
-        )
-
-    # ── 4. Crude Oil ──────────────────────────────────────────────────────
-    _cr_usd = st.session_state.get("_crude_usd")   # USD/barrel from Yahoo Finance
-    _cr_inr = st.session_state.get("_crude_ltp")   # INR/barrel (converted)
-    if _cr_usd:
-        items.append(
-            f'<span class="tb-cx">🛢&nbsp;WTI&nbsp;'
-            f'<span style="color:#f59e0b">${_cr_usd:,.2f}</span>'
-            + (f'&nbsp;<span style="color:#94a3b8">₹{_cr_inr:,.0f}</span>' if _cr_inr else "")
-            + '</span>'
-        )
-    elif _cr_inr:
-        items.append(
-            f'<span class="tb-cx">🛢&nbsp;WTI&nbsp;'
-            f'<span style="color:#f59e0b">₹{_cr_inr:,.1f}</span></span>'
-        )
-
-    # ── 4b. Brent Crude ───────────────────────────────────────────────────
-    _brent_usd_bn = st.session_state.get("_brent_usd")
-    if _brent_usd_bn:
-        items.append(
-            f'<span class="tb-cx">🛢&nbsp;Brent&nbsp;'
-            f'<span style="color:#f97316">${_brent_usd_bn:,.2f}</span></span>'
-        )
-
-    # ── 4c. Natural Gas ───────────────────────────────────────────────────
-    _ng_usd_bn = st.session_state.get("_natgas_usd")
-    if _ng_usd_bn:
-        items.append(
-            f'<span class="tb-cx">⛽&nbsp;NatGas&nbsp;'
-            f'<span style="color:#a78bfa">${_ng_usd_bn:,.3f}</span></span>'
-        )
-
-    # ── 5. Nifty PCR ──────────────────────────────────────────────────────
-    _pcr = st.session_state.get("_nifty_pcr")
-    if _pcr:
-        _pcr_col = "#22c55e" if _pcr > 1.0 else "#ef4444"
-        _pcr_lbl = "Bullish" if _pcr > 1.2 else ("Bearish" if _pcr < 0.8 else "Neutral")
-        items.append(
-            f'<span class="tb-pcr">⚖️&nbsp;PCR&nbsp;'
-            f'<span style="color:{_pcr_col}">{_pcr:.2f}&nbsp;({_pcr_lbl})</span></span>'
-        )
-
-    if not items:
-        return
-
-    _sep     = '&nbsp;&nbsp;<span style="color:#1e3a5f">|</span>&nbsp;&nbsp;'
-    _content = _sep.join(items)
-    # Duplicate for seamless infinite loop
-    _content_full = _content + _sep + _content
-
-    # Scale scroll duration with number of items for readable speed
-    _duration = max(45, len(items) * 2)
-
-    # Determine source badge: strictly websocket-driven
-    _ticker_live = _kc_module.is_ticker_alive()
-    if _ticker_live:
-        _ws_badge_txt   = "⚡&nbsp;LIVE"
-        _ws_badge_color = "#22c55e"
-    else:
-        _ws_badge_txt   = "⚠&nbsp;NO TICKS"
-        _ws_badge_color = "#ef4444"
-
-    _mkt_badge = ""
-    if not _mkt_open:
-        _mkt_badge = (
-            '<div style="flex-shrink:0;padding:0 10px;border-right:1px solid #1e3a5f;'
-            'font-size:12px;color:#64748b;font-family:monospace;white-space:nowrap">'
-            '⏸&nbsp;CLOSED&nbsp;·&nbsp;awaiting new ticks</div>'
-        )
-
-    _ws_badge = (
-        f'<div style="flex-shrink:0;padding:0 8px;border-right:1px solid #1e3a5f;'
-        f'font-size:12px;font-family:monospace;white-space:nowrap;color:{_ws_badge_color}">'
-        f'{_ws_badge_txt}</div>'
-    )
-
     import json as _json
     import streamlit.components.v1 as _stc
 
-    _inner_html = (
-        f'<div id="__tb_badges" style="display:contents">{_ws_badge}{_mkt_badge}</div>'
-        f'<div style="flex:1;overflow:hidden;height:100%;display:flex;align-items:center">'
-        f'<div id="__tb_scroll" style="display:inline-flex;white-space:nowrap;align-items:center;height:100%;'
-        f'animation:_tbsc {_duration}s linear infinite;will-change:transform">'
-        f'{_content_full}</div></div>'
-    )
+    # Only inject the full JS infrastructure once per session.
+    # On subsequent reruns, only update window.__tb_extra__ (macro data).
+    _banner_ready = st.session_state.get("_ticker_banner_ready", False)
 
-    # st.markdown strips <script> tags, so we use components.html (0-height iframe)
-    # which executes JS and can reach window.parent.document to inject/update a
-    # persistent <div id="__tb"> on the parent page body — never removed by Streamlit.
-    #
-    # On every tick we update only the inner content of #__tb_scroll and #__tb_badges
-    # rather than replacing el.innerHTML wholesale.  Replacing el.innerHTML destroys
-    # the animated div and recreates it, resetting the CSS translateX animation to
-    # position 0 each second — which is why the banner never scrolled past the first
-    # few stocks.  By updating only the children of the animated element (not the
-    # element itself) the CSS animation state is preserved across price updates.
-    _stc.html(f"""
+    # Pack non-WS data (USD/INR, crude, PCR) into a small dict for the JS
+    _extra: dict = {}
+    _usd = st.session_state.get("_usdinr_ltp")
+    if _usd:
+        _extra["usdinr"] = float(_usd)
+    _cr_usd = st.session_state.get("_crude_usd")
+    if _cr_usd:
+        _extra["wti_usd"] = float(_cr_usd)
+    _cr_inr = st.session_state.get("_crude_ltp")
+    if _cr_inr:
+        _extra["wti_inr"] = float(_cr_inr)
+    _brent = st.session_state.get("_brent_usd")
+    if _brent:
+        _extra["brent_usd"] = float(_brent)
+    _ng = st.session_state.get("_natgas_usd")
+    if _ng:
+        _extra["natgas_usd"] = float(_ng)
+    _pcr = st.session_state.get("_nifty_pcr")
+    if _pcr:
+        _extra["pcr"] = float(_pcr)
+
+    _extra_json = _json.dumps(_extra)
+
+    if not _banner_ready:
+        # First render — install styles + full JS infrastructure
+        _nifty50_json = _json.dumps(sorted(config.NIFTY50_SYMBOLS))
+        _stc.html(f"""
 <script>
 (function() {{
-  var p = window.parent.document;
-  // Inject keyframe + banner styles once
-  if (!p.getElementById('__tb_style')) {{
-    var s = p.createElement('style');
+  var p = window.parent;
+  var pd = p.document;
+
+  // ── Styles (injected once) ───────────────────────────────────────────
+  if (!pd.getElementById('__tb_style')) {{
+    var s = pd.createElement('style');
     s.id = '__tb_style';
     s.textContent = [
       '@keyframes _tbsc{{0%{{transform:translateX(0)}}100%{{transform:translateX(-50%)}}}}',
       '#__tb{{position:fixed;bottom:0;left:0;right:0;height:34px;background:#060d18;',
       'border-top:1px solid #1e3a5f;overflow:hidden;z-index:9999;display:flex;',
-      'align-items:center;gap:0;font-family:\\'SF Mono\\',\\'Fira Code\\',monospace}}',
+      'align-items:center;gap:0;font-family:"SF Mono","Fira Code",monospace}}',
       '#__tb .tb-idx{{font-size:13px;padding:0 8px;color:#e2e8f0;font-weight:600}}',
       '#__tb .tb-stk{{font-size:12px;padding:0 7px;color:#94a3b8}}',
       '#__tb .tb-fx {{font-size:12px;padding:0 7px;color:#fbbf24}}',
@@ -9052,33 +8993,126 @@ def _ticker_banner():
       '#__tb .tb-pcr{{font-size:12px;padding:0 7px;color:#a78bfa}}',
       'section.main .block-container{{padding-bottom:44px!important}}'
     ].join('');
-    p.head.appendChild(s);
+    pd.head.appendChild(s);
   }}
-  var el = p.getElementById('__tb');
-  if (!el) {{
-    // First render: create the banner and set full structure
-    el = p.createElement('div');
+
+  // ── Banner container (created once, never removed) ───────────────────
+  if (!pd.getElementById('__tb')) {{
+    var el = pd.createElement('div');
     el.id = '__tb';
-    p.body.appendChild(el);
-    el.innerHTML = {_json.dumps(_inner_html)};
-  }} else {{
-    // Subsequent renders: update only content inside the animated div and badges.
-    // Leaving #__tb_scroll itself untouched preserves its CSS animation position.
-    var scroll = p.getElementById('__tb_scroll');
-    var badges = p.getElementById('__tb_badges');
-    if (scroll && badges) {{
-      var anim = (scroll.getAnimations && scroll.getAnimations()[0]) ? scroll.getAnimations()[0] : null;
-      var ct = anim ? anim.currentTime : null;
-      scroll.innerHTML  = {_json.dumps(_content_full)};
-      badges.innerHTML  = {_json.dumps(_ws_badge + _mkt_badge)};
-      var anim2 = (scroll.getAnimations && scroll.getAnimations()[0]) ? scroll.getAnimations()[0] : null;
-      if (anim2 && ct !== null) {{
-        try {{ anim2.currentTime = ct; }} catch(e) {{}}
+    pd.body.appendChild(el);
+    // Placeholder until first tick
+    el.innerHTML = '<span style="color:#475569;font-size:12px;padding:0 12px">Awaiting WebSocket ticks\u2026</span>';
+  }}
+
+  // ── Config (symbol list) ─────────────────────────────────────────────
+  p.__tb_config__ = {{ nifty50: {_nifty50_json} }};
+  p.__tb_extra__  = {_extra_json};
+
+  // ── Render function — rebuilds content from window.__ltp__ ──────────
+  function _tbRender() {{
+    var ltp  = p.__ltp__ || {{}};
+    var prev = p.__prev_ltp__ || {{}};
+    var cfg  = p.__tb_config__ || {{}};
+    var extra = p.__tb_extra__ || {{}};
+    var syms = cfg.nifty50 || [];
+    var sep  = '\\u00a0\\u00a0<span style="color:#1e3a5f">|</span>\\u00a0\\u00a0';
+
+    function fmtNum(n) {{
+      return n >= 1000
+        ? n.toLocaleString('en-IN', {{minimumFractionDigits:2,maximumFractionDigits:2}})
+        : n.toFixed(2);
+    }}
+
+    function mkItem(sym, price, cls) {{
+      var p0 = prev[sym];
+      var col = '#94a3b8';
+      var badge = '';
+      if (p0 && Math.abs(price - p0) > 0.001) {{
+        var pct = (price - p0) / p0 * 100;
+        col   = pct >= 0 ? '#22c55e' : '#ef4444';
+        badge = '\\u00a0<span style="color:' + col + '">' + (pct >= 0 ? '\\u25b2' : '\\u25bc') + Math.abs(pct).toFixed(2) + '%</span>';
       }}
+      return '<span class="' + cls + '">' + sym + '\\u00a0<span style="color:' + col + '">' + fmtNum(price) + badge + '</span></span>';
+    }}
+
+    var items = [];
+
+    // Indices
+    ['NIFTY 50','NIFTY BANK'].forEach(function(s) {{
+      if (ltp[s]) items.push(mkItem(s, ltp[s], 'tb-idx'));
+    }});
+
+    // Nifty 50 stocks
+    syms.forEach(function(s) {{
+      if (ltp[s]) items.push(mkItem(s, ltp[s], 'tb-stk'));
+    }});
+
+    // Macro extras
+    if (extra.usdinr)   items.push('<span class="tb-fx">USD/INR\\u00a0<span style="color:#f59e0b">\\u20b9' + extra.usdinr.toFixed(2) + '</span></span>');
+    if (extra.wti_usd)  items.push('<span class="tb-cx">WTI\\u00a0<span style="color:#f59e0b">$' + fmtNum(extra.wti_usd) + '</span>' + (extra.wti_inr ? '\\u00a0<span style="color:#94a3b8">\\u20b9' + Math.round(extra.wti_inr) + '</span>' : '') + '</span>');
+    if (extra.brent_usd) items.push('<span class="tb-cx">Brent\\u00a0<span style="color:#f97316">$' + fmtNum(extra.brent_usd) + '</span></span>');
+    if (extra.natgas_usd) items.push('<span class="tb-cx">NatGas\\u00a0<span style="color:#a78bfa">$' + extra.natgas_usd.toFixed(3) + '</span></span>');
+    if (extra.pcr) {{
+      var pcrCol = extra.pcr > 1.0 ? '#22c55e' : '#ef4444';
+      var pcrLbl = extra.pcr > 1.2 ? 'Bullish' : (extra.pcr < 0.8 ? 'Bearish' : 'Neutral');
+      items.push('<span class="tb-pcr">PCR\\u00a0<span style="color:' + pcrCol + '">' + extra.pcr.toFixed(2) + '\\u00a0(' + pcrLbl + ')</span></span>');
+    }}
+
+    if (!items.length) return;
+
+    var content = items.join(sep);
+    var contentFull = content + sep + content;
+    var duration = Math.max(45, items.length * 2);
+
+    // Badge
+    var wsAlive = p.__tb_alive__ || false;
+    var badgeTxt   = wsAlive ? '\\u26a1\\u00a0LIVE'    : '\\u26a0\\u00a0NO TICKS';
+    var badgeColor = wsAlive ? '#22c55e' : '#ef4444';
+    var badgeHTML = '<div style="flex-shrink:0;padding:0 8px;border-right:1px solid #1e3a5f;font-size:12px;font-family:monospace;white-space:nowrap;color:' + badgeColor + '">' + badgeTxt + '</div>';
+
+    var tb = pd.getElementById('__tb');
+    if (!tb) return;
+
+    var scroll = pd.getElementById('__tb_scroll');
+    var badges = pd.getElementById('__tb_badges');
+
+    if (!scroll) {{
+      // Build structure on first real tick
+      tb.innerHTML =
+        '<div id="__tb_badges" style="display:contents">' + badgeHTML + '</div>' +
+        '<div style="flex:1;overflow:hidden;height:100%;display:flex;align-items:center">' +
+        '<div id="__tb_scroll" style="display:inline-flex;white-space:nowrap;align-items:center;height:100%;' +
+        'animation:_tbsc ' + duration + 's linear infinite;will-change:transform">' +
+        contentFull + '</div></div>';
     }} else {{
-      el.innerHTML = {_json.dumps(_inner_html)};
+      // Update content only — preserve animation state
+      var anim = scroll.getAnimations ? scroll.getAnimations()[0] : null;
+      var ct   = anim ? anim.currentTime : null;
+      scroll.innerHTML = contentFull;
+      var anim2 = scroll.getAnimations ? scroll.getAnimations()[0] : null;
+      if (anim2 && ct !== null) {{ try {{ anim2.currentTime = ct; }} catch(e) {{}} }}
+      if (badges) badges.innerHTML = badgeHTML;
     }}
   }}
+
+  // ── Poll window.__ltp__ every second ─────────────────────────────────
+  if (!p.__tb_interval__) {{
+    p.__tb_interval__ = setInterval(_tbRender, 1000);
+  }}
+}})();
+</script>
+""", height=0, scrolling=False)
+        st.session_state["_ticker_banner_ready"] = True
+
+    else:
+        # Subsequent runs: only update macro extra data (WS prices go via window.__ltp__)
+        _stc.html(f"""
+<script>
+(function() {{
+  var p = window.parent;
+  p.__tb_extra__ = {_extra_json};
+  p.__tb_alive__ = {"true" if _ws_manager.is_alive() else "false"};
 }})();
 </script>
 """, height=0, scrolling=False)

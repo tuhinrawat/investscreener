@@ -51,6 +51,9 @@ def rsi(df: pd.DataFrame, period: int = 14) -> float:
     """
     Standard RSI. Returns latest value.
     Wilder's smoothing (not simple SMA) — that's the canonical version.
+
+    Edge case: when avg_loss = 0 (pure uptrend, no losing closes), RSI = 100.
+    When avg_gain = 0 (pure downtrend), RSI = 0.
     """
     if len(df) < period + 1:
         return None
@@ -60,10 +63,19 @@ def rsi(df: pd.DataFrame, period: int = 14) -> float:
     # Wilder's smoothing = exponential with alpha = 1/period
     avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi_series = 100 - (100 / (1 + rs))
-    val = rsi_series.iloc[-1]
-    return float(val) if pd.notna(val) else None
+    last_gain = avg_gain.iloc[-1]
+    last_loss = avg_loss.iloc[-1]
+    # Handle negative zero (IEEE 754 artifact) and exact zero
+    last_loss = abs(float(last_loss)) if pd.notna(last_loss) else None
+    last_gain = abs(float(last_gain)) if pd.notna(last_gain) else None
+    if last_loss is None or last_gain is None:
+        return None
+    if last_loss == 0:
+        return 100.0 if last_gain > 0 else 50.0
+    if last_gain == 0:
+        return 0.0
+    rs = last_gain / last_loss
+    return round(100 - (100 / (1 + rs)), 4)
 
 
 # ============================================================

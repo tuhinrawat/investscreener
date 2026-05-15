@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest pytest-cov
+
+      - name: Syntax check all Python files
+        run: |
+          find . -name "*.py" -not -path "./.git/*" \
+            | xargs python -m py_compile
+
+      - name: Run tests
+        env:
+          # Prevent DB / Kite calls from running in CI
+          DATABASE_URL: "postgresql://ci:ci@localhost/ci_stub"
+          KITE_API_KEY: "ci_key"
+          KITE_API_SECRET: "ci_secret"
+        run: |
+          pytest tests/ -v --tb=short \
+            --ignore=tests/test_db.py \
+            --cov=signals --cov=indicators --cov=config \
+            --cov-report=term-missing
+
+      - name: Fail on blocking lint issues
+        run: |
+          python -m py_compile signals.py indicators.py config.py ws_manager.py db.py
+          echo "All core modules passed syntax check"

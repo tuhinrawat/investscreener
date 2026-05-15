@@ -255,3 +255,12 @@ SCALP_REQUIRE_FNO_LISTED   = True      # scalp only F&O listed underlyings
 
 # VWAP band — price must be within this % of VWAP to count as "near VWAP" alignment
 VWAP_BAND_PCT          = 0.5   # within 0.5% of VWAP counts as VWAP pull-to trade
+
+# ============================================================
+# INTRADAY REGIME GATE (P3.2)
+# When True, the intraday_signal() function hard-blocks:
+#   - LONG signals when stock is below its intraday VWAP AND Nifty is bearish
+#   - SHORT signals when stock is above its intraday VWAP AND Nifty is bullish
+# Set to False to revert to warning-only behaviour.
+# ============================================================
+INTRADAY_REGIME_GATE   = True

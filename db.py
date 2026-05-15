@@ -77,7 +77,7 @@ def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
         )
     if _pool is None or _pool.closed:
         _pool = psycopg2.pool.ThreadedConnectionPool(
-            minconn=2, maxconn=20, dsn=_DATABASE_URL
+            minconn=1, maxconn=4, dsn=_DATABASE_URL
         )
     return _pool
 
@@ -97,25 +97,31 @@ def _fresh_conn() -> psycopg2.extensions.connection:
 def get_conn() -> psycopg2.extensions.connection:
     """
     Borrow a connection from the pool.
-    Uses conn.closed as a fast (no network) pre-check, then attempts a
-    rollback() to reset transaction state.  Dead connections detected here
-    trigger a full pool rebuild.  Any SSL drop that slips through is caught
-    by _with_retry() at the call site.
+    Retries up to 3 times with 200 ms back-off on PoolError (pool exhaustion),
+    which can happen when many Streamlit threads compete at 1 Hz.
     """
     global _pool
     pool = _get_pool()
-    conn = pool.getconn()
-    if conn.closed:
-        return _fresh_conn()
-    try:
-        conn.rollback()   # reset transaction state, no network if already clean
-    except Exception:
+    last_exc: Exception | None = None
+    for _attempt in range(3):
         try:
-            conn.close()
+            conn = pool.getconn()
+        except psycopg2.pool.PoolError as exc:
+            last_exc = exc
+            time.sleep(0.2)
+            continue
+        if conn.closed:
+            return _fresh_conn()
+        try:
+            conn.rollback()   # reset transaction state, no network if already clean
         except Exception:
-            pass
-        return _fresh_conn()
-    return conn
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return _fresh_conn()
+        return conn
+    raise RuntimeError(f"DB pool exhausted after 3 attempts: {last_exc}")
 
 
 def release_conn(conn) -> None:

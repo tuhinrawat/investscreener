@@ -464,6 +464,7 @@ def intraday_signal(
     min_rr: float = 1.5,
     nifty_pct_change: float = 0.0,
     today_open: float | None = None,
+    vwap: float | None = None,
 ) -> dict:
     """
     Day-trading plan derived from the previous session's candle.
@@ -478,12 +479,16 @@ def intraday_signal(
     LONG  entry = 0.1% above R1  | stop = max(0.3% below R1, 0.5×ATR)  | T1 = R2  | T2 = R3
     SHORT entry = 0.1% below S1  | stop = max(0.3% above S1, 0.5×ATR)  | T1 = S2  | T2 = S3
 
-    New gates (applied on top of baseline R/R and RSI checks):
+    Gates applied on top of baseline R/R and RSI checks:
       nifty_pct_change — today's Nifty 50 intraday % change from prev close.
         Long signals are flagged/suppressed when Nifty < -NIFTY_GATE_PCT.
         Short signals are flagged/suppressed when Nifty > +NIFTY_GATE_PCT.
       today_open — today's open price for the stock.  If open is already
         GAP_WARN_PCT% above R1, flag as gap-up risk; if > GAP_SKIP_PCT, AVOID.
+      vwap — today's intraday VWAP from 5-min candles.  When
+        INTRADAY_REGIME_GATE=True:
+          Long: AVOID if stock is below VWAP AND Nifty is bearish.
+          Short: AVOID if stock is above VWAP AND Nifty is bullish.
 
     Thresholds (rsi_buy_max, rsi_sell_min, min_rr) are tunable via paper-trade
     feedback — pass values from db.get_signal_config() to adjust the algo.
@@ -568,10 +573,23 @@ def intraday_signal(
             elif gap_pct >= _cfg.GAP_WARN_PCT:
                 gap_flag = "GAP_WARN"   # emit signal but warn in the reason
 
-        # ── Nifty direction gate ──────────────────────────────────────────
+        # ── Nifty + VWAP regime gate ──────────────────────────────────────
         nifty_gate = None
         if nifty_pct_change <= -_cfg.NIFTY_GATE_PCT:
-            nifty_gate = "NIFTY_BEARISH"   # market is down — long may face headwind
+            nifty_gate = "NIFTY_BEARISH"
+            # Hard block: if regime gate enabled AND stock is also below VWAP
+            if _cfg.INTRADAY_REGIME_GATE and vwap is not None and ltp < vwap:
+                return {
+                    **_INTRA_NULL,
+                    "intraday_signal": "AVOID",
+                    "intraday_pivot": P, "intraday_r1": R1, "intraday_r2": R2, "intraday_r3": R3,
+                    "intraday_s1": S1, "intraday_s2": S2, "intraday_s3": S3,
+                    "intraday_nifty_gate": nifty_gate,
+                    "intraday_reason": (
+                        f"REGIME BLOCK: Nifty down {abs(nifty_pct_change):.1f}% AND stock "
+                        f"below VWAP ₹{vwap:.2f} — long setup has double headwind. AVOID."
+                    ),
+                }
 
         _conf = compute_intraday_confidence(metrics, rr, "BUY_ABOVE")
 
@@ -649,10 +667,23 @@ def intraday_signal(
             elif gap_pct_s >= _cfg.GAP_WARN_PCT:
                 gap_flag = "GAP_WARN"
 
-        # ── Nifty direction gate for shorts ───────────────────────────────
+        # ── Nifty + VWAP regime gate for shorts ───────────────────────────
         nifty_gate = None
         if nifty_pct_change >= _cfg.NIFTY_GATE_PCT:
-            nifty_gate = "NIFTY_BULLISH"   # market is up — short may face headwind
+            nifty_gate = "NIFTY_BULLISH"
+            # Hard block: if regime gate enabled AND stock is also above VWAP
+            if _cfg.INTRADAY_REGIME_GATE and vwap is not None and ltp > vwap:
+                return {
+                    **_INTRA_NULL,
+                    "intraday_signal": "AVOID",
+                    "intraday_pivot": P, "intraday_r1": R1, "intraday_r2": R2, "intraday_r3": R3,
+                    "intraday_s1": S1, "intraday_s2": S2, "intraday_s3": S3,
+                    "intraday_nifty_gate": nifty_gate,
+                    "intraday_reason": (
+                        f"REGIME BLOCK: Nifty up {abs(nifty_pct_change):.1f}% AND stock "
+                        f"above VWAP ₹{vwap:.2f} — short setup has double headwind. AVOID."
+                    ),
+                }
 
         _conf = compute_intraday_confidence(metrics, rr, "SELL_BELOW")
 
