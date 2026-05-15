@@ -1070,7 +1070,20 @@ if st.sidebar.button("🔄 Full Rescan (~3-5 min)", use_container_width=True,
             f"✓ {result['metrics_computed']} stocks scored "
             f"in {result['elapsed_sec']}s"
         )
-        st.sidebar.json(result)
+        # Surface non-fatal fetch failures as a warning (not a crash)
+        _n_failed = result.get("history_failed", 0)
+        if _n_failed > 0:
+            _err_samples = result.get("fetch_err_samples", [])
+            _first_err   = result.get("fetch_first_error", "")
+            st.sidebar.warning(
+                f"⚠ {_n_failed} stocks failed to fetch history "
+                f"(likely delisted/suspended — skipped).\n\n"
+                f"**First error:** `{_first_err}`\n\n"
+                + ("\n".join(f"• `{s}`" for s in _err_samples) if _err_samples else "")
+            )
+        else:
+            # Only show JSON detail when no failures — keeps UI clean on normal runs
+            st.sidebar.json(result)
 
         # ── Algo feedback: tune thresholds from paper trade performance ───
         try:

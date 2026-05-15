@@ -272,7 +272,9 @@ def fetch_historical_for_universe(
 
     success_count = 0
     fail_count = 0
+    skip_count  = 0   # stocks already up to date — counted to distinguish "nothing to do" from "all failed"
     first_error = ""
+    error_samples: list[str] = []   # first 5 failing symbols + error for diagnostics
     all_candles = []
 
     iterator = enumerate(universe_df.itertuples(index=False))
@@ -293,7 +295,8 @@ def fetch_historical_for_universe(
             if hasattr(cached_last, "date"):
                 cached_last = cached_last.date()
             if cached_last >= today:
-                continue  # nothing to fetch
+                skip_count += 1
+                continue  # nothing to fetch — NOT a failure
             from_date = datetime.combine(cached_last + timedelta(days=1), datetime.min.time())
         else:
             from_date = full_from_date
@@ -306,7 +309,8 @@ def fetch_historical_for_universe(
                 interval="day",
             )
             if not candles:
-                fail_count += 1
+                # Empty list = no new candles (holiday / new listing) — not a hard error
+                skip_count += 1
                 continue
             new_rows = [
                 {
@@ -333,8 +337,11 @@ def fetch_historical_for_universe(
 
         except Exception as e:
             fail_count += 1
+            exc_detail = f"[{type(e).__name__}] {e}"
             if fail_count == 1:
-                first_error = f"[{type(e).__name__}] {e}"
+                first_error = exc_detail
+            if len(error_samples) < 5:
+                error_samples.append(f"{symbol}: {exc_detail}")
             continue
 
     # Final DB flush
@@ -344,17 +351,36 @@ def fetch_historical_for_universe(
     # All data committed — checkpoint no longer needed
     clear_checkpoint()
 
-    print(f"✓ History pulled: {success_count} success, {fail_count} failed")
-    if success_count == 0 and fail_count > 0:
+    print(f"✓ History pulled: {success_count} fetched, {skip_count} skipped (cached), {fail_count} failed")
+    if error_samples:
+        print(f"  First {len(error_samples)} failures: {error_samples}")
+
+    # Only fatal if we have ZERO usable data at all — i.e., nothing was fetched AND
+    # nothing was cached from a prior run.  If some stocks are already in the DB
+    # (skip_count > 0) we can proceed even if today's incremental fetch failed.
+    if success_count == 0 and skip_count == 0 and fail_count > 0:
         raise RuntimeError(
-            f"All {fail_count} historical data fetches failed. "
+            f"All {fail_count} historical data fetches failed — DB is empty. "
             f"First error: {first_error}. "
+            f"Sample failures: {error_samples[:3]}. "
             "Possible causes: (1) expired/invalid Kite access token — re-authenticate; "
             "(2) Historical Data add-on not active on your Kite Connect app; "
             "(3) API key does not have permission for historical data. "
             "Use the 'Test Kite Token' button in the sidebar to diagnose."
         )
-    return success_count
+
+    if success_count == 0 and fail_count > 0 and skip_count > 0:
+        # Partial failure: cached data exists but today's update failed.
+        # Warn but don't abort — compute_metrics will use yesterday's close prices.
+        print(
+            f"⚠ {fail_count} stocks failed to update today "
+            f"({skip_count} were already cached). "
+            f"First error: {first_error}. "
+            "Proceeding with cached data — signals may use yesterday's close."
+        )
+
+    # Return tuple so callers can surface warnings without crashing
+    return success_count, fail_count, first_error, error_samples
 
 
 # ============================================================
@@ -537,7 +563,7 @@ def full_rescan(progress_callback=None, client: "KiteClient | None" = None) -> d
     fetch_list = pd.concat([filtered, nifty_row], ignore_index=True)
 
     # Step 4: Pull historical (the slow part)
-    n_fetched = fetch_historical_for_universe(
+    n_fetched, n_fetch_failed, _fetch_first_err, _fetch_err_samples = fetch_historical_for_universe(
         client, fetch_list, progress_callback=progress_callback
     )
 
@@ -578,14 +604,18 @@ def full_rescan(progress_callback=None, client: "KiteClient | None" = None) -> d
               "check liquidity gate thresholds and OHLCV data quality")
 
     elapsed = time.time() - t0
-    return {
-        "universe_size":   len(universe),
-        "post_pre_filter": len(filtered),
-        "ohlcv_rows":      ohlcv_rows,
-        "history_fetched": n_fetched,
+    result: dict = {
+        "universe_size":    len(universe),
+        "post_pre_filter":  len(filtered),
+        "ohlcv_rows":       ohlcv_rows,
+        "history_fetched":  n_fetched,
+        "history_failed":   n_fetch_failed,
+        "fetch_first_error": _fetch_first_err,
+        "fetch_err_samples": _fetch_err_samples,
         "metrics_computed": len(metrics_df),
-        "elapsed_sec":     round(elapsed, 1),
+        "elapsed_sec":      round(elapsed, 1),
     }
+    return result
 
 
 def quick_refresh(client: "KiteClient | None" = None) -> dict:
