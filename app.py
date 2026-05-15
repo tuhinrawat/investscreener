@@ -9552,25 +9552,22 @@ _fetch_fx_commodity()
 @st.fragment(run_every=1)
 def _ticker_banner():
     """
-    Pure-JS ticker banner.
+    Realtime scrolling ticker banner (bottom of page).
 
-    Python side runs ONCE per session to inject:
-      1. CSS keyframes and banner styles
-      2. window.__tb_config__ with Nifty50 symbol list and extra data
-      3. A setInterval(1000) that reads window.__ltp__ and refreshes
-         the scrolling content in-place — CSS animation state is preserved.
-
-    Subsequent price updates reach the banner via window.__ltp__ without
-    any Streamlit reruns or Python involvement.
+    Architecture (solves the stale-closure / animation-reset problem):
+    - The FULL script is injected on EVERY Streamlit rerun (no _banner_ready guard).
+    - DOM structure and CSS animation are created ONCE (guarded by element IDs).
+    - _tbBuild and _tbUpdate are stored on window.parent so the setInterval
+      callback always references the freshest versions even after iframe recycling.
+    - The interval indirectly calls p.__tbUpdate__() so redefining it on each
+      rerun keeps it live without stopping/restarting the interval.
+    - price spans carry data-tb-sym; only their textContent + color are mutated —
+      the animation container is NEVER touched, preventing any visual reset.
     """
     import json as _json
     import streamlit.components.v1 as _stc
 
-    # Only inject the full JS infrastructure once per session.
-    # On subsequent reruns, only update window.__tb_extra__ (macro data).
-    _banner_ready = st.session_state.get("_ticker_banner_ready", False)
-
-    # Pack non-WS data (USD/INR, crude, PCR) into a small dict for the JS
+    # Pack non-WS macro data (USD/INR, crude, PCR) for the JS
     _extra: dict = {}
     _usd = st.session_state.get("_usdinr_ltp")
     if _usd:
@@ -9593,24 +9590,20 @@ def _ticker_banner():
 
     _extra_json = _json.dumps(_extra)
 
-    if not _banner_ready:
-        # First render: install DOM, styles, and the full JS engine.
-        # KEY DESIGN: build the scroll DOM ONCE, then update only the individual
-        # price <span data-tb-sym> text nodes at 500 ms — the CSS animation is
-        # NEVER reset, so the scroll never jumps or stutters.
-        _nifty50_json = _json.dumps(sorted(config.NIFTY50_SYMBOLS))
+    _nifty50_json = _json.dumps(sorted(config.NIFTY50_SYMBOLS))
+    _alive_js     = "true" if _ws_manager.is_alive() else "false"
+    if True:  # always inject — functions stored on parent so interval stays live
         _stc.html(f"""
 <script>
 (function() {{
   var p  = window.parent;
   var pd = p.document;
 
-  // ── Styles (injected once) ────────────────────────────────────────────────
-  // Keyframe: -33.333% shift because content is tripled for seamless looping.
+  // ── Styles — injected once, guarded by element ID ────────────────────────
   if (!pd.getElementById('__tb_style')) {{
-    var s = pd.createElement('style');
-    s.id  = '__tb_style';
-    s.textContent = [
+    var _s = pd.createElement('style');
+    _s.id  = '__tb_style';
+    _s.textContent = [
       '@keyframes _tbsc{{0%{{transform:translateX(0)}}100%{{transform:translateX(-33.333%)}}}}',
       '#__tb{{position:fixed;bottom:0;left:0;right:0;height:34px;background:#060d18;',
         'border-top:1px solid #1e3a5f;overflow:hidden;z-index:9999;display:flex;',
@@ -9623,113 +9616,90 @@ def _ticker_banner():
       '[data-tb-sym]{{transition:color 0.25s;border-radius:3px;padding:0 2px}}',
       'section.main .block-container{{padding-bottom:44px!important}}'
     ].join('');
-    pd.head.appendChild(s);
+    pd.head.appendChild(_s);
   }}
 
-  // ── Banner container (created once, never destroyed) ─────────────────────
+  // ── Banner container — created once, never destroyed ─────────────────────
   if (!pd.getElementById('__tb')) {{
     var _tb = pd.createElement('div');
     _tb.id  = '__tb';
     pd.body.appendChild(_tb);
-    _tb.innerHTML = '<span style="color:#475569;font-size:12px;padding:0 12px">Awaiting WebSocket ticks\u2026</span>';
+    _tb.innerHTML = '<span style="color:#475569;font-size:12px;padding:0 12px">Awaiting ticks\u2026</span>';
   }}
 
-  // ── Shared config on parent window ───────────────────────────────────────
+  // ── Update config on parent window every rerun ───────────────────────────
   p.__tb_config__  = {{ nifty50: {_nifty50_json} }};
   p.__tb_extra__   = {_extra_json};
+  p.__tb_alive__   = {_alive_js};
+  p.__tb_prevpx__  = p.__tb_prevpx__ || {{}};
 
-  p.__tb_alive__   = {"true" if _ws_manager.is_alive() else "false"};
-  p.__tb_prevpx__  = p.__tb_prevpx__ || {{}};  // per-symbol last-seen price for flash
-
+  // ── Helper: locale-aware price formatter ────────────────────────────────
   function _fmtP(n) {{
     return n >= 1000
-      ? n.toLocaleString('en-IN', {{minimumFractionDigits:2,maximumFractionDigits:2}})
+      ? n.toLocaleString('en-IN', {{minimumFractionDigits:2, maximumFractionDigits:2}})
       : n.toFixed(2);
   }}
 
-  // ── Phase 1: Build DOM structure (called once, when first prices arrive) ──
-  // Creates scroll container with data-tb-sym spans. After this, only the
-  // text nodes inside those spans are ever touched — the animation runs forever.
-  function _tbBuild() {{
+  // ── _tbBuild: build scroll DOM once when first prices arrive ─────────────
+  // Stores all symbol chips as <span data-tb-sym="SYM"> so _tbUpdate can
+  // find and mutate only those text nodes — animation container never touched.
+  p.__tbBuild__ = function() {{
     var ltp   = p.__ltp__     || {{}};
     var ref   = p.__ref_ltp__ || {{}};
     var syms  = (p.__tb_config__ || {{}}).nifty50 || [];
     var extra = p.__tb_extra__ || {{}};
     var sep   = '\\u00a0\\u00a0<span style="color:#1e3a5f">|</span>\\u00a0\\u00a0';
 
-    function mkChip(sym, cls) {{
-      var px   = ltp[sym] || ref[sym] || 0;
-      var ref0 = ref[sym] || 0;
-      var col  = '#94a3b8'; var chg = '';
-      if (px > 0 && ref0 > 0) {{
-        var pct  = (px - ref0) / ref0 * 100;
+    function _chip(sym, cls) {{
+      var px = ltp[sym] || ref[sym] || 0;
+      var r  = ref[sym] || 0;
+      var col = '#94a3b8'; var chg = '';
+      if (px > 0 && r > 0) {{
+        var pct = (px - r) / r * 100;
         col = pct > 0.005 ? '#22c55e' : pct < -0.005 ? '#ef4444' : '#94a3b8';
         chg = '\\u00a0' + (pct >= 0 ? '\\u25b2' : '\\u25bc') + (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%';
       }}
-      var pCol = ltp[sym] ? col : '#4b5563';
-      var pStr = px > 0 ? _fmtP(px) : '\\u2014';
-      return '<span class="'+cls+'">'+sym+'\\u00a0<span data-tb-sym="'+sym+'" data-tb-px="'+px+'" style="color:'+pCol+'">'+pStr+chg+'</span></span>';
+      return '<span class="' + cls + '">' + sym + '\\u00a0'
+           + '<span data-tb-sym="' + sym + '" data-tb-px="' + px + '" style="color:' + (ltp[sym] ? col : '#4b5563') + '">'
+           + (px > 0 ? _fmtP(px) : '\\u2014') + chg + '</span></span>';
     }}
 
     var items = [];
-    ['NIFTY 50','NIFTY BANK'].forEach(function(s) {{ items.push(mkChip(s,'tb-idx')); }});
-    syms.forEach(function(s) {{ items.push(mkChip(s,'tb-stk')); }});
-    if (extra.usdinr)    items.push('<span class="tb-fx">USD/INR\\u00a0<span id="__tb_usdinr">\\u20b9'+extra.usdinr.toFixed(2)+'</span></span>');
-    if (extra.wti_usd)   items.push('<span class="tb-cx">WTI\\u00a0<span id="__tb_wti">$'+_fmtP(extra.wti_usd)+'</span></span>');
-    if (extra.brent_usd) items.push('<span class="tb-cx">Brent\\u00a0<span id="__tb_brent">$'+_fmtP(extra.brent_usd)+'</span></span>');
+    ['NIFTY 50', 'NIFTY BANK'].forEach(function(s) {{ items.push(_chip(s, 'tb-idx')); }});
+    syms.forEach(function(s) {{ items.push(_chip(s, 'tb-stk')); }});
+    if (extra.usdinr)    items.push('<span class="tb-fx">USD/INR\\u00a0<span id="__tb_usdinr">\\u20b9' + extra.usdinr.toFixed(2) + '</span></span>');
+    if (extra.wti_usd)   items.push('<span class="tb-cx">WTI\\u00a0<span id="__tb_wti">$' + _fmtP(extra.wti_usd) + '</span></span>');
+    if (extra.brent_usd) items.push('<span class="tb-cx">Brent\\u00a0<span id="__tb_brent">$' + _fmtP(extra.brent_usd) + '</span></span>');
     if (extra.pcr) {{
       var pc = extra.pcr > 1.0 ? '#22c55e' : '#ef4444';
-      items.push('<span class="tb-pcr">PCR\\u00a0<span id="__tb_pcr" style="color:'+pc+'">'+extra.pcr.toFixed(2)+'</span></span>');
+      items.push('<span class="tb-pcr">PCR\\u00a0<span id="__tb_pcr" style="color:' + pc + '">' + extra.pcr.toFixed(2) + '</span></span>');
     }}
+    if (!items.length) return;
 
     var content = items.join(sep);
-    var full    = content + sep + content + sep + content;  // triple for seamless loop
+    var full    = content + sep + content + sep + content;  // tripled for seamless loop
     var dur     = Math.max(60, items.length * 2.2);
 
     var tb = pd.getElementById('__tb');
     if (!tb) return;
     tb.innerHTML =
       '<div id="__tb_badge" style="flex-shrink:0;padding:0 8px;border-right:1px solid #1e3a5f;font-size:12px;white-space:nowrap;color:#22c55e">\\u26a1\\u00a0LIVE</div>'
-      +'<div style="flex:1;overflow:hidden;height:100%;display:flex;align-items:center">'
-      +'<div id="__tb_scroll" style="display:inline-flex;white-space:nowrap;align-items:center;height:100%;animation:_tbsc '+dur+'s linear infinite;will-change:transform">'
-      +full+'</div></div>';
-  }}
+      + '<div style="flex:1;overflow:hidden;height:100%;display:flex;align-items:center">'
+      + '<div id="__tb_scroll" style="display:inline-flex;white-space:nowrap;align-items:center;height:100%;'
+      + 'animation:_tbsc ' + dur + 's linear infinite;will-change:transform">'
+      + full + '</div></div>';
+  }};
 
-  // ── Phase 2: Update prices in-place (runs every 500 ms) ──────────────────
-  // Only mutates textContent + color of data-tb-sym spans — never touches the
-  // scroll container's structure or animation, so there is ZERO flicker/reset.
-  function _tbUpdate() {{
-    var ltp   = p.__ltp__     || {{}};
-    var ref   = p.__ref_ltp__ || {{}};   // prev-day close injected by Python
-    var cfg   = p.__tb_config__ || {{}};
-    var extra = p.__tb_extra__  || {{}};
-    var syms  = cfg.nifty50 || [];
-    var sep   = '\\u00a0\\u00a0<span style="color:#1e3a5f">|</span>\\u00a0\\u00a0';
-
-    function fmtNum(n) {{
-      return n >= 1000
-        ? n.toLocaleString('en-IN', {{minimumFractionDigits:2,maximumFractionDigits:2}})
-        : n.toFixed(2);
-    }}
-
-    // Build one ticker chip.
-    // price    = live LTP (or ref-close if WS hasn't arrived yet)
-    // refPrice = previous day's closing price (for daily % change)
-    // hasLive  = true if price came from WebSocket
-    function mkItem(sym, price, cls, refPrice, hasLive) {{
-      var col   = '#94a3b8';   // default: neutral grey
-      var badge = '';
-      if (refPrice && refPrice > 0 && price && price > 0) {{
-        var chgPct = (price - refPrice) / refPrice * 100;
-        col = chgPct > 0.005  ? '#22c55e'
-            : chgPct < -0.005 ? '#ef4444'
-            : '#94a3b8';
-        var arrow = chgPct >= 0 ? '\\u25b2' : '\\u25bc';
+  // ── _tbUpdate: mutate only price text nodes every 500 ms ─────────────────
+  // NEVER rebuilds scroll innerHTML — animation runs uninterrupted.
+  // Stored on p so the setInterval always calls the freshest version.
+  p.__tbUpdate__ = function() {{
     var scroll = pd.getElementById('__tb_scroll');
     if (!scroll) {{
-      // Build if prices are available (live or ref)
-      var hasAny = Object.keys(p.__ltp__ || {{}}).length || Object.keys(p.__ref_ltp__ || {{}}).length;
-      if (hasAny) _tbBuild();
+      // First tick — build if any prices available
+      if (Object.keys(p.__ltp__ || {{}}).length || Object.keys(p.__ref_ltp__ || {{}}).length) {{
+        p.__tbBuild__();
+      }}
       return;
     }}
 
@@ -9737,26 +9707,24 @@ def _ticker_banner():
     var ref  = p.__ref_ltp__ || {{}};
     var prev = p.__tb_prevpx__;
 
-    // Mutate only the price text nodes — never touch scroll.innerHTML
-    var spans = pd.querySelectorAll('[data-tb-sym]');
-    spans.forEach(function(el) {{
+    pd.querySelectorAll('[data-tb-sym]').forEach(function(el) {{
       var sym     = el.getAttribute('data-tb-sym');
-      var price   = ltp[sym]  || 0;
-      var refPx   = ref[sym]  || 0;
+      var price   = ltp[sym] || 0;
+      var refPx   = ref[sym] || 0;
       var display = price > 0 ? price : refPx;
       var prevPx  = parseFloat(el.getAttribute('data-tb-px') || '0');
-      if (display === prevPx) return;  // no change — skip repaint
+      if (display === prevPx) return;  // skip if unchanged
 
       var col = '#94a3b8'; var chg = '';
       if (display > 0 && refPx > 0) {{
-        var pct  = (display - refPx) / refPx * 100;
+        var pct = (display - refPx) / refPx * 100;
         col = pct > 0.005 ? '#22c55e' : pct < -0.005 ? '#ef4444' : '#94a3b8';
         chg = '\\u00a0' + (pct >= 0 ? '\\u25b2' : '\\u25bc') + (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%';
       }}
       el.textContent = (display > 0 ? _fmtP(display) : '\\u2014') + chg;
       el.style.color  = price > 0 ? col : '#4b5563';
 
-      // Green/red background flash on each live tick change
+      // Brief green/red background flash on each live tick change
       if (price > 0 && prevPx > 0 && Math.abs(price - prevPx) > 0.001) {{
         el.style.background = price > prevPx ? 'rgba(34,197,94,0.28)' : 'rgba(239,68,68,0.28)';
         clearTimeout(el._tbFlash);
@@ -9765,36 +9733,22 @@ def _ticker_banner():
       el.setAttribute('data-tb-px', display);
     }});
 
-    // Update LIVE / NO TICKS badge
+    // Refresh LIVE badge
     var badge = pd.getElementById('__tb_badge');
     if (badge) {{
-      var alive = p.__tb_alive__ || false;
-      badge.style.color = alive ? '#22c55e' : '#ef4444';
-      badge.textContent  = alive ? '\\u26a1\\u00a0LIVE' : '\\u26a0\\u00a0NO TICKS';
+      badge.style.color = p.__tb_alive__ ? '#22c55e' : '#ef4444';
+      badge.textContent  = p.__tb_alive__ ? '\\u26a1\\u00a0LIVE' : '\\u26a0\\u00a0NO TICKS';
     }}
     var keys = Object.keys(ltp);
     for (var i = 0; i < keys.length; i++) {{ if (ltp[keys[i]]) prev[keys[i]] = ltp[keys[i]]; }}
-  }}
+  }};
 
-  // ── 500 ms interval (twice per second — more responsive than 1 s) ────────
+  // ── Install interval once — calls p.__tbUpdate__ indirectly so that
+  //    redefining it above on each rerun refreshes the live function ─────────
   if (!p.__tb_interval__) {{
-    p.__tb_interval__ = setInterval(_tbUpdate, 500);
+    p.__tb_interval__ = setInterval(function() {{ p.__tbUpdate__(); }}, 500);
   }}
-  _tbUpdate();  // immediate first paint
-}})();
-</script>
-""", height=0, scrolling=False)
-        st.session_state["_ticker_banner_ready"] = True
-
-    else:
-        # Subsequent Streamlit reruns: only sync macro data + alive flag.
-        # Price updates flow through window.__ltp__ — no Python involvement needed.
-        _stc.html(f"""
-<script>
-(function() {{
-  var p = window.parent;
-  p.__tb_extra__ = {_extra_json};
-  p.__tb_alive__ = {"true" if _ws_manager.is_alive() else "false"};
+  p.__tbUpdate__();  // immediate first render
 }})();
 </script>
 """, height=0, scrolling=False)
