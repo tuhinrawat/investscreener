@@ -2034,22 +2034,59 @@ def _global_ltp_updater():
         return
 
     _ws_prices = _kc_module.get_all_ticker_prices() or {}
-    if not _ws_prices:
+    _ws_alive = _kc_module.is_ticker_alive()
+    if _ws_prices:
+        _old = st.session_state.get("_live_ltp", {})
+        st.session_state["_prev_ltp"] = dict(_old) if _old else {}
+        st.session_state["_live_ltp"] = {str(k): float(v) for k, v in _ws_prices.items()}
+        st.session_state["_live_ltp_ts"] = _now
+
+        _nifty_ltp = _ws_prices.get("NIFTY 50")
+        if _nifty_ltp:
+            _nifty_ltp_f = float(_nifty_ltp)
+            st.session_state["_nifty_live_ltp"] = _nifty_ltp_f
+            _nf_prev = st.session_state.get("_nifty_prev_close")
+            if _nf_prev and _nf_prev > 0:
+                _nifty_pct = (_nifty_ltp_f - _nf_prev) / _nf_prev * 100
+                st.session_state["_nifty_intraday_pct"] = round(_nifty_pct, 3)
         return
 
-    _old = st.session_state.get("_live_ltp", {})
-    st.session_state["_prev_ltp"] = dict(_old) if _old else {}
-    st.session_state["_live_ltp"] = {str(k): float(v) for k, v in _ws_prices.items()}
-    st.session_state["_live_ltp_ts"] = _now
-
-    _nifty_ltp = _ws_prices.get("NIFTY 50")
-    if _nifty_ltp:
-        _nifty_ltp_f = float(_nifty_ltp)
-        st.session_state["_nifty_live_ltp"] = _nifty_ltp_f
-        _nf_prev = st.session_state.get("_nifty_prev_close")
-        if _nf_prev and _nf_prev > 0:
-            _nifty_pct = (_nifty_ltp_f - _nf_prev) / _nf_prev * 100
-            st.session_state["_nifty_intraday_pct"] = round(_nifty_pct, 3)
+    # Fallback path: if WS is not flowing, backfill visible symbols via REST
+    # at low cadence so the app never freezes on stale DB LTPs.
+    if _ws_alive:
+        return
+    _last_rest_ts = float(st.session_state.get("_global_ltp_rest_ts", 0) or 0)
+    if (_now.timestamp() - _last_rest_ts) < 3:
+        return
+    try:
+        _syms = []
+        _bdf = st.session_state.get("_signals_base_df", pd.DataFrame())
+        if _bdf is not None and not _bdf.empty and "tradingsymbol" in _bdf.columns:
+            _syms.extend(_bdf["tradingsymbol"].dropna().astype(str).unique().tolist())
+        _syms.extend([v.get("sym") for v in st.session_state.get("paper_open", {}).values() if v.get("sym")])
+        _syms.extend([v.get("sym") for v in st.session_state.get("scalp_open", {}).values() if v.get("sym")])
+        _syms = sorted(set(_syms))
+        if not _syms:
+            return
+        _rest = _kc_live.get_ltp_batch([f"NSE:{s}" for s in _syms] + ["NSE:NIFTY 50"])
+        if not _rest:
+            return
+        _mapped = {k.split(":", 1)[-1]: float(v) for k, v in _rest.items() if v}
+        if _mapped:
+            _old = st.session_state.get("_live_ltp", {})
+            st.session_state["_prev_ltp"] = dict(_old) if _old else {}
+            st.session_state["_live_ltp"] = _mapped
+            st.session_state["_live_ltp_ts"] = _now
+            _nifty_ltp_f = _mapped.get("NIFTY 50")
+            if _nifty_ltp_f:
+                st.session_state["_nifty_live_ltp"] = float(_nifty_ltp_f)
+                _nf_prev = st.session_state.get("_nifty_prev_close")
+                if _nf_prev and _nf_prev > 0:
+                    _nifty_pct = (float(_nifty_ltp_f) - _nf_prev) / _nf_prev * 100
+                    st.session_state["_nifty_intraday_pct"] = round(_nifty_pct, 3)
+            st.session_state["_global_ltp_rest_ts"] = _now.timestamp()
+    except Exception:
+        pass
 
 
 _global_ltp_updater()
@@ -4468,20 +4505,7 @@ def _live_signals_header():
                         pass
 
                 if _filtered_ws:
-                    if "_live_ltp" in st.session_state:
-                        st.session_state["_prev_ltp"] = dict(st.session_state["_live_ltp"])
-                    st.session_state["_live_ltp"] = _filtered_ws
-                    st.session_state["_live_ltp_ts"] = datetime.now(_IST)
-
-                    # Keep Nifty intraday regime input updated from WS snapshot.
-                    _nifty_ltp_f = _ws_prices.get("NIFTY 50")
-                    if _nifty_ltp_f:
-                        _nifty_ltp_f = float(_nifty_ltp_f)
-                        st.session_state["_nifty_live_ltp"] = _nifty_ltp_f
-                        _nf_prev = st.session_state.get("_nifty_prev_close")
-                        if _nf_prev and _nf_prev > 0:
-                            _nifty_pct = (_nifty_ltp_f - _nf_prev) / _nf_prev * 100
-                            st.session_state["_nifty_intraday_pct"] = round(_nifty_pct, 3)
+                    pass
 
         # ── Priority 2: REST fallback (ticker down or first startup) ─────────
         if not _ws_used:
@@ -4501,35 +4525,8 @@ def _live_signals_header():
                     # Include NIFTY 50 in the main batch — eliminates a second API round-trip
                     _batch_syms = [f"NSE:{s}" for s in _signal_syms] + ["NSE:NIFTY 50"]
                     fresh = _fc.get_ltp_batch(_batch_syms)
-                    # Snapshot current → previous BEFORE overwriting with new prices
-                    if "_live_ltp" in st.session_state:
-                        st.session_state["_prev_ltp"] = dict(st.session_state["_live_ltp"])
-                    st.session_state["_live_ltp"] = {
-                        k.split(":", 1)[-1]: v for k, v in fresh.items()
-                    }
-                    st.session_state["_live_ltp_ts"] = datetime.now(_IST)
-
-                    # ── Nifty 50 intraday direction gate (extracted from same batch) ─
-                    try:
-                        _nifty_ltp = fresh.get("NSE:NIFTY 50") or fresh.get("NIFTY 50")
-                        if _nifty_ltp:
-                            _nifty_ltp_f = float(_nifty_ltp)
-                            st.session_state["_nifty_live_ltp"] = _nifty_ltp_f
-                            _nf_prev = st.session_state.get("_nifty_prev_close")
-                            if not _nf_prev or _nf_prev <= 0:
-                                try:
-                                    _nf_ohlc = _fc.get_today_open(["NSE:NIFTY 50"])
-                                    _nf_open  = _nf_ohlc.get("NSE:NIFTY 50") or _nf_ohlc.get("NIFTY 50")
-                                    if _nf_open and _nf_open > 0:
-                                        st.session_state["_nifty_prev_close"] = float(_nf_open)
-                                        _nf_prev = float(_nf_open)
-                                except Exception:
-                                    pass
-                            if _nf_prev and _nf_prev > 0:
-                                _nifty_pct = (_nifty_ltp_f - _nf_prev) / _nf_prev * 100
-                                st.session_state["_nifty_intraday_pct"] = round(_nifty_pct, 3)
-                    except Exception:
-                        pass
+                    # Single-writer rule: global updater owns session LTP writes.
+                    _ = fresh
             except Exception as exc:
                 _ltp_err = str(exc)[:80]
 
@@ -8914,21 +8911,7 @@ def _ticker_banner():
 
     _mkt_open = _is_market_open()
 
-    # Sync WebSocket prices → session_state so all other fragments/tabs see
-    # fresh LTP without needing a separate _global_ltp_updater fragment.
-    if _ws_prices and _mkt_open:
-        if "_live_ltp" in st.session_state:
-            st.session_state["_prev_ltp"] = dict(st.session_state["_live_ltp"])
-        st.session_state["_live_ltp"]    = _ws_prices
-        st.session_state["_live_ltp_ts"] = datetime.now(_IST)
-        _nf = _ws_prices.get("NIFTY 50")
-        if _nf:
-            st.session_state["_nifty_live_ltp"] = float(_nf)
-            _nf_prev = st.session_state.get("_nifty_prev_close")
-            if _nf_prev and _nf_prev > 0:
-                st.session_state["_nifty_intraday_pct"] = round(
-                    (float(_nf) - _nf_prev) / _nf_prev * 100, 3
-                )
+    # Single-writer rule: global updater owns session LTP writes.
 
     if not _prices:
         # No WebSocket ticks yet — try fetching last-close prices from Kite REST API
