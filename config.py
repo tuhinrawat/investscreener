@@ -221,36 +221,57 @@ PARTIAL_BOOK_RATIO    = 0.60   # 60% exit at T1
 # Remaining 40% trails to T2 (R3 / S3) with stop moved to break-even
 
 # ============================================================
-# SCALPING — Opening Range Breakout (ORB) strategy
+# SCALPING — Opening Range Breakout (ORB) strategy v2
 # ============================================================
 # Opening range = first N minutes after 9:15 AM IST
-SCALP_ORB_MINUTES      = 15    # first 15-min candle(s) define the range
+SCALP_ORB_MINUTES      = 15    # first 15-min window defines the range
 
-# Scalping targets / stops expressed as multiples of the ORB range width
-SCALP_TARGET_MULT      = 1.5   # target  = breakout + 1.5 × ORB_range
-SCALP_STOP_MULT        = 0.5   # stop    = breakout – 0.5 × ORB_range (tight)
-SCALP_STOP_FLOOR_PCT   = 0.002 # minimum stop = 0.2% below breakout (prevents sub-paise stops)
-SCALP_MIN_RR           = 1.8   # minimum R/R to emit a scalp signal
-SCALP_MIN_ORB_ATR_MULT = 0.5   # minimum ORB range as ATR multiple; raise to 0.75 if false breaks persist
-SCALP_STOP_ATR_MULT    = 1.5   # ATR stop floor; reduce to 1.0 (not lower) only if too restrictive
-SCALP_BREAKOUT_VOLUME_MULT = 1.5  # breakout candle volume must be >= this × ORB-window average candle volume
+# ── Targets (two-stage partial exit) ────────────────────────────────────────
+# T1 = 1× ORB_range (first target — exit 70% here, move stop to breakeven)
+# T2 = 1.5× ORB_range (runner target — trail remaining 30%)
+# Both capped at 2.5× 5-min ATR so we never target what volatility can't deliver.
+SCALP_TARGET_T1_MULT   = 1.0   # T1 = breakout + 1.0 × ORB_range
+SCALP_TARGET_T2_MULT   = 1.5   # T2 = breakout + 1.5 × ORB_range (runner)
+SCALP_ATR_TARGET_CAP   = 2.5   # hard cap: target never beyond 2.5 × 5-min ATR
 
-# Scalping requires ≥ this many of the 3 internal confirmations to auto-trade
-SCALP_MIN_CONFIRMATIONS = 2    # ORB breakout + VWAP alignment + RSI momentum
+# ── Stop-loss ────────────────────────────────────────────────────────────────
+# Structural stop = 50% retrace back into opening range (thesis invalidation).
+# ATR floor ensures stop is never tighter than normal intraday noise.
+# Fixed floor = 0.2% minimum (prevents sub-paise stops on low-volatility opens).
+# Rule: take WIDER of structural/ATR, then apply % floor as minimum distance.
+SCALP_STOP_ORB_FRAC    = 0.5   # structural: retrace 50% into range = failed breakout
+SCALP_STOP_ATR_MULT    = 1.0   # ATR floor (was 1.5×; reduced — scalp hold < 30 min)
+SCALP_STOP_FLOOR_PCT   = 0.002 # 0.2% absolute floor
 
-# Capital per scalp trade (smaller than intraday — scalping = quick in/out)
-SCALP_CAP_PER_TRADE    = 75_000    # ₹75,000 per scalp position
+# ── R:R and quality gates ─────────────────────────────────────────────────────
+SCALP_MIN_RR           = 1.8   # minimum R:R at T1 to emit a signal (unchanged)
+SCALP_MIN_CONFIRMATIONS = 2    # need ≥ 2 of 3 internal confirmations (unchanged)
+# ORB range vs daily ATR gates (inverted from old logic):
+#   Wide ORB (> 1.5× ATR) = range already exhausted → WATCH  ← NEW rejection
+#   Narrow ORB (< 0.5× ATR) = coiled spring → quality BOOSTER (not rejection)
+SCALP_ORB_EXHAUSTION_MULT = 1.5  # reject if ORB_range > this × 5-min ATR
+SCALP_ORB_ATR_PERIOD   = 7     # 5-min ATR period for scalping (fast-signal period)
+SCALP_BREAKOUT_VOLUME_MULT = 1.5  # breakout candle vol must be >= this × avg ORB candle vol
+
+# ── Regime gate (graduated, not binary cliff) ────────────────────────────────
+# Hard block only at extreme adverse move; soft penalty between thresholds.
+SCALP_NIFTY_HARD_BLOCK_PCT = 1.2  # hard BLOCKED above this adverse Nifty % move
+SCALP_NIFTY_SOFT_WARN_PCT  = 0.6  # confidence penalty between soft & hard threshold
+
+# ── Exit structure ────────────────────────────────────────────────────────────
+SCALP_PARTIAL_EXIT_PCT = 0.70  # exit 70% of position at T1; lock profit
+SCALP_RUNNER_PCT       = 0.30  # trail remaining 30% to T2 with breakeven stop
+
+# ── Capital and position limits ──────────────────────────────────────────────
+SCALP_CAP_PER_TRADE    = 75_000    # ₹75,000 per scalp position (unchanged)
 SCALP_MAX_POSITIONS    = 4         # max 4 concurrent scalp trades
-SCALP_HARD_EXIT_TIME   = (14, 45)  # (hour, minute) in IST — hard exit all scalps at 2:45 PM
+SCALP_HARD_EXIT_TIME   = (14, 45)  # (hour, minute) IST — hard exit all scalps
 
-# Scalp quality gates — prevent taking low-priced / illiquid stocks as scalps.
-# Low-price stocks (< ₹300) have wide bid-ask spreads that consume the entire
-# scalp edge before charges. Illiquid stocks (< ₹50 Cr avg daily turnover)
-# show unfavourable slippage on rapid entries/exits.
-SCALP_MIN_PRICE        = 300.0    # ₹300 minimum LTP to qualify for a scalp entry
-SCALP_MIN_TURNOVER_CR  = 50.0     # ₹50 Cr minimum avg daily turnover (screener metric)
-SCALP_MIN_AVG_DAILY_VOLUME = 500_000   # minimum 20D average volume for scalp universe
-SCALP_MIN_MARKET_CAP_CR    = 5_000     # minimum market cap in crore INR (if available)
+# ── Universe quality gates ───────────────────────────────────────────────────
+SCALP_MIN_PRICE        = 300.0    # ₹300 minimum LTP (bid-ask spread constraint)
+SCALP_MIN_TURNOVER_CR  = 50.0     # ₹50 Cr minimum avg daily turnover
+SCALP_MIN_AVG_DAILY_VOLUME = 500_000   # minimum 20D average daily volume
+SCALP_MIN_MARKET_CAP_CR    = 5_000     # minimum market cap in crore INR
 SCALP_REQUIRE_FNO_LISTED   = True      # scalp only F&O listed underlyings
 
 # VWAP band — price must be within this % of VWAP to count as "near VWAP" alignment

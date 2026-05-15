@@ -1089,6 +1089,28 @@ def close_trade(trade_id: int, actual_exit: float, status: str, notes: str = Non
             pass  # never let a capital-update failure block a trade close
 
 
+def append_trade_note(trade_id: int, note: str) -> None:
+    """Append a note to an existing trade without changing its status or exit price."""
+    if not note:
+        return
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute("SELECT notes FROM trade_log WHERE id = %s", [trade_id])
+        row = cur.fetchone()
+        if not row:
+            return
+        merged = "\n".join(filter(None, [row[0], note]))
+        cur.execute("UPDATE trade_log SET notes = %s WHERE id = %s", [merged, trade_id])
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        release_conn(conn)
+
+
 def get_stored_ltps(symbols: list[str]) -> dict[str, float]:
     """Return last known LTP from computed_metrics for each symbol in the list."""
     if not symbols:

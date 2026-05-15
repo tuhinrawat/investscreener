@@ -732,7 +732,7 @@ def intraday_signal(
     }
 
 
-# ─── scalping signal (Opening Range Breakout) ────────────────────────────────
+# ─── scalping signal (Opening Range Breakout v2) ─────────────────────────────
 
 _SCALP_NULL = {
     "scalp_signal":        None,
@@ -740,6 +740,7 @@ _SCALP_NULL = {
     "scalp_entry":         None,
     "scalp_stop":          None,
     "scalp_t1":            None,
+    "scalp_t2":            None,   # runner target (30% of position)
     "scalp_rr":            None,
     "scalp_confirmations": None,
     "scalp_orb_high":      None,
@@ -750,6 +751,39 @@ _SCALP_NULL = {
 }
 
 
+def _scalp_confidence(
+    n_confirmed: int,
+    rr: float,
+    atr_pct: float,
+    orb_range_vs_atr: float,
+    nifty_soft_adverse: bool,
+    volume_pace_ok: bool,
+    vol_surge_at_breakout: bool,
+) -> int:
+    """
+    Calibrated 0–10 confidence score for ORB scalp signals.
+    Weights the factors that actually predict whether a scalp reaches T1.
+    """
+    score = 0
+    # Confirmations: 3/3 better than 2/3
+    score += 3 if n_confirmed == 3 else 2
+    # R:R quality — primary predictor of payout asymmetry
+    if rr >= 3.0:   score += 3
+    elif rr >= 2.5: score += 2
+    elif rr >= 1.8: score += 1
+    # ATR% viability: can the stock move enough in 30 min?
+    if atr_pct >= 2.0:   score += 2
+    elif atr_pct >= 1.5: score += 1
+    # ORB compression ratio: tight coil = coiled spring = higher breakout quality
+    if orb_range_vs_atr < 0.4:   score += 2   # very tight coil
+    elif orb_range_vs_atr < 0.6: score += 1   # moderate coil
+    # Context deductions
+    if nifty_soft_adverse:        score -= 1
+    if not volume_pace_ok:        score -= 1
+    if not vol_surge_at_breakout: score -= 1
+    return max(0, min(10, score))
+
+
 def scalping_signal(
     current_ltp: float,
     orb_high: float | None,
@@ -757,290 +791,244 @@ def scalping_signal(
     orb_range: float | None,
     vwap_price: float | None,
     rsi_5min: float | None,
-    atr: float | None,
+    atr: float | None,               # 5-min ATR(7) — NOT daily ATR
     nifty_pct_change: float = 0.0,
     daily_vol_ratio: float | None = None,
+    vol_surge_at_breakout: bool = False,
 ) -> dict:
     """
-    Opening Range Breakout (ORB) scalping signal with 3 internal confirmations.
+    Opening Range Breakout (ORB) scalping signal v2.
 
-    Strategy:
-      • Compute the opening range (first 15 minutes: 9:15–9:30 AM).
-      • Long scalp: LTP breaks above ORB high  → quick momentum entry.
-      • Short scalp: LTP breaks below ORB low  → quick momentum short.
-
-    Three internal confirmation signals (need ≥ SCALP_MIN_CONFIRMATIONS = 2/3):
-      1. ORB Breakout       — LTP crossed above ORB_high (long) / below ORB_low (short)
-      2. VWAP Alignment     — LTP is above VWAP (long) / below VWAP (short)
-      3. RSI 5-min Momentum — RSI > 55 (long) / RSI < 45 (short) on 5-min candles
-
-    Additional context gates (reduce confidence, don't block):
-      • Nifty direction: if Nifty is down and we're long, signal is lower confidence
-      • Volume pace: if today's volume is running below average, signal is lower confidence
-
-    Targets / Stops:
-      Target  = breakout + SCALP_TARGET_MULT × ORB_range  (default 1.5×)
-      Stop    = breakout − SCALP_STOP_MULT   × ORB_range  (default 0.5×)
-      Minimum stop floor: 0.2% below entry (prevents microscopic stops)
-
-    Returns _SCALP_NULL if ORB data is unavailable or no breakout is confirmed.
+    Key improvements over v1:
+      • Uses 5-min ATR(7) instead of daily ATR for all calculations.
+      • Stop uses WIDER of structural (50% ORB retrace) or ATR floor — not tighter.
+      • Two-stage targets: T1 = 1× ORB range (70% exit), T2 = 1.5× (30% runner).
+      • Both targets capped at 2.5× ATR to prevent unreachable aspirational levels.
+      • Narrow ORB is a quality BOOSTER (coiled spring), not a rejection gate.
+      • Wide ORB (> 1.5× ATR) is rejected — daily range already exhausted.
+      • Regime gate is graduated: hard block at 1.2%, soft penalty at 0.6%.
+      • Confidence score is a proper 0–10 scale weighted on R:R, ATR%, compression.
     """
     if orb_high is None or orb_low is None or orb_range is None or orb_range <= 0:
         return dict(_SCALP_NULL)
     if current_ltp is None or current_ltp <= 0:
         return dict(_SCALP_NULL)
-    # Quality gate: scalping on low-priced stocks is uneconomical — bid-ask spread
-    # alone erodes the edge. Require ≥ ₹300 LTP.
     if current_ltp < _cfg.SCALP_MIN_PRICE:
         return dict(_SCALP_NULL)
     if atr is None or atr <= 0:
         return dict(_SCALP_NULL)
 
-    # Structural gate: ignore ultra-narrow ORB windows relative to volatility.
-    _min_orb_atr = _cfg.SCALP_MIN_ORB_ATR_MULT
-    if orb_range < atr * _min_orb_atr:
+    atr_pct         = (atr / current_ltp * 100) if current_ltp > 0 else 0
+    orb_range_atr   = orb_range / atr            # compression ratio
+    min_conf        = _cfg.SCALP_MIN_CONFIRMATIONS
+
+    # ── ORB range quality gates (INVERTED from v1) ───────────────────────────
+    # Wide ORB: stock already used up its daily range → nowhere for target to go
+    if orb_range > _cfg.SCALP_ORB_EXHAUSTION_MULT * atr:
         return {
             **_SCALP_NULL,
             "scalp_signal": "WATCH",
-            "scalp_reason": (
-                f"ORB_TOO_NARROW — range {orb_range:.2f} < "
-                f"{_min_orb_atr:.2f}× ATR ({atr:.2f})"
-            ),
             "scalp_orb_high": orb_high,
             "scalp_orb_low": orb_low,
             "scalp_confirmations": 0,
+            "scalp_reason": (
+                f"ORB_RANGE_EXHAUSTED — range {orb_range:.2f} > "
+                f"{_cfg.SCALP_ORB_EXHAUSTION_MULT:.1f}× ATR ({atr:.2f}). "
+                "Daily range already consumed. Skip."
+            ),
         }
+    # Narrow ORB (< 0.5× ATR): coiled spring → do NOT reject, boosts confidence score
 
-    min_conf = _cfg.SCALP_MIN_CONFIRMATIONS
+    # ── Regime gate — graduated ───────────────────────────────────────────────
+    _nifty_adverse_long  = nifty_pct_change <= -_cfg.SCALP_NIFTY_HARD_BLOCK_PCT
+    _nifty_adverse_short = nifty_pct_change >=  _cfg.SCALP_NIFTY_HARD_BLOCK_PCT
+    _nifty_soft_long     = (nifty_pct_change <= -_cfg.SCALP_NIFTY_SOFT_WARN_PCT
+                            and not _nifty_adverse_long)
+    _nifty_soft_short    = (nifty_pct_change >=  _cfg.SCALP_NIFTY_SOFT_WARN_PCT
+                            and not _nifty_adverse_short)
+    _vol_pace_ok         = daily_vol_ratio is None or daily_vol_ratio >= 0.8
 
-    # ── LONG scalp: breakout above ORB high ──────────────────────────────
+    def _build_levels_long():
+        entry     = round(orb_high, 2)
+        orb_stop  = entry - _cfg.SCALP_STOP_ORB_FRAC * orb_range
+        atr_floor = entry - _cfg.SCALP_STOP_ATR_MULT * atr
+        pct_floor = entry * (1 - _cfg.SCALP_STOP_FLOOR_PCT)
+        # Take WIDER of structural/ATR (most protection), then apply % floor as minimum
+        stop      = round(max(min(orb_stop, atr_floor), pct_floor), 2)
+        risk      = entry - stop
+        orb_t1    = entry + _cfg.SCALP_TARGET_T1_MULT * orb_range
+        orb_t2    = entry + _cfg.SCALP_TARGET_T2_MULT * orb_range
+        atr_cap   = entry + _cfg.SCALP_ATR_TARGET_CAP * atr
+        t1        = round(min(orb_t1, atr_cap), 2)
+        t2        = round(min(orb_t2, atr_cap), 2)
+        rr        = round((t1 - entry) / risk, 2) if risk > 0 else 0
+        return entry, stop, t1, t2, rr
+
+    def _build_levels_short():
+        entry     = round(orb_low, 2)
+        orb_stop  = entry + _cfg.SCALP_STOP_ORB_FRAC * orb_range
+        atr_floor = entry + _cfg.SCALP_STOP_ATR_MULT * atr
+        pct_floor = entry * (1 + _cfg.SCALP_STOP_FLOOR_PCT)
+        stop      = round(min(max(orb_stop, atr_floor), pct_floor), 2)
+        risk      = stop - entry
+        orb_t1    = entry - _cfg.SCALP_TARGET_T1_MULT * orb_range
+        orb_t2    = entry - _cfg.SCALP_TARGET_T2_MULT * orb_range
+        atr_cap   = entry - _cfg.SCALP_ATR_TARGET_CAP * atr
+        t1        = round(max(orb_t1, atr_cap), 2)
+        t2        = round(max(orb_t2, atr_cap), 2)
+        rr        = round((entry - t1) / risk, 2) if risk > 0 else 0
+        return entry, stop, t1, t2, rr
+
+    def _check_confirmations(is_long: bool):
+        confs, notes = [], []
+        confs.append("ORB↑" if is_long else "ORB↓")
+        notes.append(f"ORB {'breakout above' if is_long else 'breakdown below'} ₹{orb_high if is_long else orb_low:.2f} ✓")
+        if vwap_price is not None:
+            ok = current_ltp > vwap_price if is_long else current_ltp < vwap_price
+            if ok:
+                confs.append("VWAP↑" if is_long else "VWAP↓")
+                notes.append(f"{'Above' if is_long else 'Below'} VWAP ₹{vwap_price:.2f} ✓")
+            else:
+                notes.append(f"{'Below' if is_long else 'Above'} VWAP ₹{vwap_price:.2f} ✗")
+        else:
+            notes.append("VWAP: n/a")
+        if rsi_5min is not None:
+            ok = rsi_5min > 55 if is_long else rsi_5min < 45
+            thresh = "> 55" if is_long else "< 45"
+            if ok:
+                confs.append("RSI↑" if is_long else "RSI↓")
+                notes.append(f"5-min RSI {rsi_5min:.0f} {thresh} ✓")
+            else:
+                notes.append(f"5-min RSI {rsi_5min:.0f} {'≤ 55' if is_long else '≥ 45'} ✗")
+        else:
+            notes.append("5-min RSI: n/a")
+        return confs, notes
+
+    # ── LONG scalp ───────────────────────────────────────────────────────────
     if current_ltp > orb_high:
-        # Hard regime gate — avoid long scalps when Nifty tape is bearish.
-        if nifty_pct_change <= -_cfg.NIFTY_GATE_PCT:
+        if _nifty_adverse_long:
             return {
                 **_SCALP_NULL,
                 "scalp_signal": "BLOCKED",
                 "scalp_direction": "LONG",
                 "scalp_confirmations": 0,
-                "scalp_orb_high": orb_high,
-                "scalp_orb_low": orb_low,
-                "scalp_reason": "NIFTY_BEARISH — long scalp hard-blocked by regime gate",
+                "scalp_orb_high": orb_high, "scalp_orb_low": orb_low,
+                "scalp_reason": (
+                    f"NIFTY_BEARISH_EXTREME — Nifty down {abs(nifty_pct_change):.1f}% "
+                    f"(hard block > {_cfg.SCALP_NIFTY_HARD_BLOCK_PCT:.1f}%)"
+                ),
             }
-        confirmations = []
-        conf_notes    = []
 
-        # Confirmation 1 — ORB breakout (always true by branch condition)
-        confirmations.append("ORB↑")
-        conf_notes.append(f"ORB breakout above ₹{orb_high:.2f} ✓")
-
-        # Confirmation 2 — VWAP alignment
-        if vwap_price is not None:
-            if current_ltp > vwap_price:
-                confirmations.append("VWAP↑")
-                conf_notes.append(f"Above VWAP ₹{vwap_price:.2f} ✓")
-            else:
-                conf_notes.append(f"Below VWAP ₹{vwap_price:.2f} ✗")
-        else:
-            conf_notes.append("VWAP: n/a")
-
-        # Confirmation 3 — RSI 5-min momentum
-        if rsi_5min is not None:
-            if rsi_5min > 55:
-                confirmations.append("RSI↑")
-                conf_notes.append(f"5-min RSI {rsi_5min:.0f} > 55 ✓")
-            else:
-                conf_notes.append(f"5-min RSI {rsi_5min:.0f} ≤ 55 ✗")
-        else:
-            conf_notes.append("5-min RSI: n/a")
-
-        n_confirmed = len(confirmations)
+        confs, conf_notes = _check_confirmations(is_long=True)
+        n_confirmed = len(confs)
         if n_confirmed < min_conf:
             return {
                 **_SCALP_NULL,
-                "scalp_signal":        "WATCH",
-                "scalp_direction":     "LONG",
-                "scalp_orb_high":      orb_high,
-                "scalp_orb_low":       orb_low,
-                "scalp_vwap":          vwap_price,
-                "scalp_confirmations": n_confirmed,
+                "scalp_signal": "WATCH", "scalp_direction": "LONG",
+                "scalp_orb_high": orb_high, "scalp_orb_low": orb_low,
+                "scalp_vwap": vwap_price, "scalp_confirmations": n_confirmed,
                 "scalp_reason": (
-                    f"ORB long breakout but only {n_confirmed}/{min_conf} confirmations. "
+                    f"ORB long — only {n_confirmed}/{min_conf} confirmations. "
                     + " | ".join(conf_notes)
                 ),
             }
 
-        # Levels
-        entry  = round(orb_high, 2)
-        target = round(entry + _cfg.SCALP_TARGET_MULT * orb_range, 2)
-        raw_stop = entry - _cfg.SCALP_STOP_MULT * orb_range
-        atr_stop = entry - _cfg.SCALP_STOP_ATR_MULT * atr
-        floor_stop = entry * (1 - _cfg.SCALP_STOP_FLOOR_PCT)
-        stop   = round(min(raw_stop, atr_stop, floor_stop), 2)
-        risk   = entry - stop
-        rr     = round((target - entry) / risk, 2) if risk > 0 else 0
-
+        entry, stop, t1, t2, rr = _build_levels_long()
         if rr < _cfg.SCALP_MIN_RR:
             return {
                 **_SCALP_NULL,
-                "scalp_signal":     "WATCH",
-                "scalp_direction":  "LONG",
-                "scalp_orb_high":   orb_high,
-                "scalp_orb_low":    orb_low,
-                "scalp_vwap":       vwap_price,
-                "scalp_reason":     f"ORB long — R/R {rr:.1f}× < {_cfg.SCALP_MIN_RR:.1f}× minimum.",
+                "scalp_signal": "WATCH", "scalp_direction": "LONG",
+                "scalp_orb_high": orb_high, "scalp_orb_low": orb_low,
+                "scalp_vwap": vwap_price,
+                "scalp_reason": f"ORB long — R:R {rr:.1f}× < {_cfg.SCALP_MIN_RR:.1f}× minimum.",
             }
 
-        # Context confidence adjustments
-        context_notes = []
-        base_score = n_confirmed  # 2 or 3
-        if nifty_pct_change <= -_cfg.NIFTY_GATE_PCT:
-            base_score -= 1
-            context_notes.append(f"⚠️ Nifty down {abs(nifty_pct_change):.1f}%")
-        if daily_vol_ratio is not None and daily_vol_ratio < 0.8:
-            base_score -= 1
-            context_notes.append(f"⚠️ Volume only {daily_vol_ratio:.1f}× avg pace")
-        scalp_conf = max(0, min(10, base_score * 3 + 1))  # scale 0-3 base → 1-10
-
-        context_str = " | ".join(context_notes) if context_notes else ""
+        scalp_conf = _scalp_confidence(
+            n_confirmed, rr, atr_pct, orb_range_atr,
+            _nifty_soft_long, _vol_pace_ok, vol_surge_at_breakout,
+        )
         return {
-            "scalp_signal":        "LONG",
-            "scalp_direction":     "LONG",
-            "scalp_entry":         entry,
-            "scalp_stop":          stop,
-            "scalp_t1":            target,
-            "scalp_rr":            rr,
+            "scalp_signal": "LONG", "scalp_direction": "LONG",
+            "scalp_entry": entry, "scalp_stop": stop,
+            "scalp_t1": t1, "scalp_t2": t2, "scalp_rr": rr,
             "scalp_confirmations": n_confirmed,
-            "scalp_orb_high":      orb_high,
-            "scalp_orb_low":       orb_low,
-            "scalp_vwap":          vwap_price,
-            "scalp_confidence":    scalp_conf,
+            "scalp_orb_high": orb_high, "scalp_orb_low": orb_low,
+            "scalp_vwap": vwap_price, "scalp_confidence": scalp_conf,
             "scalp_reason": (
-                f"ORB LONG breakout. {n_confirmed}/3 confirmations: "
-                + " | ".join(conf_notes)
-                + f". Entry ₹{entry:.2f} | Stop ₹{stop:.2f} | Target ₹{target:.2f} "
-                + f"(1.5× ORB range ₹{orb_range:.2f}). R/R {rr:.1f}×."
-                + (f" {context_str}" if context_str else "")
-                + f" Hard exit 2:45 PM."
+                f"ORB LONG. {n_confirmed}/3: " + " | ".join(conf_notes)
+                + f". Entry ₹{entry:.2f} | Stop ₹{stop:.2f} | T1 ₹{t1:.2f} (70%) "
+                + f"| T2 ₹{t2:.2f} (30% runner). R:R {rr:.1f}× on T1."
+                + (f" ⚠️ Nifty soft headwind {abs(nifty_pct_change):.1f}%." if _nifty_soft_long else "")
+                + " Hard exit 2:45 PM."
             ),
         }
 
-    # ── SHORT scalp: breakdown below ORB low ─────────────────────────────
+    # ── SHORT scalp ──────────────────────────────────────────────────────────
     if current_ltp < orb_low:
-        # Hard regime gate — avoid short scalps when Nifty tape is bullish.
-        if nifty_pct_change >= _cfg.NIFTY_GATE_PCT:
+        if _nifty_adverse_short:
             return {
                 **_SCALP_NULL,
                 "scalp_signal": "BLOCKED",
                 "scalp_direction": "SHORT",
                 "scalp_confirmations": 0,
-                "scalp_orb_high": orb_high,
-                "scalp_orb_low": orb_low,
-                "scalp_reason": "NIFTY_BULLISH — short scalp hard-blocked by regime gate",
+                "scalp_orb_high": orb_high, "scalp_orb_low": orb_low,
+                "scalp_reason": (
+                    f"NIFTY_BULLISH_EXTREME — Nifty up {nifty_pct_change:.1f}% "
+                    f"(hard block > {_cfg.SCALP_NIFTY_HARD_BLOCK_PCT:.1f}%)"
+                ),
             }
-        confirmations = []
-        conf_notes    = []
 
-        # Confirmation 1 — ORB breakdown
-        confirmations.append("ORB↓")
-        conf_notes.append(f"ORB breakdown below ₹{orb_low:.2f} ✓")
-
-        # Confirmation 2 — VWAP alignment
-        if vwap_price is not None:
-            if current_ltp < vwap_price:
-                confirmations.append("VWAP↓")
-                conf_notes.append(f"Below VWAP ₹{vwap_price:.2f} ✓")
-            else:
-                conf_notes.append(f"Above VWAP ₹{vwap_price:.2f} ✗")
-        else:
-            conf_notes.append("VWAP: n/a")
-
-        # Confirmation 3 — RSI 5-min momentum
-        if rsi_5min is not None:
-            if rsi_5min < 45:
-                confirmations.append("RSI↓")
-                conf_notes.append(f"5-min RSI {rsi_5min:.0f} < 45 ✓")
-            else:
-                conf_notes.append(f"5-min RSI {rsi_5min:.0f} ≥ 45 ✗")
-        else:
-            conf_notes.append("5-min RSI: n/a")
-
-        n_confirmed = len(confirmations)
+        confs, conf_notes = _check_confirmations(is_long=False)
+        n_confirmed = len(confs)
         if n_confirmed < min_conf:
             return {
                 **_SCALP_NULL,
-                "scalp_signal":        "WATCH",
-                "scalp_direction":     "SHORT",
-                "scalp_orb_high":      orb_high,
-                "scalp_orb_low":       orb_low,
-                "scalp_vwap":          vwap_price,
-                "scalp_confirmations": n_confirmed,
+                "scalp_signal": "WATCH", "scalp_direction": "SHORT",
+                "scalp_orb_high": orb_high, "scalp_orb_low": orb_low,
+                "scalp_vwap": vwap_price, "scalp_confirmations": n_confirmed,
                 "scalp_reason": (
-                    f"ORB short breakdown but only {n_confirmed}/{min_conf} confirmations. "
+                    f"ORB short — only {n_confirmed}/{min_conf} confirmations. "
                     + " | ".join(conf_notes)
                 ),
             }
 
-        entry   = round(orb_low, 2)
-        target  = round(entry - _cfg.SCALP_TARGET_MULT * orb_range, 2)
-        raw_stop = entry + _cfg.SCALP_STOP_MULT * orb_range
-        atr_stop = entry + _cfg.SCALP_STOP_ATR_MULT * atr
-        floor_stop = entry * (1 + _cfg.SCALP_STOP_FLOOR_PCT)
-        stop    = round(max(raw_stop, atr_stop, floor_stop), 2)
-        risk    = stop - entry
-        rr      = round((entry - target) / risk, 2) if risk > 0 else 0
-
+        entry, stop, t1, t2, rr = _build_levels_short()
         if rr < _cfg.SCALP_MIN_RR:
             return {
                 **_SCALP_NULL,
-                "scalp_signal":     "WATCH",
-                "scalp_direction":  "SHORT",
-                "scalp_orb_high":   orb_high,
-                "scalp_orb_low":    orb_low,
-                "scalp_vwap":       vwap_price,
-                "scalp_reason":     f"ORB short — R/R {rr:.1f}× < {_cfg.SCALP_MIN_RR:.1f}× minimum.",
+                "scalp_signal": "WATCH", "scalp_direction": "SHORT",
+                "scalp_orb_high": orb_high, "scalp_orb_low": orb_low,
+                "scalp_vwap": vwap_price,
+                "scalp_reason": f"ORB short — R:R {rr:.1f}× < {_cfg.SCALP_MIN_RR:.1f}× minimum.",
             }
 
-        context_notes = []
-        base_score = n_confirmed
-        if nifty_pct_change >= _cfg.NIFTY_GATE_PCT:
-            base_score -= 1
-            context_notes.append(f"⚠️ Nifty up {nifty_pct_change:.1f}%")
-        if daily_vol_ratio is not None and daily_vol_ratio < 0.8:
-            base_score -= 1
-            context_notes.append(f"⚠️ Volume only {daily_vol_ratio:.1f}× avg pace")
-        scalp_conf = max(0, min(10, base_score * 3 + 1))
-
-        context_str = " | ".join(context_notes) if context_notes else ""
+        scalp_conf = _scalp_confidence(
+            n_confirmed, rr, atr_pct, orb_range_atr,
+            _nifty_soft_short, _vol_pace_ok, vol_surge_at_breakout,
+        )
         return {
-            "scalp_signal":        "SHORT",
-            "scalp_direction":     "SHORT",
-            "scalp_entry":         entry,
-            "scalp_stop":          stop,
-            "scalp_t1":            target,
-            "scalp_rr":            rr,
+            "scalp_signal": "SHORT", "scalp_direction": "SHORT",
+            "scalp_entry": entry, "scalp_stop": stop,
+            "scalp_t1": t1, "scalp_t2": t2, "scalp_rr": rr,
             "scalp_confirmations": n_confirmed,
-            "scalp_orb_high":      orb_high,
-            "scalp_orb_low":       orb_low,
-            "scalp_vwap":          vwap_price,
-            "scalp_confidence":    scalp_conf,
+            "scalp_orb_high": orb_high, "scalp_orb_low": orb_low,
+            "scalp_vwap": vwap_price, "scalp_confidence": scalp_conf,
             "scalp_reason": (
-                f"ORB SHORT breakdown. {n_confirmed}/3 confirmations: "
-                + " | ".join(conf_notes)
-                + f". Entry ₹{entry:.2f} | Stop ₹{stop:.2f} | Target ₹{target:.2f} "
-                + f"(1.5× ORB range ₹{orb_range:.2f}). R/R {rr:.1f}×."
-                + (f" {context_str}" if context_str else "")
-                + f" Hard exit 2:45 PM."
+                f"ORB SHORT. {n_confirmed}/3: " + " | ".join(conf_notes)
+                + f". Entry ₹{entry:.2f} | Stop ₹{stop:.2f} | T1 ₹{t1:.2f} (70%) "
+                + f"| T2 ₹{t2:.2f} (30% runner). R:R {rr:.1f}× on T1."
+                + (f" ⚠️ Nifty soft tailwind for longs {nifty_pct_change:.1f}%." if _nifty_soft_short else "")
+                + " Hard exit 2:45 PM."
             ),
         }
 
-    # LTP is inside the ORB — no scalp signal yet
+    # LTP inside ORB — no signal yet
     return {
         **_SCALP_NULL,
-        "scalp_signal":    "INSIDE_ORB",
-        "scalp_orb_high":  orb_high,
-        "scalp_orb_low":   orb_low,
-        "scalp_vwap":      vwap_price,
-        "scalp_reason":    (
+        "scalp_signal": "INSIDE_ORB",
+        "scalp_orb_high": orb_high, "scalp_orb_low": orb_low,
+        "scalp_vwap": vwap_price,
+        "scalp_reason": (
             f"LTP ₹{current_ltp:.2f} inside ORB [{orb_low:.2f}–{orb_high:.2f}]. "
             "Waiting for breakout/breakdown."
         ),

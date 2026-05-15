@@ -5564,41 +5564,82 @@ def _live_signals_header():
                     except Exception as _te:
                         st.toast(f"⚠ Trailing exit failed for {_rt_sym}: {_te}", icon="⚠️")
 
-        # ── Pass 2b: T1 / stop exits for scalp trades (same logic, separate dict) ─
-        _scalp_exits    = []
-        _scalp_partials = []
+        # ── Pass 2b: Two-stage exit for scalp trades ──────────────────────────
+        # Stage 1 (T1): exit 70% of position, move stop to entry (breakeven).
+        # Stage 2 (T2 or breakeven stop hit): exit remaining 30% runner.
+        _scalp_exits    = []   # (trade_id, sym, reason, price, is_partial, qty_pct)
         for _scid, _sct in list(st.session_state.get("scalp_open", {}).items()):
             _sc_ltp = _live_ltp_now.get(_sct.get("sym", ""), 0)
             if not _sc_ltp:
                 continue
-            _sc_sig  = _sct.get("signal_type", "")
-            _sc_t1   = _sct.get("t1", 0)
-            _sc_stop = _sct.get("stop", 0)
+            _sc_sig     = _sct.get("signal_type", "")
+            _sc_t1      = _sct.get("t1", 0)
+            _sc_t2      = _sct.get("t2", 0)
+            _sc_stop    = _sct.get("stop", 0)
+            _sc_entry   = _sct.get("entry", 0)
             _sc_partial = _sct.get("partial_booked", False)
+
             if _sc_sig == "BUY_ORB":
-                if _sc_t1 and _sc_ltp >= _sc_t1:
-                    _scalp_exits.append((_scid, _sct["sym"], "TARGET_HIT", _sc_t1))
-                elif _sc_stop and (
-                    _sc_ltp <= _sc_stop
-                    or _sc_ltp < _sc_stop * (1 - _STOP_OVERSHOOT_PCT)
+                if not _sc_partial and _sc_t1 and _sc_ltp >= _sc_t1:
+                    # Stage 1: T1 hit → book 70%, slide stop to entry (breakeven)
+                    _scalp_exits.append((_scid, _sct["sym"], "T1_HIT_PARTIAL", _sc_t1, True))
+                elif _sc_partial:
+                    # Runner is live — stop is now at entry (breakeven)
+                    _be_stop = _sc_entry  # breakeven stop for runner
+                    _runner_t2 = _sc_t2 if _sc_t2 and _sc_t2 > _sc_t1 else 0
+                    if _runner_t2 and _sc_ltp >= _runner_t2:
+                        _scalp_exits.append((_scid, _sct["sym"], "T2_HIT_RUNNER", _runner_t2, False))
+                    elif _be_stop and _sc_ltp <= _be_stop:
+                        _scalp_exits.append((_scid, _sct["sym"], "BREAKEVEN_STOP_RUNNER", _be_stop, False))
+                if not _sc_partial and _sc_stop and (
+                    _sc_ltp <= _sc_stop or _sc_ltp < _sc_stop * (1 - _STOP_OVERSHOOT_PCT)
                 ):
-                    _scalp_exits.append((_scid, _sct["sym"], "STOPPED_OUT", _sc_ltp))
+                    _scalp_exits.append((_scid, _sct["sym"], "STOPPED_OUT", _sc_ltp, False))
+
             elif _sc_sig == "SELL_ORB":
-                if _sc_t1 and _sc_ltp <= _sc_t1:
-                    _scalp_exits.append((_scid, _sct["sym"], "TARGET_HIT", _sc_t1))
-                elif _sc_stop and (
-                    _sc_ltp >= _sc_stop
-                    or _sc_ltp > _sc_stop * (1 + _STOP_OVERSHOOT_PCT)
+                if not _sc_partial and _sc_t1 and _sc_ltp <= _sc_t1:
+                    _scalp_exits.append((_scid, _sct["sym"], "T1_HIT_PARTIAL", _sc_t1, True))
+                elif _sc_partial:
+                    _be_stop = _sc_entry
+                    _runner_t2 = _sc_t2 if _sc_t2 and _sc_t2 < _sc_t1 else 0
+                    if _runner_t2 and _sc_ltp <= _runner_t2:
+                        _scalp_exits.append((_scid, _sct["sym"], "T2_HIT_RUNNER", _runner_t2, False))
+                    elif _be_stop and _sc_ltp >= _be_stop:
+                        _scalp_exits.append((_scid, _sct["sym"], "BREAKEVEN_STOP_RUNNER", _be_stop, False))
+                if not _sc_partial and _sc_stop and (
+                    _sc_ltp >= _sc_stop or _sc_ltp > _sc_stop * (1 + _STOP_OVERSHOOT_PCT)
                 ):
-                    _scalp_exits.append((_scid, _sct["sym"], "STOPPED_OUT", _sc_ltp))
-        for _scid, _sym_sc, _out_sc, _ep_sc in _scalp_exits:
+                    _scalp_exits.append((_scid, _sct["sym"], "STOPPED_OUT", _sc_ltp, False))
+
+        for _scid, _sym_sc, _out_sc, _ep_sc, _is_partial in _scalp_exits:
             try:
-                _lbl_sc = "at T1" if _out_sc == "TARGET_HIT" else "stopped"
-                db.close_trade(_scid, _ep_sc, _out_sc,
-                               f"⚡ Scalp auto-{_lbl_sc} @ ₹{_ep_sc:.2f}")
-                st.session_state["scalp_open"].pop(_scid, None)
-                _icon_sc = "✅" if _out_sc == "TARGET_HIT" else "🛑"
-                st.toast(f"{_icon_sc} Scalp {_sym_sc}: {_out_sc} @ ₹{_ep_sc:.2f}", icon=_icon_sc)
+                if _is_partial:
+                    # Stage 1: partial close — mark partial_booked, add note; don't close trade
+                    if _scid in st.session_state.get("scalp_open", {}):
+                        st.session_state["scalp_open"][_scid]["partial_booked"] = True
+                    db.append_trade_note(
+                        _scid,
+                        f"⚡ Scalp T1 hit (70% booked @ ₹{_ep_sc:.2f}). Runner (30%) active. Stop → entry (breakeven).",
+                    )
+                    st.toast(
+                        f"⚡ T1 hit {_sym_sc}: 70% booked @ ₹{_ep_sc:.2f} | Runner to T2",
+                        icon="⚡",
+                    )
+                else:
+                    # Stage 2: full close (T2, breakeven stop, or initial stop-out)
+                    _lbl_map = {
+                        "T2_HIT_RUNNER": "T2 runner ✅",
+                        "BREAKEVEN_STOP_RUNNER": "breakeven stop (runner)",
+                        "STOPPED_OUT": "stopped out 🛑",
+                    }
+                    _lbl_sc = _lbl_map.get(_out_sc, _out_sc)
+                    db.close_trade(
+                        _scid, _ep_sc, _out_sc,
+                        f"⚡ Scalp auto-{_lbl_sc} @ ₹{_ep_sc:.2f}"
+                    )
+                    st.session_state["scalp_open"].pop(_scid, None)
+                    _icon_sc = "✅" if "HIT" in _out_sc else "🛑"
+                    st.toast(f"{_icon_sc} Scalp {_sym_sc}: {_lbl_sc} @ ₹{_ep_sc:.2f}", icon=_icon_sc)
             except Exception:
                 pass
 
@@ -6257,6 +6298,8 @@ def _intraday_scalp_live():
                         "vwap":      _ind.vwap(_candles_df),
                         "rsi":       _ind.rsi_intraday(_candles_df),
                         "vol_ratio": _ind.intraday_volume_ratio(_candles_df, _avg_vol_c) if _avg_vol_c > 0 else None,
+                        # 5-min ATR(7) — correct timeframe for scalp stops/targets
+                        "atr_5m":    _ind.atr(_candles_df, period=config.SCALP_ORB_ATR_PERIOD),
                     }
         except Exception:
             _candles_df = pd.DataFrame()
@@ -6265,12 +6308,13 @@ def _intraday_scalp_live():
             continue
 
         # ── Read cached indicators (recomputed only at 30 s cadence above) ─
-        _cached_ind = _indic_cache.get(_sym, {})
-        _orb_data   = _cached_ind.get("orb")
-        _vwap_price = _cached_ind.get("vwap")
-        _rsi_5m     = _cached_ind.get("rsi")
-        _vol_ratio  = _cached_ind.get("vol_ratio")
-        _avg_vol    = float(_row.get("avg_volume") or 0)
+        _cached_ind  = _indic_cache.get(_sym, {})
+        _orb_data    = _cached_ind.get("orb")
+        _vwap_price  = _cached_ind.get("vwap")
+        _rsi_5m      = _cached_ind.get("rsi")
+        _vol_ratio   = _cached_ind.get("vol_ratio")
+        _atr_5m      = _cached_ind.get("atr_5m")   # 5-min ATR(7) for scalp calculations
+        _avg_vol     = float(_row.get("avg_volume") or 0)
 
         if not _orb_data:
             continue
@@ -6290,46 +6334,49 @@ def _intraday_scalp_live():
                 "scalp_confidence": None,
             }
         else:
+            # vol_surge_at_breakout: check if latest candle volume > 1.5× avg ORB candle vol
+            # computed here so it can be passed to scalping_signal for confidence scoring
+            _orb_st = pd.to_datetime("09:15").time()
+            _orb_et = pd.to_datetime("09:45").time()
+            _tm_sg  = pd.to_datetime(_candles_df["date"], errors="coerce").dt.time if "date" in _candles_df.columns else None
+            _orb_c_sg = _candles_df[(_tm_sg >= _orb_st) & (_tm_sg <= _orb_et)] if _tm_sg is not None else pd.DataFrame()
+            _brk_vol_sg = float(_candles_df["volume"].iloc[-1]) if not _candles_df.empty and "volume" in _candles_df.columns else 0.0
+            _avg_orb_vol_sg = float(_orb_c_sg["volume"].mean()) if (not _orb_c_sg.empty and "volume" in _orb_c_sg.columns) else 0.0
+            _vol_surge_sg = (_avg_orb_vol_sg > 0 and _brk_vol_sg >= _avg_orb_vol_sg * config.SCALP_BREAKOUT_VOLUME_MULT)
+
             _scalp_sig = _sig_mod.scalping_signal(
-                current_ltp      = _ltp_now,
-                orb_high         = _orb_data["orb_high"],
-                orb_low          = _orb_data["orb_low"],
-                orb_range        = _orb_data["orb_range"],
-                vwap_price       = _vwap_price,
-                rsi_5min         = _rsi_5m,
-                atr              = float(_row.get("atr_14") or 0) or None,
-                nifty_pct_change = _nifty_pct,
-                daily_vol_ratio  = _vol_ratio,
+                current_ltp           = _ltp_now,
+                orb_high              = _orb_data["orb_high"],
+                orb_low               = _orb_data["orb_low"],
+                orb_range             = _orb_data["orb_range"],
+                vwap_price            = _vwap_price,
+                rsi_5min              = _rsi_5m,
+                atr                   = _atr_5m or float(_row.get("atr_14") or 0) or None,
+                nifty_pct_change      = _nifty_pct,
+                daily_vol_ratio       = _vol_ratio,
+                vol_surge_at_breakout = _vol_surge_sg,
             )
 
-        _status  = _scalp_sig.get("scalp_signal") or "INSIDE_ORB"
-        _dir     = _scalp_sig.get("scalp_direction") or ""
-        _confs   = _scalp_sig.get("scalp_confirmations") or 0
-        _sc_conf = _scalp_sig.get("scalp_confidence") or 0
+        _status    = _scalp_sig.get("scalp_signal") or "INSIDE_ORB"
+        _dir       = _scalp_sig.get("scalp_direction") or ""
+        _confs     = _scalp_sig.get("scalp_confirmations") or 0
+        _sc_conf   = _scalp_sig.get("scalp_confidence") or 0
         _sc_reason = str(_scalp_sig.get("scalp_reason") or "")
-        _atr_14 = float(_row.get("atr_14") or 0) or 0.0
+        _atr_use   = _atr_5m or float(_row.get("atr_14") or 0) or 0.0  # prefer 5-min ATR
         _orb_range = float(_orb_data.get("orb_range") or 0) if _orb_data else 0.0
-
-        _orb_start_t = pd.to_datetime("09:15").time()
-        _orb_end_t = pd.to_datetime("09:45").time()
-        _tm = pd.to_datetime(_candles_df["date"], errors="coerce").dt.time if "date" in _candles_df.columns else None
-        if _tm is not None:
-            _orb_candles = _candles_df[(_tm >= _orb_start_t) & (_tm <= _orb_end_t)]
-        else:
-            _orb_candles = pd.DataFrame()
-        _latest_candle = _candles_df.iloc[-1] if not _candles_df.empty else None
-        _breakout_candle_vol = float(_latest_candle.get("volume", 0)) if _latest_candle is not None else 0.0
-        _avg_orb_volume = float(_orb_candles["volume"].mean()) if (not _orb_candles.empty and "volume" in _orb_candles.columns) else 0.0
-        _vol_ratio_break = (_breakout_candle_vol / _avg_orb_volume) if _avg_orb_volume > 0 else None
+        # Reuse volume stats computed before scalping_signal call
+        _breakout_candle_vol = _brk_vol_sg
+        _avg_orb_volume      = _avg_orb_vol_sg
+        _vol_ratio_break     = (_breakout_candle_vol / _avg_orb_volume) if _avg_orb_volume > 0 else None
         _nifty_gate = (
             "NIFTY_BULLISH" if _nifty_pct >= config.NIFTY_GATE_PCT
             else "NIFTY_BEARISH" if _nifty_pct <= -config.NIFTY_GATE_PCT
             else None
         )
         def _scalp_obs_blob(_entry_for_obs: float) -> str:
-            _atr_term = round(config.SCALP_STOP_ATR_MULT * _atr_14, 2) if _atr_14 > 0 else 0.0
+            _atr_term = round(config.SCALP_STOP_ATR_MULT * _atr_use, 2) if _atr_use > 0 else 0.0
             _stop_obs = (_entry_for_obs + _atr_term) if _status == "SHORT" else (_entry_for_obs - _atr_term)
-            _ratio_txt = f"{(_orb_range / _atr_14):.3f}" if _atr_14 > 0 else "0.000"
+            _ratio_txt = f"{(_orb_range / _atr_use):.3f}" if _atr_use > 0 else "0.000"
             _vol_txt = f"{_vol_ratio_break:.2f}" if _vol_ratio_break is not None else "—"
             return (
                 f"orb_range={_orb_range:.2f} | orb_range_atr_ratio={_ratio_txt}"
@@ -6337,6 +6384,7 @@ def _intraday_scalp_live():
                 f" | avg_orb_volume={_avg_orb_volume:.0f}"
                 f" | vol_ratio={_vol_txt}"
                 f" | nifty_gate={_nifty_gate or 'NONE'}"
+                f" | atr_5m={_atr_use:.2f}"
                 f" | stop_atr_based={_stop_obs:.2f}"
             )
 
@@ -6346,7 +6394,8 @@ def _intraday_scalp_live():
         _sc_entry_px  = float(_scalp_sig.get("scalp_entry") or _ltp_now or 0)
         _sc_stop_px   = float(_scalp_sig.get("scalp_stop")  or 0)
         _sc_t1_px     = float(_scalp_sig.get("scalp_t1")    or 0)
-        _sc_atr       = float(_row.get("atr_14") or 0)
+        _sc_t2_px     = float(_scalp_sig.get("scalp_t2")    or 0)
+        _sc_atr       = _atr_use  # 5-min ATR(7)
         _sc_is_long   = _status == "LONG"
         _in_zone_sc, _rr_ok_sc, _ = _entry_ok(
             _ltp_now, _sc_entry_px, _sc_stop_px, _sc_t1_px, _sc_atr, is_buy=_sc_is_long,
@@ -6395,6 +6444,7 @@ def _intraday_scalp_live():
         _entry_px      = _scalp_sig.get("scalp_entry") or _ltp_now
         _stop_px       = _scalp_sig.get("scalp_stop")  or 0
         _t1_px         = _scalp_sig.get("scalp_t1")    or 0
+        _t2_px         = _scalp_sig.get("scalp_t2")    or 0
         _pqty          = max(1, int(config.SCALP_CAP_PER_TRADE / (_entry_px or 1)))
         _breakout_vol_ok = (
             _avg_orb_volume > 0 and
@@ -6421,7 +6471,7 @@ def _intraday_scalp_live():
                     and _sc_trig_key not in st.session_state.get("scalp_triggered", {})):
                 try:
                     _ltp_sc_p = float(_ltp_now or 1)
-                    _atr_sc_p = float(_row.get("atr_14") or 0)
+                    _atr_sc_p = _atr_use
                     _scid = db.log_trade({
                         "trade_date":          datetime.now(_IST).date(),
                         "tradingsymbol":       _sym,
@@ -6431,7 +6481,7 @@ def _intraday_scalp_live():
                         "rec_entry":           _entry_px,
                         "rec_stop":            _stop_px,
                         "rec_t1":              _t1_px,
-                        "rec_t2":              0,
+                        "rec_t2":              _t2_px,
                         "rec_rr":              float(_scalp_sig.get("scalp_rr") or 0),
                         "rec_reason":          str(_scalp_sig.get("scalp_reason") or "")[:250],
                         "rec_composite_score": float(_row.get("composite_score") or 0),
@@ -6454,7 +6504,7 @@ def _intraday_scalp_live():
                     })
                     st.session_state["scalp_triggered"][_sc_trig_key] = _scid
                     st.session_state["scalp_open"][_scid] = {
-                        "sym": _sym, "stop": _stop_px, "t1": _t1_px, "t2": 0,
+                        "sym": _sym, "stop": _stop_px, "t1": _t1_px, "t2": _t2_px,
                         "signal_type": _sc_sig_type, "entry": _ltp_now,
                         "cap": config.SCALP_CAP_PER_TRADE, "setup_type": "SCALP",
                         "partial_booked": False,
@@ -6503,7 +6553,7 @@ def _intraday_scalp_live():
                             except Exception:
                                 pass
                         _ltp_sc_r = float(_ltp_now or 1)
-                        _atr_sc_r = float(_row.get("atr_14") or 0)
+                        _atr_sc_r = _atr_use
                         _scid_r = db.log_trade({
                             "trade_date":          datetime.now(_IST).date(),
                             "tradingsymbol":       _sym,
@@ -6513,7 +6563,7 @@ def _intraday_scalp_live():
                             "rec_entry":           _entry_px,
                             "rec_stop":            _stop_px,
                             "rec_t1":              _t1_px,
-                            "rec_t2":              0,
+                            "rec_t2":              _t2_px,
                             "rec_rr":              float(_scalp_sig.get("scalp_rr") or 0),
                             "rec_reason":          str(_scalp_sig.get("scalp_reason") or "")[:250],
                             "rec_composite_score": float(_row.get("composite_score") or 0),
@@ -6539,7 +6589,7 @@ def _intraday_scalp_live():
                         })
                         st.session_state["scalp_triggered"][_sc_trig_key] = _scid_r
                         st.session_state["scalp_open"][_scid_r] = {
-                            "sym": _sym, "stop": _stop_px, "t1": _t1_px, "t2": 0,
+                            "sym": _sym, "stop": _stop_px, "t1": _t1_px, "t2": _t2_px,
                             "signal_type": _sc_sig_type, "entry": _ltp_now,
                             "cap": config.SCALP_CAP_PER_TRADE, "setup_type": "SCALP",
                             "partial_booked": False,
@@ -6631,11 +6681,11 @@ def _intraday_scalp_live():
 </tr>
 <tr>
   <td style="padding:4px 14px 4px 0;color:#f59e0b;font-weight:700;white-space:nowrap">Target</td>
-  <td style="color:#cbd5e1">Breakout + {config.SCALP_TARGET_MULT}× ORB range. Typical: 0.5–1.2% move.</td>
+  <td style="color:#cbd5e1">T1 = breakout + {config.SCALP_TARGET_T1_MULT}× ORB range (exit 70%); T2 = breakout + {config.SCALP_TARGET_T2_MULT}× ORB range (runner 30%). Both capped at {config.SCALP_ATR_TARGET_CAP}× 5-min ATR.</td>
 </tr>
 <tr>
   <td style="padding:4px 14px 4px 0;color:#ef4444;font-weight:700;white-space:nowrap">Stop</td>
-  <td style="color:#cbd5e1">Breakout − {config.SCALP_STOP_MULT}× ORB range (tight). If price re-enters ORB → exit immediately.</td>
+  <td style="color:#cbd5e1">Wider of: structural (50% retrace into ORB) or {config.SCALP_STOP_ATR_MULT}× 5-min ATR. After T1: stop moves to entry (breakeven) for runner.</td>
 </tr>
 <tr>
   <td style="padding:4px 14px 4px 0;color:#a78bfa;font-weight:700;white-space:nowrap">Hard Exit</td>
