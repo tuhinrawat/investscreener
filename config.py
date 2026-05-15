@@ -280,11 +280,16 @@ INTRADAY_ORB_CANDLES       = 6      # 6 × 5 min = 30-min ORB window (9:15–9:4
 
 # Stop-loss and targets
 INTRADAY_ATR_SL_MULT       = 0.75   # stop = entry ± ATR5 × this
-INTRADAY_T1_PCT            = 0.005  # +0.5% first target  (exit 40%)
-INTRADAY_T2_PCT            = 0.010  # +1.0% second target (exit 35%)
-INTRADAY_T3_PCT            = 0.018  # +1.8% runner target (hold 25%)
-INTRADAY_MIN_RR            = 1.2    # minimum R:R at T2 to emit a live signal (was 1.5 — too strict)
-INTRADAY_MAX_STOP_PCT      = 2.0    # hard stop-width cap as % of entry (was 1.0 — killed volatile stocks)
+# Targets are expressed as ATR5 multiples so they scale with each stock's
+# actual intraday volatility instead of a fixed percentage of price.
+# With SL = 0.75 × ATR5 the theoretical R:R at T2 = 2.0 / 0.75 = 2.67.
+# If the ORL/ORH-anchored stop is wider than the ATR-based stop, actual RR
+# will be lower — the gate below (INTRADAY_MIN_RR) catches that case.
+INTRADAY_T1_ATR_MULT       = 1.0    # T1 = entry ± 1.0 × ATR5 (exit 40%)
+INTRADAY_T2_ATR_MULT       = 2.0    # T2 = entry ± 2.0 × ATR5 (exit 35%)
+INTRADAY_T3_ATR_MULT       = 3.5    # T3 = entry ± 3.5 × ATR5 runner (hold 25%)
+INTRADAY_MIN_RR            = 1.5    # minimum R:R at T2 to emit a live signal
+INTRADAY_MAX_STOP_PCT      = 2.0    # hard stop-width cap as % of entry
 
 # Volume confirmation
 INTRADAY_VOL_MULT          = 1.5    # volume surge = current vol > avg_20 × this

@@ -1463,24 +1463,35 @@ def intraday_scan(client=None, progress_callback=None) -> dict:
                     reason = (f"ATR% {atr_pct_val:.2f}% < "
                               f"minimum {config.INTRADAY_MIN_ATR_PCT}%")
                 else:
+                    # Targets scale with ATR5 so they reflect each stock's
+                    # actual intraday range, not a fixed % of price.
                     if is_buy:
                         stop_loss = max(orl, entry_price - atr5 * config.INTRADAY_ATR_SL_MULT)
-                        t1 = entry_price * (1 + config.INTRADAY_T1_PCT)
-                        t2 = entry_price * (1 + config.INTRADAY_T2_PCT)
-                        t3 = entry_price * (1 + config.INTRADAY_T3_PCT)
+                        t1 = entry_price + atr5 * config.INTRADAY_T1_ATR_MULT
+                        t2 = entry_price + atr5 * config.INTRADAY_T2_ATR_MULT
+                        t3 = entry_price + atr5 * config.INTRADAY_T3_ATR_MULT
                     else:
                         stop_loss = min(orh, entry_price + atr5 * config.INTRADAY_ATR_SL_MULT)
-                        t1 = entry_price * (1 - config.INTRADAY_T1_PCT)
-                        t2 = entry_price * (1 - config.INTRADAY_T2_PCT)
-                        t3 = entry_price * (1 - config.INTRADAY_T3_PCT)
+                        t1 = entry_price - atr5 * config.INTRADAY_T1_ATR_MULT
+                        t2 = entry_price - atr5 * config.INTRADAY_T2_ATR_MULT
+                        t3 = entry_price - atr5 * config.INTRADAY_T3_ATR_MULT
 
-                    stop_dist = abs(entry_price - stop_loss)
-                    stop_pct  = stop_dist / entry_price * 100 if entry_price > 0 else 0
-                    rr_at_t2  = abs(t2 - entry_price) / stop_dist if stop_dist > 0 else 0
+                    atr_sl_dist  = atr5 * config.INTRADAY_ATR_SL_MULT
+                    stop_dist    = abs(entry_price - stop_loss)
+                    stop_pct     = stop_dist / entry_price * 100 if entry_price > 0 else 0
+                    rr_at_t2     = abs(t2 - entry_price) / stop_dist if stop_dist > 0 else 0
+                    orl_anchored = stop_dist > atr_sl_dist  # ORL/ORH stop is wider than ATR stop
 
                     if rr_at_t2 < config.INTRADAY_MIN_RR:
                         final_signal = "NO_SIGNAL"
-                        reason = f"R:R at T2 {rr_at_t2:.2f} < minimum {config.INTRADAY_MIN_RR}"
+                        if orl_anchored:
+                            reason = (
+                                f"ORL/ORH stop ({stop_dist:.2f}) wider than ATR stop "
+                                f"({atr_sl_dist:.2f}) — R:R at T2 {rr_at_t2:.2f} "
+                                f"< minimum {config.INTRADAY_MIN_RR}"
+                            )
+                        else:
+                            reason = f"R:R at T2 {rr_at_t2:.2f} < minimum {config.INTRADAY_MIN_RR}"
                     elif stop_pct > config.INTRADAY_MAX_STOP_PCT:
                         final_signal = "NO_SIGNAL"
                         reason = f"Stop {stop_pct:.2f}% > max {config.INTRADAY_MAX_STOP_PCT}%"
