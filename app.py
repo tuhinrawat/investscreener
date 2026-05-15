@@ -188,43 +188,69 @@ _stc_boot.html("""
   p.__ltp_patcher_installed__ = true;
   p.__ltp__       = p.__ltp__       || {};
   p.__prev_ltp__  = p.__prev_ltp__  || {};
+  p.__ref_ltp__   = p.__ref_ltp__   || {};  // prev-day close for daily % chg
   p.__positions__ = p.__positions__ || {};
 
-  // ── LTP text patcher: updates any [data-symbol] element ──────────────────
+  // Locale-aware price formatter
+  function _fmtPrice(v) {
+    return v >= 1000
+      ? v.toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2})
+      : v.toFixed(2);
+  }
+
+  // ── LTP patcher: updates any [data-symbol] element ───────────────────────
+  // Shows:  ₹2450.00 ▲ +0.32%   (green)
+  //     or  ₹2448.50 ▼ −0.05%   (red)
+  // Color persists; a 2-second flash on each tick change highlights the move.
   function _patchLtp() {
     var prices = p.__ltp__;
+    var refs   = p.__ref_ltp__;   // prev-day close from Python
     if (!prices || !Object.keys(prices).length) return;
     var cells = p.document.querySelectorAll('[data-symbol]');
     cells.forEach(function(el) {
       var sym = el.getAttribute('data-symbol');
       var ltp = prices[sym];
       if (ltp === undefined || ltp === null) return;
-      var oldVal = parseFloat(el.getAttribute('data-ltp-val') || '0');
-      var fmt = ltp >= 1000
-        ? ltp.toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2})
-        : ltp.toFixed(2);
-      if (Math.abs(ltp - oldVal) > 0.001) {
-        el.textContent = '\u20B9' + fmt;
+
+      var oldVal  = parseFloat(el.getAttribute('data-ltp-val') || '0');
+      var refPx   = refs[sym] ? parseFloat(refs[sym]) : 0;
+      var changed = Math.abs(ltp - oldVal) > 0.001;
+
+      // Daily % change from reference (prev close)
+      var chgHtml = '';
+      var ltpColor = '#94a3b8';  // neutral grey
+      if (refPx > 0) {
+        var chgPct = (ltp - refPx) / refPx * 100;
+        var arrow  = chgPct >= 0 ? '\u25b2' : '\u25bc';   // ▲ ▼
+        var sign   = chgPct >= 0 ? '+' : '';
+        ltpColor   = chgPct > 0.005  ? '#22c55e'
+                   : chgPct < -0.005 ? '#ef4444'
+                   : '#94a3b8';
+        chgHtml = ' <span style="font-size:0.78em;opacity:0.9">'
+                + arrow + ' ' + sign + chgPct.toFixed(2) + '%</span>';
+      }
+
+      if (changed || el.innerHTML.indexOf('\u20b9') === -1) {
+        el.innerHTML = '<span style="font-weight:700">\u20B9' + _fmtPrice(ltp) + '</span>' + chgHtml;
+        el.style.color = ltpColor;
         el.setAttribute('data-ltp-val', ltp);
-        el.classList.remove('ltp-up', 'ltp-down');
-        if (ltp > oldVal && oldVal > 0) {
-          el.classList.add('ltp-up');
-        } else if (ltp < oldVal && oldVal > 0) {
-          el.classList.add('ltp-down');
+
+        // Brief flash on tick change (background highlight)
+        if (changed && oldVal > 0) {
+          var flashBg = ltp > oldVal ? 'rgba(34,197,94,0.18)' : 'rgba(239,68,68,0.18)';
+          el.style.background = flashBg;
+          clearTimeout(el._ltpFlashTimer);
+          el._ltpFlashTimer = setTimeout(function() {
+            el.style.background = 'transparent';
+          }, 800);
         }
-        clearTimeout(el._ltpFlashTimer);
-        el._ltpFlashTimer = setTimeout(function() {
-          el.classList.remove('ltp-up', 'ltp-down');
-        }, 2000);
       }
     });
   }
 
-  // ── Live P&L badge: updates [data-pnl-badge] elements from __positions__ ─
-  // Each position entry: {entry, direction (+1/-1), qty, stop, cap}
-  // Renders live MTM P&L using current window.__ltp__ prices.
+  // ── P&L badge: updates [data-pnl-badge] elements ─────────────────────────
   function _patchPnl() {
-    var prices = p.__ltp__;
+    var prices    = p.__ltp__;
     var positions = p.__positions__;
     if (!prices || !positions) return;
     var badges = p.document.querySelectorAll('[data-pnl-badge]');
@@ -238,10 +264,11 @@ _stc_boot.html("""
       });
       var sign  = totalMtm >= 0 ? '+' : '';
       var color = totalMtm >= 0 ? '#22c55e' : '#ef4444';
-      var fmt = Math.abs(totalMtm) >= 1000
+      var fmtAmt = Math.abs(totalMtm) >= 1000
         ? totalMtm.toLocaleString('en-IN', {minimumFractionDigits:0, maximumFractionDigits:0})
         : totalMtm.toFixed(0);
-      el.innerHTML = '<span style="color:' + color + ';font-weight:700">MTM: \u20B9' + sign + fmt + '</span>';
+      el.innerHTML = '<span style="color:' + color + ';font-weight:700">'
+                   + 'MTM: \u20B9' + sign + fmtAmt + '</span>';
     });
   }
 
@@ -2159,12 +2186,29 @@ def _global_ltp_updater():
     _push_ltp = st.session_state.get("_live_ltp") or {}
     if _push_ltp:
         _prices_json = _json_ltp.dumps(_push_ltp)
+
+        # Build reference-price map (prev-day close) from screener base df.
+        # Push once per session — used by the JS patcher to compute daily % change.
+        _ref_js = ""
+        if not st.session_state.get("_ref_ltp_pushed"):
+            _base_sc = st.session_state.get("_screener_live_base_df")
+            if _base_sc is not None and not _base_sc.empty and "tradingsymbol" in _base_sc.columns:
+                _ref_map = {
+                    str(sym): float(ltp)
+                    for sym, ltp in zip(_base_sc["tradingsymbol"], _base_sc["ltp"])
+                    if ltp and str(ltp) not in ("nan", "None", "")
+                }
+                if _ref_map:
+                    _ref_js = f"p.__ref_ltp__ = {_json_ltp.dumps(_ref_map)};"
+                    st.session_state["_ref_ltp_pushed"] = True
+
         _stc_ltp.html(f"""
 <script>
 (function(){{
   var p = window.parent;
   p.__prev_ltp__ = Object.assign({{}}, p.__ltp__ || {{}});
   p.__ltp__      = {_prices_json};
+  {_ref_js}
 }})();
 </script>""", height=0, scrolling=False)
 
@@ -3182,15 +3226,21 @@ with tab_screener:
             <= _now_sc.replace(hour=15, minute=30, second=0, microsecond=0)
         )
         _live = st.session_state.get("_live_ltp", {})
-        _fdf = _fdf.copy()
-        if "tradingsymbol" in _fdf.columns:
-            if _mkt_open_sc:
-                # Override ltp column entirely from WebSocket — NaN = "—" in table
-                _fdf["ltp"] = _fdf["tradingsymbol"].map(_live)
-            elif _live:
-                # Market closed but WS somehow has prices — use them, fall back to DB
-                _fdf["ltp"] = _fdf["tradingsymbol"].map(_live).combine_first(_fdf["ltp"])
-            # else: market closed, no WS prices → keep DB last-session close (correct)
+        if _mkt_open_sc and _live and "tradingsymbol" in _fdf.columns:
+            # _add_ltp_chg injects live LTP and computes Δ% from the DB close
+            # that was in _fdf["ltp"] before we overwrite it.
+            _fdf = _add_ltp_chg(_fdf, _live)
+            # Add Δ% to display columns right after ltp
+            if "Δ%" in _fdf.columns and "Δ%" not in _dc:
+                _ltp_idx = _dc.index("ltp") + 1 if "ltp" in _dc else 1
+                _dc = _dc[:_ltp_idx] + ["Δ%"] + _dc[_ltp_idx:]
+        elif _mkt_open_sc and "tradingsymbol" in _fdf.columns:
+            _fdf["ltp"] = _fdf["tradingsymbol"].map(_live)  # all NaN → "—"
+        elif _live and "tradingsymbol" in _fdf.columns:
+            _fdf = _add_ltp_chg(_fdf, _live)
+            if "Δ%" in _fdf.columns and "Δ%" not in _dc:
+                _ltp_idx = _dc.index("ltp") + 1 if "ltp" in _dc else 1
+                _dc = _dc[:_ltp_idx] + ["Δ%"] + _dc[_ltp_idx:]
         _dc = [c for c in _dc if c in _fdf.columns]
         _fmts = {
             "ltp": "₹{:,.2f}",
@@ -3212,6 +3262,7 @@ with tab_screener:
             "support_20d": "₹{:,.2f}",
             "resistance_20d": "₹{:,.2f}",
         }
+        _fmts["Δ%"] = "{:+.2f}%"
         _fmts_valid = {k: v for k, v in _fmts.items() if k in _dc}
         def _cr(val):
             if pd.isna(val): return ""
@@ -3236,6 +3287,8 @@ with tab_screener:
             _styled = _styled.map(_cvd, subset=[c for c in _vc if c in _dc])
         if _asc:
             _styled = _styled.map(_cas, subset=[c for c in _asc if c in _dc])
+        # TradingView-style: color LTP and Δ% columns green/red
+        _styled = _style_ltp_chg(_styled, _fdf)
         _W2 = config.TREND_WEIGHTS
         _cc2 = st.column_config
         st.dataframe(
@@ -3248,16 +3301,18 @@ with tab_screener:
                     "Symbol",
                     help="NSE ticker symbol. Click the stock name in the detail panel below to see its full chart.",
                 ),
+                "Δ%": _cc2.TextColumn(
+                    "Δ% Today",
+                    help="Intraday % change: (live LTP − yesterday's close) / yesterday's close × 100. "
+                         "Green = up, Red = down.",
+                ),
         "company_name": _cc.TextColumn(
             "Company",
             help="Full registered company name.",
         ),
         "ltp": _cc.TextColumn(
             "LTP (₹)",
-            help=(
-                "Last Traded Price — the closing price from the most recent trading session stored in the DB. "
-                "Enable 📡 Live mode in the detail panel for the real-time quote."
-            ),
+            help="Live last traded price from Kite WebSocket. Updates every 2 seconds.",
         ),
         "composite_score": _cc.TextColumn(
             "Score",
@@ -4565,6 +4620,75 @@ def _is_market_open() -> bool:
 
 # ── Live LTP chip helpers ─────────────────────────────────────────────────────
 
+def _color_for_chg(chg: "float | None") -> str:
+    """Return CSS color string based on % change sign."""
+    if chg is None:
+        return "#94a3b8"
+    try:
+        return "#22c55e" if chg > 0.005 else "#ef4444" if chg < -0.005 else "#94a3b8"
+    except Exception:
+        return "#94a3b8"
+
+
+def _add_ltp_chg(df: "pd.DataFrame", live_map: dict,
+                 sym_col: str = "tradingsymbol") -> "pd.DataFrame":
+    """
+    Inject live LTP and compute intraday % change into a copy of *df*.
+
+    Adds / overwrites two columns:
+      ltp     — current WebSocket price (NaN = no live price)
+      Δ%      — (live − ref_close) / ref_close × 100
+                 where ref_close is the DB last-session close that was in
+                 df["ltp"] before we override it.
+
+    Call BEFORE building the display/styled dataframe so that both the
+    pandas styler and the column_config can reference these values.
+    """
+    df = df.copy()
+    if sym_col not in df.columns:
+        return df
+    ref_series  = df["ltp"].copy()                          # DB last-session close
+    live_series = df[sym_col].map(live_map)                 # WebSocket price
+    df["ltp"] = live_series
+    safe_ref    = ref_series.where(ref_series > 0)          # avoid div-by-zero
+    df["Δ%"]    = (live_series - safe_ref) / safe_ref * 100
+    return df
+
+
+def _style_ltp_chg(styler, df: "pd.DataFrame",
+                   ltp_col: str = "ltp", chg_col: str = "Δ%"):
+    """
+    Apply TradingView-style green / red colors to the LTP and Δ% columns.
+    Both columns must already exist in the dataframe and in the styler subset.
+    """
+    def _chg_cell_color(val):
+        try:
+            f = float(val)
+            if f > 0.005:  return "color:#22c55e;font-weight:700"
+            if f < -0.005: return "color:#ef4444;font-weight:700"
+        except Exception:
+            pass
+        return "color:#94a3b8"
+
+    cols_present = [c for c in [ltp_col, chg_col] if c in df.columns]
+    if chg_col in cols_present:
+        styler = styler.map(_chg_cell_color, subset=[chg_col])
+
+    if ltp_col in cols_present and chg_col in df.columns:
+        # Color the LTP cell based on the sign of Δ%
+        chg_vals = df[chg_col].fillna(0).tolist()
+        styler = styler.apply(
+            lambda _s: [
+                "color:#22c55e;font-weight:700" if c > 0.005
+                else "color:#ef4444;font-weight:700" if c < -0.005
+                else "color:#94a3b8"
+                for c in chg_vals
+            ],
+            subset=[ltp_col],
+        )
+    return styler
+
+
 def _ltp_chip(symbol: str, ltp: "float | None" = None,
               style: str = "font-size:1.1rem;font-weight:700") -> str:
     """
@@ -5801,6 +5925,8 @@ def _intraday_scalp_live():
     )
 
     _nifty_pct     = st.session_state.get("_nifty_intraday_pct", 0.0) or 0.0
+    # Save DB close prices before any WS override — used for daily Δ% display
+    _db_close_sc = dict(zip(_scalp_cands.get("tradingsymbol", []), _scalp_cands.get("ltp", [])))
     _scalp_results = []
     _live_ltp_now  = st.session_state.get("_live_ltp", {})
     _trade_mode    = st.session_state.get("trading_mode", "paper")
@@ -6227,10 +6353,19 @@ def _intraday_scalp_live():
         if _sc_trig_key in st.session_state.get("scalp_triggered", {}):
             _auto_badge = " ✅ TRADED"
 
+        # Daily % change for scalp table
+        _sc_db_px = _db_close_sc.get(_sym, 0)
+        if _sc_db_px and _ltp_now and _ltp_now > 0:
+            _sc_day_chg = (_ltp_now - _sc_db_px) / _sc_db_px * 100
+            _sc_day_chg_str = f"▲{_sc_day_chg:.2f}%" if _sc_day_chg > 0 else f"▼{abs(_sc_day_chg):.2f}%"
+        else:
+            _sc_day_chg_str = "—"
+
         _scalp_results.append({
             "Status":     _status_label + _auto_badge,
             "Symbol":     _sym,
             "LTP":        f"₹{_ltp_now:,.2f}",
+            "Δ% Day":     _sc_day_chg_str,
             "Direction":  _dir or "—",
             "Confirms":   f"{_confs}/3" if _confs else "—",
             "Conf":       f"{_sc_conf}/10",
@@ -6264,12 +6399,13 @@ def _intraday_scalp_live():
     _scalp_df = _scalp_df.sort_values("_sort").drop(columns=["_sort"]).reset_index(drop=True)
 
     st.dataframe(
-        _scalp_df,
+        _scalp_df.style.map(_delta_color, subset=["Δ% Day"]) if "Δ% Day" in _scalp_df.columns else _scalp_df,
         use_container_width=True,
         height=min(500, 50 + len(_scalp_results) * 38),
         hide_index=True,
         column_config={
             "Status":     st.column_config.TextColumn("Status", help="ORB signal state. 🚀 = live breakout, 👁 = only 1/3 confirmations, ⬜ = inside opening range"),
+            "Δ% Day":     st.column_config.TextColumn("Δ% Day", help="Daily % change from yesterday's close. ▲ green = up, ▼ red = down."),
             "Confirms":   st.column_config.TextColumn("Confirms", help="Number of internal confirmations (max 3): ORB break + VWAP + 5-min RSI. Need ≥2 to act."),
             "Conf Score": st.column_config.TextColumn("Score", help="Scalp confidence 0–10. Adjusted down if Nifty is against direction or volume is below average."),
             "5m RSI":     st.column_config.TextColumn("5m RSI", help="RSI computed on today's 5-min candles. >55 favours longs, <45 favours shorts."),
@@ -6327,6 +6463,8 @@ def _intraday_long_live():
 
     df_l = base_df.copy()
     _ltp_m = st.session_state.get("_live_ltp", {})
+    # Save DB close BEFORE overriding ltp — used for Δ% calculation
+    _db_close_l = dict(zip(df_l.get("tradingsymbol", []), df_l.get("ltp", [])))
     if "tradingsymbol" in df_l.columns:
         df_l["ltp"] = df_l["tradingsymbol"].map(_ltp_m)
 
@@ -6616,11 +6754,20 @@ def _intraday_long_live():
         if _nifty_gate:                _flags.append("🔴NF")
         _flag_str = " ".join(_flags) if _flags else "✓"
 
+        # Daily % change: live LTP vs yesterday's DB close (same color logic as TradingView)
+        _db_px_l = _db_close_l.get(sym, 0)
+        if _db_px_l and ltp_now and ltp_now > 0:
+            _day_chg_l = (ltp_now - _db_px_l) / _db_px_l * 100
+            _day_chg_str_l = f"▲{_day_chg_l:.2f}%" if _day_chg_l > 0 else f"▼{abs(_day_chg_l):.2f}%"
+        else:
+            _day_chg_str_l = "—"
+
         _si_rows.append([
             live_status,
             sym,
             r.get("company_name", ""),
             _fmt(ltp_now,                  "₹{:,.2f}"),
+            _day_chg_str_l,
             _delta_str(sym),
             _conf_str,
             _flag_str,
@@ -6638,13 +6785,14 @@ def _intraday_long_live():
         ])
 
     _si_df = pd.DataFrame(_si_rows, columns=[
-        "Status", "Symbol", "Company", "LTP", "Δ",
+        "Status", "Symbol", "Company", "LTP", "Δ% Day", "Δ",
         "Conf", "Flags", "Gain %", "Risk %", "R/R",
         "Buy Above", "Stop", "T1 (R2)", "T2 (R3)", "Pivot", "R1", "R2", "S1",
     ])
     st.dataframe(
         _si_df.style
             .map(_long_status_color, subset=["Status"])
+            .map(_delta_color,       subset=["Δ% Day"])
             .map(_delta_color,       subset=["Δ"])
             .map(_conf_color,        subset=["Conf"])
             .map(_gain_color,        subset=["Gain %"])
@@ -6668,8 +6816,12 @@ def _intraday_long_live():
                     "⚪ WATCHING — LTP is between S1 and R1. "
                     "No action yet. Monitor for approach to R1."
                 )),
+            "Δ% Day":    st.column_config.TextColumn("Δ% Day",
+                help="Daily % change from yesterday's closing price. "
+                     "▲ green = up from yesterday's close, ▼ red = down. "
+                     "Same as what TradingView / Kite shows next to LTP."),
             "Δ":         st.column_config.TextColumn("Δ",
-                help="LTP change since last 2-second refresh tick. "
+                help="LTP change since last 1-second refresh tick. "
                      "▲ green = price rising, ▼ red = price falling."),
             "Conf":      st.column_config.TextColumn("Conf",
                 help=(
@@ -6835,6 +6987,8 @@ def _intraday_short_live():
 
     df_s = base_df.copy()
     _ltp_ms = st.session_state.get("_live_ltp", {})
+    # Save DB close BEFORE overriding ltp — used for Δ% Day calculation
+    _db_close_s = dict(zip(df_s.get("tradingsymbol", []), df_s.get("ltp", [])))
     if "tradingsymbol" in df_s.columns:
         df_s["ltp"] = df_s["tradingsymbol"].map(_ltp_ms)
 
@@ -7112,11 +7266,20 @@ def _intraday_short_live():
             _rr_str = "—"
 
         _conf_str = f"{confidence}/10" if confidence else "—"
+        # Daily % change: live LTP vs yesterday's DB close
+        _db_px_s = _db_close_s.get(sym, 0)
+        if _db_px_s and ltp_now and ltp_now > 0:
+            _day_chg_s = (ltp_now - _db_px_s) / _db_px_s * 100
+            _day_chg_str_s = f"▲{_day_chg_s:.2f}%" if _day_chg_s > 0 else f"▼{abs(_day_chg_s):.2f}%"
+        else:
+            _day_chg_str_s = "—"
+
         _ss_rows.append([
             short_status,
             sym,
             r.get("company_name", ""),
             _fmt(ltp_now,                  "₹{:,.2f}"),
+            _day_chg_str_s,
             _delta_str(sym),
             _conf_str,
             _gain_pct(r.get("intraday_t1"), r.get("intraday_entry")),   # short: t1 < entry
@@ -7132,13 +7295,14 @@ def _intraday_short_live():
         ])
 
     _ss_df = pd.DataFrame(_ss_rows, columns=[
-        "Status", "Symbol", "Company", "LTP", "Δ",
+        "Status", "Symbol", "Company", "LTP", "Δ% Day", "Δ",
         "Conf", "Gain %", "Risk %", "R/R",
         "Sell Below", "Cover Stop", "T1 (S2)", "Pivot", "S1", "S2", "R1",
     ])
     st.dataframe(
         _ss_df.style
             .map(_short_status_color, subset=["Status"])
+            .map(_delta_color,        subset=["Δ% Day"])
             .map(_delta_color,        subset=["Δ"])
             .map(_conf_color,         subset=["Conf"])
             .map(_gain_color,         subset=["Gain %"])
@@ -7160,8 +7324,12 @@ def _intraday_short_live():
                     "⚪ WATCHING — LTP is between Pivot and S1. "
                     "Bearish bias but no trigger yet. Monitor only."
                 )),
+            "Δ% Day":     st.column_config.TextColumn("Δ% Day",
+                help="Daily % change from yesterday's closing price. "
+                     "▲ green = above yesterday, ▼ red = below yesterday. "
+                     "For shorts: red (falling from yesterday's close) is favourable."),
             "Δ":          st.column_config.TextColumn("Δ",
-                help="LTP change since last 2-second refresh tick. "
+                help="LTP change since last 1-second refresh tick. "
                      "▲ green = price rising (bad for shorts), ▼ red = price falling (good)."),
             "Conf":       st.column_config.TextColumn("Conf",
                 help=(
