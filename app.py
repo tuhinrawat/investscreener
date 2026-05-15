@@ -578,15 +578,16 @@ if (_kc_ticker_client and getattr(_kc_ticker_client, "authenticated", False)
 # Keep the running ticker subscribed to the full stock universe even across
 # reruns/auth refreshes where start_ticker() doesn't re-run.
 if _kc_ticker_client and getattr(_kc_ticker_client, "authenticated", False):
+    _today_sync = _dt.date.today().isoformat()
     _full_sync_date = st.session_state.get("_ticker_full_sync_date")
-    if _full_sync_date != _today_str:
+    if _full_sync_date != _today_sync:
         try:
             _full_map = db.get_all_nse_stock_tokens()
             if _full_map:
                 _kc_module.update_ticker_subscriptions(_full_map)
         except Exception:
             pass
-        st.session_state["_ticker_full_sync_date"] = _today_str
+        st.session_state["_ticker_full_sync_date"] = _today_sync
 
 # Convenience alias — current Kite user id for per-user DB filtering
 _cur_user_id: str = st.session_state.get("kite_user_id", "")
