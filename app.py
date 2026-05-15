@@ -3193,6 +3193,52 @@ with tab_screener:
 
     _W = config.TREND_WEIGHTS
     _cc = st.column_config
+
+    # ── LTP Δ% helpers (must be defined before the fragment that calls them) ─
+    def _color_for_chg_local(chg):
+        """CSS color string based on % change sign."""
+        try:
+            return "#22c55e" if chg > 0.005 else "#ef4444" if chg < -0.005 else "#94a3b8"
+        except Exception:
+            return "#94a3b8"
+
+    def _add_ltp_chg_local(df, live_map, sym_col="tradingsymbol"):
+        """Inject live LTP + Δ% column (ref = DB close in df['ltp'] before override)."""
+        df = df.copy()
+        if sym_col not in df.columns:
+            return df
+        ref_series  = df["ltp"].copy()
+        live_series = df[sym_col].map(live_map)
+        df["ltp"] = live_series
+        safe_ref   = ref_series.where(ref_series > 0)
+        df["Δ%"]   = (live_series - safe_ref) / safe_ref * 100
+        return df
+
+    def _style_ltp_chg_local(styler, df, ltp_col="ltp", chg_col="Δ%"):
+        """Apply green/red colors to LTP and Δ% columns based on Δ% sign."""
+        def _chg_cc(val):
+            try:
+                f = float(val)
+                if f > 0.005:  return "color:#22c55e;font-weight:700"
+                if f < -0.005: return "color:#ef4444;font-weight:700"
+            except Exception:
+                pass
+            return "color:#94a3b8"
+        if chg_col in df.columns:
+            styler = styler.map(_chg_cc, subset=[chg_col])
+        if ltp_col in df.columns and chg_col in df.columns:
+            _chg_vals = df[chg_col].fillna(0).tolist()
+            styler = styler.apply(
+                lambda _s: [
+                    "color:#22c55e;font-weight:700" if c > 0.005
+                    else "color:#ef4444;font-weight:700" if c < -0.005
+                    else "color:#94a3b8"
+                    for c in _chg_vals
+                ],
+                subset=[ltp_col],
+            )
+        return styler
+
     # ── Screener table rendered by a live fragment (run_every=2) ─────────────
     # The fragment re-injects _live_ltp into the ltp column on every fire so
     # prices stay current without re-running the entire filter pipeline.
@@ -3227,17 +3273,14 @@ with tab_screener:
         )
         _live = st.session_state.get("_live_ltp", {})
         if _mkt_open_sc and _live and "tradingsymbol" in _fdf.columns:
-            # _add_ltp_chg injects live LTP and computes Δ% from the DB close
-            # that was in _fdf["ltp"] before we overwrite it.
-            _fdf = _add_ltp_chg(_fdf, _live)
-            # Add Δ% to display columns right after ltp
+            _fdf = _add_ltp_chg_local(_fdf, _live)
             if "Δ%" in _fdf.columns and "Δ%" not in _dc:
                 _ltp_idx = _dc.index("ltp") + 1 if "ltp" in _dc else 1
                 _dc = _dc[:_ltp_idx] + ["Δ%"] + _dc[_ltp_idx:]
         elif _mkt_open_sc and "tradingsymbol" in _fdf.columns:
             _fdf["ltp"] = _fdf["tradingsymbol"].map(_live)  # all NaN → "—"
         elif _live and "tradingsymbol" in _fdf.columns:
-            _fdf = _add_ltp_chg(_fdf, _live)
+            _fdf = _add_ltp_chg_local(_fdf, _live)
             if "Δ%" in _fdf.columns and "Δ%" not in _dc:
                 _ltp_idx = _dc.index("ltp") + 1 if "ltp" in _dc else 1
                 _dc = _dc[:_ltp_idx] + ["Δ%"] + _dc[_ltp_idx:]
@@ -3288,7 +3331,7 @@ with tab_screener:
         if _asc:
             _styled = _styled.map(_cas, subset=[c for c in _asc if c in _dc])
         # TradingView-style: color LTP and Δ% columns green/red
-        _styled = _style_ltp_chg(_styled, _fdf)
+        _styled = _style_ltp_chg_local(_styled, _fdf)
         _W2 = config.TREND_WEIGHTS
         _cc2 = st.column_config
         st.dataframe(
@@ -7472,12 +7515,15 @@ def _dist_color(val):
 # ────────────────────────────────────────────────────────────────────────────
 
 @st.fragment
+@st.fragment(run_every=2)
 def _swing_buy_tab_content():
     base_df = st.session_state.get("_signals_base_df", pd.DataFrame())
     if base_df.empty:
         return
     df_live = base_df.copy()
     _ltp_sw1 = st.session_state.get("_live_ltp", {})
+    # Save DB close BEFORE overriding ltp for Δ% Day calculation
+    _db_close_sw = dict(zip(df_live.get("tradingsymbol", []), df_live.get("ltp", [])))
     if "tradingsymbol" in df_live.columns:
         df_live["ltp"] = df_live["tradingsymbol"].map(_ltp_sw1)
 
@@ -7494,19 +7540,30 @@ def _swing_buy_tab_content():
         "Set a hard stop-loss at Stop. Book 50% at T1, let the rest run to T2 "
         "with a trailing stop. Minimum R/R to consider: 1.5×."
     )
-    _swing_sym_q = st.text_input(
+    _swing_sym_q = st.session_state.get("swing_buy_sym_search", "")
+    _swing_sym_q_inp = st.text_input(
         "🔍 Search symbol", placeholder="type to filter...",
         key="swing_buy_sym_search", label_visibility="collapsed",
     )
+    _swing_sym_q = _swing_sym_q_inp or _swing_sym_q
     if _swing_sym_q:
         _sb = _sb[_sb["tradingsymbol"].str.contains(
             _swing_sym_q.strip(), case=False, na=False, regex=False)]
     _sb_rows = []
     for _, r in _sb.iterrows():
+        _sym_sw = r.get("tradingsymbol", "")
+        _ltp_sw_v = _fv(r.get("ltp")) or 0
+        _db_px_sw = _db_close_sw.get(_sym_sw, 0)
+        if _db_px_sw and _ltp_sw_v > 0:
+            _sw_day_chg = (_ltp_sw_v - _db_px_sw) / _db_px_sw * 100
+            _sw_day_str = f"▲{_sw_day_chg:.2f}%" if _sw_day_chg > 0 else f"▼{abs(_sw_day_chg):.2f}%"
+        else:
+            _sw_day_str = "—"
         _sb_rows.append([
-            r.get("tradingsymbol", ""), r.get("company_name", ""),
+            _sym_sw, r.get("company_name", ""),
             r.get("swing_setup", ""),
-            _fmt(r.get("ltp"),         "₹{:,.2f}"),
+            _fmt(_ltp_sw_v,        "₹{:,.2f}"),
+            _sw_day_str,
             _gain_pct(r.get("swing_entry"), r.get("swing_t1")),
             _risk_pct(r.get("swing_entry"), r.get("swing_stop")),
             _fmt(r.get("swing_entry"),  "₹{:,.2f}"),
@@ -7518,34 +7575,39 @@ def _swing_buy_tab_content():
             str(r.get("swing_reason", ""))[:120],
         ])
     _sb_df = pd.DataFrame(_sb_rows, columns=[
-        "Symbol", "Company", "Setup", "LTP",
+        "Symbol", "Company", "Setup", "LTP", "Δ% Day",
         "Gain %", "Risk %", "Entry", "Stop", "T1", "T2", "R/R", "Quality", "Reason",
     ])
     st.dataframe(
-        _sb_df.style.map(_gain_color, subset=["Gain %"]).map(_risk_color, subset=["Risk %"]),
+        _sb_df.style
+            .map(_delta_color, subset=["Δ% Day"])
+            .map(_gain_color,  subset=["Gain %"])
+            .map(_risk_color,  subset=["Risk %"]),
         use_container_width=True, height=min(400, 50 + len(_sb_rows) * 38), hide_index=True,
         column_config={
-            "Setup":   st.column_config.TextColumn("Setup",   help="PULLBACK = retracement to EMA20 | BREAKOUT = 20D high break | NR7 = narrowest range coil"),
-            "Gain %":  st.column_config.TextColumn("Gain %",  help="Upside to T1 from entry price. Swing trades typically target 5–15%."),
-            "Risk %":  st.column_config.TextColumn("Risk %",  help="Downside from entry to hard stop-loss. Ideal risk per trade: 2–4%."),
-            "Entry":   st.column_config.TextColumn("Entry",   help="Suggested entry price. For NR7 this is a buy-stop order above today's high."),
-            "Stop":    st.column_config.TextColumn("Stop",    help="Hard stop-loss. Exit the full position if price closes below this level."),
-            "T1":      st.column_config.TextColumn("T1",      help="First target = Entry + 2×ATR. Book 50% here."),
-            "T2":      st.column_config.TextColumn("T2",      help="Second target = Entry + 4×ATR. Trail stop on the remaining 50%."),
-            "R/R":     st.column_config.TextColumn("R/R",     help="Risk/Reward ratio at T1. Minimum 1.5× recommended."),
-            "Quality": st.column_config.TextColumn("Quality", help="★★★★★ = best (full EMA stack + ADX confirmed + strong volume)"),
+            "Setup":    st.column_config.TextColumn("Setup",    help="PULLBACK = retracement to EMA20 | BREAKOUT = 20D high break | NR7 = narrowest range coil"),
+            "Δ% Day":   st.column_config.TextColumn("Δ% Day",  help="Intraday % change from yesterday's close. ▲ green = up, ▼ red = down."),
+            "Gain %":   st.column_config.TextColumn("Gain %",  help="Upside to T1 from entry price. Swing trades typically target 5–15%."),
+            "Risk %":   st.column_config.TextColumn("Risk %",  help="Downside from entry to hard stop-loss. Ideal risk per trade: 2–4%."),
+            "Entry":    st.column_config.TextColumn("Entry",   help="Suggested entry price. For NR7 this is a buy-stop order above today's high."),
+            "Stop":     st.column_config.TextColumn("Stop",    help="Hard stop-loss. Exit the full position if price closes below this level."),
+            "T1":       st.column_config.TextColumn("T1",      help="First target = Entry + 2×ATR. Book 50% here."),
+            "T2":       st.column_config.TextColumn("T2",      help="Second target = Entry + 4×ATR. Trail stop on the remaining 50%."),
+            "R/R":      st.column_config.TextColumn("R/R",     help="Risk/Reward ratio at T1. Minimum 1.5× recommended."),
+            "Quality":  st.column_config.TextColumn("Quality", help="★★★★★ = best (full EMA stack + ADX confirmed + strong volume)"),
         },
     )
     _render_order_panel(_sb, setup_type="SWING", form_key="sw_buy")
 
 
-@st.fragment
+@st.fragment(run_every=2)
 def _exit_sell_tab_content():
     base_df = st.session_state.get("_signals_base_df", pd.DataFrame())
     if base_df.empty:
         return
     df_live = base_df.copy()
     _ltp_vx = st.session_state.get("_live_ltp", {})
+    _db_close_ex = dict(zip(df_live.get("tradingsymbol", []), df_live.get("ltp", [])))
     if "tradingsymbol" in df_live.columns:
         df_live["ltp"] = df_live["tradingsymbol"].map(_ltp_vx)
 
@@ -7570,25 +7632,36 @@ def _exit_sell_tab_content():
             _exit_sym_q.strip(), case=False, na=False, regex=False)]
     _se_rows = []
     for _, r in _se.iterrows():
+        _sym_ex = r.get("tradingsymbol", "")
         ltp_v = _fv(r.get("ltp")) or 0
         ema_v = r.get("ema_20") or 0
+        _db_px_ex = _db_close_ex.get(_sym_ex, 0)
+        if _db_px_ex and ltp_v > 0:
+            _ex_day_chg = (ltp_v - _db_px_ex) / _db_px_ex * 100
+            _ex_day_str = f"▲{_ex_day_chg:.2f}%" if _ex_day_chg > 0 else f"▼{abs(_ex_day_chg):.2f}%"
+        else:
+            _ex_day_str = "—"
         try:
             dist_ema = f"+{(ltp_v - ema_v) / ema_v * 100:.1f}%" if ema_v > 0 else "—"
         except Exception:
             dist_ema = "—"
         _se_rows.append([
-            r.get("tradingsymbol", ""), r.get("company_name", ""),
-            _fmt(ltp_v, "₹{:,.2f}"), _fmt(ema_v, "₹{:,.2f}"),
+            _sym_ex, r.get("company_name", ""),
+            _fmt(ltp_v, "₹{:,.2f}"), _ex_day_str,
+            _fmt(ema_v, "₹{:,.2f}"),
             dist_ema, _fmt(r.get("rsi_14"), "{:.1f}"),
             str(r.get("swing_reason", "")),
         ])
     _se_df = pd.DataFrame(_se_rows, columns=[
-        "Symbol", "Company", "LTP", "EMA20", "EMA20 Dist", "RSI", "Exit Reason",
+        "Symbol", "Company", "LTP", "Δ% Day", "EMA20", "EMA20 Dist", "RSI", "Exit Reason",
     ])
     st.dataframe(
-        _se_df.style.map(_dist_color, subset=["EMA20 Dist"]),
+        _se_df.style
+            .map(_delta_color, subset=["Δ% Day"])
+            .map(_dist_color,  subset=["EMA20 Dist"]),
         use_container_width=True, height=min(400, 50 + len(_se_rows) * 38), hide_index=True,
         column_config={
+            "Δ% Day":     st.column_config.TextColumn("Δ% Day",   help="Intraday % change from yesterday's close. ▲ green = up, ▼ red = down."),
             "EMA20 Dist": st.column_config.TextColumn("EMA20 Dist", help=(
                 "How far LTP is above EMA20. A large positive value (+10%+) means the stock is "
                 "stretched and likely to mean-revert — this is what triggers the SELL signal.")),
@@ -7606,13 +7679,14 @@ def _exit_sell_tab_content():
     _render_order_panel(_se_log, setup_type="SWING", form_key="sw_exit")
 
 
-@st.fragment
+@st.fragment(run_every=2)
 def _scaling_tab_content():
     base_df = st.session_state.get("_signals_base_df", pd.DataFrame())
     if base_df.empty:
         return
     df_live = base_df.copy()
     _ltp_vx = st.session_state.get("_live_ltp", {})
+    _db_close_scl = dict(zip(df_live.get("tradingsymbol", []), df_live.get("ltp", [])))
     if "tradingsymbol" in df_live.columns:
         df_live["ltp"] = df_live["tradingsymbol"].map(_ltp_vx)
 
@@ -7639,9 +7713,18 @@ def _scaling_tab_content():
             _scale_sym_q.strip(), case=False, na=False, regex=False)]
     _ssc_rows = []
     for _, r in _ssc.iterrows():
+        _sym_scl = r.get("tradingsymbol", "")
+        _ltp_scl_v = _fv(r.get("ltp")) or 0
+        _db_px_scl = _db_close_scl.get(_sym_scl, 0)
+        if _db_px_scl and _ltp_scl_v > 0:
+            _scl_day_chg = (_ltp_scl_v - _db_px_scl) / _db_px_scl * 100
+            _scl_day_str = f"▲{_scl_day_chg:.2f}%" if _scl_day_chg > 0 else f"▼{abs(_scl_day_chg):.2f}%"
+        else:
+            _scl_day_str = "—"
         _ssc_rows.append([
-            r.get("tradingsymbol", ""), r.get("company_name", ""),
-            _fmt(r.get("ltp"),                 "₹{:,.2f}"),
+            _sym_scl, r.get("company_name", ""),
+            _fmt(_ltp_scl_v,               "₹{:,.2f}"),
+            _scl_day_str,
             _gain_pct(r.get("scale_entry_1"), r.get("scale_target")),
             _risk_pct(r.get("scale_entry_1"), r.get("scale_stop")),
             _fmt(r.get("scale_entry_1"),       "₹{:,.2f}"),
@@ -7654,16 +7737,20 @@ def _scaling_tab_content():
             str(r.get("scale_reason", ""))[:120],
         ])
     _ssc_df = pd.DataFrame(_ssc_rows, columns=[
-        "Symbol", "Company", "LTP",
+        "Symbol", "Company", "LTP", "Δ% Day",
         "Gain %", "Risk %",
         "Entry 1 (40%)", "Hard Stop", "Trail Stop (EMA50)",
         "Target (+18%)", "6M Return", "RS vs Nifty",
         "Quality", "Reason",
     ])
     st.dataframe(
-        _ssc_df.style.map(_gain_color, subset=["Gain %"]).map(_risk_color, subset=["Risk %"]),
+        _ssc_df.style
+            .map(_delta_color, subset=["Δ% Day"])
+            .map(_gain_color,  subset=["Gain %"])
+            .map(_risk_color,  subset=["Risk %"]),
         use_container_width=True, height=min(450, 50 + len(_ssc_rows) * 38), hide_index=True,
         column_config={
+            "Δ% Day":             st.column_config.TextColumn("Δ% Day",     help="Intraday % change from yesterday's close. ▲ green = up, ▼ red = down."),
             "Gain %":             st.column_config.TextColumn("Gain %",     help="Upside from Entry 1 to the 18% target. Scaling trades typically run 15–25%."),
             "Risk %":             st.column_config.TextColumn("Risk %",     help="Downside from Entry 1 to hard stop. Acceptable for a position you intend to scale into."),
             "Entry 1 (40%)":      st.column_config.TextColumn("Entry 1",    help="0.5% above EMA50 — confirms EMA50 held as support. Deploy 40% of position here."),
