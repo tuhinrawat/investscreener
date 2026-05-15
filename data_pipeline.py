@@ -791,11 +791,10 @@ def select_intraday_candidates(metrics_df: pd.DataFrame) -> pd.DataFrame:
     """
     Step 4.5 — run after compute_metrics_for_universe().
 
-    From the liquidity-passed universe, select the top N stocks for
-    tomorrow's 5-min intraday scan based on ATR% >= minimum threshold
-    and highest composite_score.  Pre-computes P2 (daily structure score)
-    using values already in metrics_df so intraday_scan() doesn't need
-    to re-derive it from the DB.
+    Selects ALL stocks that clear the ATR% floor — no composite_score rank cap.
+    INTRADAY_MAX_CANDIDATES acts as a safety ceiling only (e.g. 300) to prevent
+    runaway API usage if the ATR% threshold is misconfigured.  Pre-computes P2
+    (daily structure score) so intraday_scan() doesn't re-derive it from DB.
     """
     df = metrics_df.copy()
 
@@ -809,9 +808,13 @@ def select_intraday_candidates(metrics_df: pd.DataFrame) -> pd.DataFrame:
 
     eligible = df[df["atr_pct"].notna() & (df["atr_pct"] >= config.INTRADAY_MIN_ATR_PCT)].copy()
 
+    # Sort by composite_score so the best stocks appear first in scan output,
+    # but do NOT cut to top-N — every stock that clears ATR% gate is included.
+    # INTRADAY_MAX_CANDIDATES is a safety ceiling only.
     candidates = (
         eligible
-        .nlargest(config.INTRADAY_MAX_CANDIDATES, "composite_score")
+        .sort_values("composite_score", ascending=False)
+        .head(config.INTRADAY_MAX_CANDIDATES)          # safety ceiling
         [["tradingsymbol", "instrument_token", "ltp", "atr_14", "atr_pct",
           "ema_20", "ema_200", "composite_score", "rs_vs_nifty_3m",
           "trend_score", "rsi_14"]]
@@ -840,19 +843,23 @@ def select_intraday_candidates(metrics_df: pd.DataFrame) -> pd.DataFrame:
 
 def _score_p1(adx_val: float, plus_di: float, minus_di: float,
                is_buy: bool) -> tuple[int, bool]:
-    """Pillar 1 — Trend Strength (ADX/DMI). Returns (score, adx_gate_passed)."""
+    """Pillar 1 — Trend Strength (ADX/DMI). Returns (score, adx_gate_passed).
+    ADX gate threshold lowered to 15 (was 20) — ADX 15-20 is directional enough intraday.
+    """
     score = 0
     if adx_val > 35:
         score += 5
     elif adx_val > 25:
         score += 4
     elif adx_val > 20:
-        score += 2
+        score += 3
+    elif adx_val > 15:
+        score += 1
     if is_buy and plus_di > minus_di:
         score += 2
     if not is_buy and minus_di > plus_di:
         score += 2
-    return score, adx_val >= 20
+    return score, adx_val >= 15
 
 
 def _score_p2(ltp: float, ema_20d: float, ema_200d: float, is_buy: bool) -> int:
@@ -913,18 +920,20 @@ def _score_p5(volume: float, avg_vol_20: float,
                   if len(obv_series) >= 11 else False)
     s = 0
     if is_buy:
-        if vol_surge:   s += 2
-        if obv_rising:  s += 2
-        if obv_new_hi:  s += 1
-        if not obv_rising: s -= 3
+        if vol_surge:        s += 2
+        if obv_rising:       s += 2
+        if obv_new_hi:       s += 1
+        # Penalty reduced to -1 (was -3): flat OBV is neutral, not catastrophic.
+        # Active distribution (OBV falling while price rises) is what should hurt.
+        if not obv_rising:   s -= 1
     else:
         obv_falling = obv_series.iloc[-1] < obv_series.iloc[-4] if len(obv_series) >= 4 else False
         obv_new_lo  = (obv_series.iloc[-1] < obv_series.iloc[-11:-1].min()
                        if len(obv_series) >= 11 else False)
-        if vol_surge:    s += 2
-        if obv_falling:  s += 2
-        if obv_new_lo:   s += 1
-        if not obv_falling: s -= 3
+        if vol_surge:        s += 2
+        if obv_falling:      s += 2
+        if obv_new_lo:       s += 1
+        if not obv_falling:  s -= 1
     return s
 
 
@@ -1308,9 +1317,9 @@ def intraday_scan(client=None, progress_callback=None) -> dict:
                     if rr_at_t2 < config.INTRADAY_MIN_RR:
                         final_signal = "NO_SIGNAL"
                         reason = f"R:R at T2 {rr_at_t2:.2f} < minimum {config.INTRADAY_MIN_RR}"
-                    elif stop_pct > 1.0:
+                    elif stop_pct > config.INTRADAY_MAX_STOP_PCT:
                         final_signal = "NO_SIGNAL"
-                        reason = f"Stop% {stop_pct:.2f}% too wide — R:R broken"
+                        reason = f"Stop {stop_pct:.2f}% > max {config.INTRADAY_MAX_STOP_PCT}%"
 
             if final_signal != "NO_SIGNAL":
                 breakeven_stop = (entry_price - 1.0) if is_buy else (entry_price + 1.0)

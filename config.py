@@ -273,7 +273,7 @@ INTRADAY_REGIME_GATE   = True
 
 # Candidate pre-selection (Step 4.5 in full_rescan)
 INTRADAY_MIN_ATR_PCT       = 1.0    # minimum ATR% to qualify for 5-min scan
-INTRADAY_MAX_CANDIDATES    = 40     # max stocks to run 5-min candle fetch on
+INTRADAY_MAX_CANDIDATES    = 300    # safety ceiling — all ATR%-eligible stocks are scanned up to this
 
 # Opening Range Breakout window
 INTRADAY_ORB_CANDLES       = 6      # 6 × 5 min = 30-min ORB window (9:15–9:44)
@@ -283,7 +283,8 @@ INTRADAY_ATR_SL_MULT       = 0.75   # stop = entry ± ATR5 × this
 INTRADAY_T1_PCT            = 0.005  # +0.5% first target  (exit 40%)
 INTRADAY_T2_PCT            = 0.010  # +1.0% second target (exit 35%)
 INTRADAY_T3_PCT            = 0.018  # +1.8% runner target (hold 25%)
-INTRADAY_MIN_RR            = 1.5    # minimum R:R at T2 to emit a live signal
+INTRADAY_MIN_RR            = 1.2    # minimum R:R at T2 to emit a live signal (was 1.5 — too strict)
+INTRADAY_MAX_STOP_PCT      = 2.0    # hard stop-width cap as % of entry (was 1.0 — killed volatile stocks)
 
 # Volume confirmation
 INTRADAY_VOL_MULT          = 1.5    # volume surge = current vol > avg_20 × this
