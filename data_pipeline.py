@@ -1103,7 +1103,7 @@ def intraday_scan(client=None, progress_callback=None) -> dict:
                 interval="5minute",
             )
             if not candles_5m or len(candles_5m) < config.INTRADAY_ORB_CANDLES + 3:
-                signals.append(_no_signal_row(sym, token, reason="Insufficient 5-min candles"))
+                signals.append(_no_signal_row(sym, token, reason="Insufficient 5-min candles", scan_date=today_date))
                 continue
 
             df5 = pd.DataFrame(candles_5m)
@@ -1126,7 +1126,7 @@ def intraday_scan(client=None, progress_callback=None) -> dict:
             orb_candles = session_df.head(config.INTRADAY_ORB_CANDLES)
 
             if len(orb_candles) < config.INTRADAY_ORB_CANDLES:
-                signals.append(_no_signal_row(sym, token, reason="ORB window not yet complete"))
+                signals.append(_no_signal_row(sym, token, reason="ORB window not yet complete", scan_date=today_date))
                 continue
 
             orh = float(orb_candles["high"].max())
@@ -1262,6 +1262,7 @@ def intraday_scan(client=None, progress_callback=None) -> dict:
                     signals.append(_no_signal_row(
                         sym, token,
                         reason=f"ORB signal stale — breakout occurred {bars_ago * 5} min ago (>{config.INTRADAY_STALE_CANDLES * 5} min threshold)",
+                        scan_date=today_date,
                     ))
                     continue
 
@@ -1269,6 +1270,7 @@ def intraday_scan(client=None, progress_callback=None) -> dict:
                 signals.append(_no_signal_row(
                     sym, token,
                     reason="No valid 3-candle ORB confirmation in this session",
+                    scan_date=today_date,
                 ))
                 continue
 
@@ -1332,6 +1334,7 @@ def intraday_scan(client=None, progress_callback=None) -> dict:
             signals.append({
                 "tradingsymbol":    sym,
                 "instrument_token": token,
+                "scan_date":        today_date,
                 "signal":           final_signal,
                 "grade":            grade,
                 "total_score":      total_score,
@@ -1368,7 +1371,7 @@ def intraday_scan(client=None, progress_callback=None) -> dict:
 
         except Exception as _e:
             print(f"  ⚠ {sym}: {_e}")
-            signals.append(_no_signal_row(sym, token, reason=str(_e)[:200]))
+            signals.append(_no_signal_row(sym, token, reason=str(_e)[:200], scan_date=today_date))
             continue
 
     signals_df = pd.DataFrame(signals)
@@ -1390,11 +1393,13 @@ def intraday_scan(client=None, progress_callback=None) -> dict:
     }
 
 
-def _no_signal_row(tradingsymbol: str, instrument_token: int, reason: str = "") -> dict:
+def _no_signal_row(tradingsymbol: str, instrument_token: int,
+                   reason: str = "", scan_date=None) -> dict:
     """Return a minimal NO_SIGNAL dict for a stock that couldn't be scored."""
     return {
         "tradingsymbol":    tradingsymbol,
         "instrument_token": instrument_token,
+        "scan_date":        scan_date or _now_ist().date(),
         "signal":           "NO_SIGNAL",
         "grade":            "D",
         "total_score":      0,

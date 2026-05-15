@@ -518,6 +518,7 @@ def init_schema():
             CREATE TABLE IF NOT EXISTS intraday_signals (
                 tradingsymbol           VARCHAR         PRIMARY KEY,
                 instrument_token        BIGINT,
+                scan_date               DATE,
                 signal                  VARCHAR,
                 grade                   VARCHAR,
                 total_score             INTEGER,
@@ -549,6 +550,11 @@ def init_schema():
                 valid_until             TIMESTAMP,
                 signal_generated_at     TIMESTAMP           DEFAULT CURRENT_TIMESTAMP
             )
+        """)
+        # Migration: add scan_date column if it doesn't exist yet
+        cur.execute("""
+            ALTER TABLE intraday_signals
+            ADD COLUMN IF NOT EXISTS scan_date DATE
         """)
 
         # One-time migration: UTC → IST shift on logged_at

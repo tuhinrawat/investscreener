@@ -9416,18 +9416,7 @@ with tab_6pillar:
             "Run **⚡ 6-Pillar Intraday Scan** from the sidebar after 9:45 AM."
         )
 
-        # ── Last scan info ────────────────────────────────────────────────────
-        last_scan_ts = st.session_state.get("_6p_scan_ts")
-        if last_scan_ts:
-            mins_ago = int((now_6p - last_scan_ts).total_seconds() / 60)
-            st.markdown(
-                f'<span style="font-size:12px;color:#64748b">Last scan: '
-                f'{last_scan_ts.strftime("%H:%M:%S")} IST '
-                f'({mins_ago} min ago)</span>',
-                unsafe_allow_html=True,
-            )
-
-        # ── Load signals ─────────────────────────────────────────────────────
+        # ── Load signals first (DB is the source of truth, not session state) ──
         try:
             sigs = db.load_intraday_signals(include_no_signal=False)
         except Exception as _load_err:
@@ -9442,6 +9431,44 @@ with tab_6pillar:
                 icon="ℹ️",
             )
             return
+
+        # ── Scan date banner — shows freshness even after logout/re-login ────
+        _sig_date = None
+        if "scan_date" in sigs.columns:
+            _sig_date = sigs["scan_date"].dropna().max()
+        _today_date = now_6p.date()
+
+        if _sig_date is not None:
+            import pandas as _pd_date
+            try:
+                _sig_date_obj = _pd_date.Timestamp(_sig_date).date()
+            except Exception:
+                _sig_date_obj = None
+
+            if _sig_date_obj == _today_date:
+                _freshness_color = "#22c55e"
+                _freshness_label = f"Signals from today ({_sig_date_obj.strftime('%d %b %Y')})"
+            else:
+                _freshness_color = "#f59e0b"
+                _days_old = (_today_date - _sig_date_obj).days if _sig_date_obj else "?"
+                _freshness_label = (
+                    f"⚠ Signals from {_sig_date_obj.strftime('%d %b %Y') if _sig_date_obj else 'unknown date'} "
+                    f"({_days_old} day{'s' if _days_old != 1 else ''} ago) — "
+                    f"run ⚡ 6-Pillar Intraday Scan for today's signals"
+                )
+
+            st.markdown(
+                f'<div style="font-size:12px;color:{_freshness_color};'
+                f'padding:4px 8px;background:{"#052e16" if _sig_date_obj == _today_date else "#431407"}; '
+                f'border-radius:6px;margin-bottom:6px">{_freshness_label}</div>',
+                unsafe_allow_html=True,
+            )
+
+        # ── Session-state scan timestamp (set in same session only) ──────────
+        last_scan_ts = st.session_state.get("_6p_scan_ts")
+        if last_scan_ts:
+            mins_ago = int((now_6p - last_scan_ts).total_seconds() / 60)
+            st.caption(f"This session: scanned {mins_ago} min ago at {last_scan_ts.strftime('%H:%M:%S')} IST")
 
         # ── Inject live LTP ──────────────────────────────────────────────────
         live_ltp = st.session_state.get("_live_ltp", {})
