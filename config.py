@@ -305,3 +305,19 @@ INTRADAY_GRADE_APLUS       = 27
 INTRADAY_GRADE_A           = 24
 INTRADAY_GRADE_B           = 19
 INTRADAY_GRADE_C           = 13
+
+# ============================================================
+# ENTRY QUALITY GUARDS — applied at auto-trade fire time
+# Prevents chasing a spike and ensures RR still makes sense
+# at the actual fill price (not the original signal price).
+# ============================================================
+# Max acceptable "chase" above the trigger level (for BUY) or
+# below it (for SHORT).  Uses the larger of:
+#   • fixed % of the trigger price   (ENTRY_MAX_CHASE_PCT)
+#   • ATR-scaled distance            (ENTRY_ATR_CHASE_MULT × ATR)
+# so volatile stocks get a bigger allowed band automatically.
+ENTRY_MAX_CHASE_PCT  = 0.005   # 0.5% fixed allowance
+ENTRY_ATR_CHASE_MULT = 0.25    # 0.25 × ATR adaptive allowance
+# Minimum live R:R at actual entry LTP before firing.
+# T1 below entry after a spike → RR < 0 → trade blocked.
+ENTRY_MIN_RR_AT_FIRE = 1.0     # (T1−entry)/(entry−SL) must be ≥ 1.0

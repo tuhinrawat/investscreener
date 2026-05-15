@@ -732,6 +732,41 @@ if "_entry_confirm_since" not in st.session_state:
     st.session_state["_entry_confirm_since"] = {}
 _ENTRY_CONFIRM_SECS = 30   # require 30 s sustained above entry before firing
 
+
+def _entry_ok(
+    ltp: float, entry: float, sl: float, t1: float,
+    atr: float = 0, is_buy: bool = True,
+) -> "tuple[bool, bool, float]":
+    """Entry quality guards checked at the moment auto-trade fires.
+
+    Returns (in_zone, rr_ok, max_chase) where:
+      in_zone  — LTP is within the retest zone around the trigger
+                 (price ran too far → spike, not a clean breakout → skip)
+      rr_ok    — live R:R at current LTP >= config.ENTRY_MIN_RR_AT_FIRE
+                 (T1 below actual fill price after a spike → block trade)
+      max_chase — the computed allowance in price units
+    """
+    if entry <= 0:
+        return True, True, 0.0
+    max_chase = (
+        max(entry * config.ENTRY_MAX_CHASE_PCT, config.ENTRY_ATR_CHASE_MULT * atr)
+        if atr > 0 else entry * config.ENTRY_MAX_CHASE_PCT
+    )
+    if is_buy:
+        in_zone     = entry <= ltp <= entry + max_chase
+        live_risk   = ltp - sl        if sl   > 0 and ltp > sl   else 0.0
+        live_reward = t1  - ltp       if t1   > 0 and t1  > ltp  else 0.0
+    else:  # SHORT
+        in_zone     = entry - max_chase <= ltp <= entry
+        live_risk   = sl  - ltp        if sl   > 0 and sl  > ltp  else 0.0
+        live_reward = ltp - t1         if t1   > 0 and ltp > t1   else 0.0
+    rr_ok = (
+        live_risk > 0 and live_reward > 0
+        and live_reward / live_risk >= config.ENTRY_MIN_RR_AT_FIRE
+    )
+    return in_zone, rr_ok, max_chase
+
+
 # ── Scalp trade tracking ──────────────────────────────────────────────────────
 # scalp_triggered: {(date_str, sym, direction): trade_id} — prevents re-entering
 # scalp_open:      {trade_id: {sym, stop, t1, signal_type, entry, cap, setup_type}}
@@ -6305,14 +6340,23 @@ def _intraday_scalp_live():
                 f" | stop_atr_based={_stop_obs:.2f}"
             )
 
-        # ── Confirmation timer (10 s sustained breakout) ──────────────────────
+        # ── Confirmation timer (5 s sustained breakout + entry guards) ────────
         _sc_key_long  = f"_sc_long_{_sym}"
         _sc_key_short = f"_sc_short_{_sym}"
-        if _status == "LONG":
+        _sc_entry_px  = float(_scalp_sig.get("scalp_entry") or _ltp_now or 0)
+        _sc_stop_px   = float(_scalp_sig.get("scalp_stop")  or 0)
+        _sc_t1_px     = float(_scalp_sig.get("scalp_t1")    or 0)
+        _sc_atr       = float(_row.get("atr_14") or 0)
+        _sc_is_long   = _status == "LONG"
+        _in_zone_sc, _rr_ok_sc, _ = _entry_ok(
+            _ltp_now, _sc_entry_px, _sc_stop_px, _sc_t1_px, _sc_atr, is_buy=_sc_is_long,
+        ) if _sc_entry_px > 0 else (True, True, 0.0)
+
+        if _status == "LONG" and _in_zone_sc:
             if _sc_key_long not in _scalp_confirm_map:
                 _scalp_confirm_map[_sc_key_long] = datetime.now(_IST)
             _scalp_confirm_map.pop(_sc_key_short, None)
-        elif _status == "SHORT":
+        elif _status == "SHORT" and _in_zone_sc:
             if _sc_key_short not in _scalp_confirm_map:
                 _scalp_confirm_map[_sc_key_short] = datetime.now(_IST)
             _scalp_confirm_map.pop(_sc_key_long, None)
@@ -6366,8 +6410,9 @@ def _intraday_scalp_live():
             _scalp_sig["scalp_reason"] = _sc_reason
             _scalp_skip_log.append({"symbol": _sym, "reason": _sc_reason})
 
-        # ── Auto-trade when confirmed + within limits ─────────────────────────
+        # ── Auto-trade when confirmed + within limits + entry guards ─────────
         if (_status in ("LONG", "SHORT") and _sc_confirmed
+                and _in_zone_sc and _rr_ok_sc
                 and _sc_within_limit and not _ltp_stale_sc
                 and _trade_mode != "off"):
 
@@ -6743,15 +6788,23 @@ def _intraday_long_live():
         _paper_key  = (_today_str, sym)
         _real_key   = (_today_str, sym)
 
-        # ── False-breakout confirmation timer ────────────────────────────────
-        # Record the first moment LTP crossed entry. Only auto-trade after the
-        # price has stayed above entry for _ENTRY_CONFIRM_SECS seconds.
+        # ── Entry quality guards (max-chase + RR recheck) ───────────────────
+        _atr_lng  = float(r.get("atr_14") or 0)
+        _sl_lng   = float(r.get("intraday_stop") or 0)
+        _t1_lng   = float(r.get("intraday_t1")   or 0)
+        _in_zone_lng, _rr_ok_lng, _ = _entry_ok(
+            ltp_now, entry_val, _sl_lng, _t1_lng, _atr_lng, is_buy=True
+        )
+
+        # ── Confirmation timer: only tick when price is in the retest zone ────
+        # Timer starts on first tick inside zone, resets if price exits zone
+        # (fell below entry = failed breakout; or spiked above max-chase = stale
+        # breakout — wait for pullback before starting a fresh 30-s window).
         _confirm_map = st.session_state.setdefault("_entry_confirm_since", {})
-        if live_status == "TRIGGERED":
+        if live_status == "TRIGGERED" and _in_zone_lng:
             if sym not in _confirm_map:
                 _confirm_map[sym] = datetime.now(_IST)
         else:
-            # Price fell back below entry — reset timer
             _confirm_map.pop(sym, None)
 
         _confirm_ts  = _confirm_map.get(sym)
@@ -6760,7 +6813,9 @@ def _intraday_long_live():
             (datetime.now(_IST) - _confirm_ts).total_seconds() >= _ENTRY_CONFIRM_SECS
         )
 
-        if live_status == "TRIGGERED" and _confirmed and _within_limit and not _ltp_stale:
+        if (live_status == "TRIGGERED" and _confirmed
+                and _in_zone_lng and _rr_ok_lng
+                and _within_limit and not _ltp_stale):
 
             # ── PAPER mode ────────────────────────────────────────────────────
             if (_trade_mode == "paper"
@@ -7270,10 +7325,18 @@ def _intraday_short_live():
         _paper_key  = (_today_str, sym)
         _real_key   = (_today_str, sym)
 
-        # ── False-breakout confirmation timer (shorts) ───────────────────────
+        # ── Entry quality guards (max-chase + RR recheck) ───────────────────
+        _atr_sht  = float(r.get("atr_14") or 0)
+        _sl_sht   = float(r.get("intraday_stop") or 0)
+        _t1_sht   = float(r.get("intraday_t1")   or 0)
+        _in_zone_sht, _rr_ok_sht, _ = _entry_ok(
+            ltp_now, entry_val, _sl_sht, _t1_sht, _atr_sht, is_buy=False
+        )
+
+        # ── Confirmation timer (SHORT): only tick when price in retest zone ──
         _confirm_map_s = st.session_state.setdefault("_entry_confirm_since", {})
         _short_key = f"_short_{sym}"
-        if short_status == "TRIGGERED":
+        if short_status == "TRIGGERED" and _in_zone_sht:
             if _short_key not in _confirm_map_s:
                 _confirm_map_s[_short_key] = datetime.now(_IST)
         else:
@@ -7285,7 +7348,9 @@ def _intraday_short_live():
             (datetime.now(_IST) - _confirm_ts_s).total_seconds() >= _ENTRY_CONFIRM_SECS
         )
 
-        if short_status == "TRIGGERED" and _confirmed_s and _within_limit and not _ltp_stale:
+        if (short_status == "TRIGGERED" and _confirmed_s
+                and _in_zone_sht and _rr_ok_sht
+                and _within_limit and not _ltp_stale):
 
             # ── PAPER mode ────────────────────────────────────────────────────
             if (_trade_mode == "paper"
@@ -9605,8 +9670,17 @@ with tab_6pillar:
                         elif _altp <= _aentry * 1.003:
                             _alive_status = "APPROACHING"
 
-                # ── Confirmation timer (false-breakout filter) ────────────────
-                if _alive_status == "TRIGGERED":
+                # ── Entry quality guards (max-chase + RR recheck) ────────────
+                _a6_atr  = float(_ar.get("atr") or 0)
+                _a6_buy  = _asig == "BUY"
+                _in_zone_6p, _rr_ok_6p, _ = _entry_ok(
+                    _altp, _aentry, _asl, _at1, _a6_atr, is_buy=_a6_buy
+                )
+
+                # ── Confirmation timer: only tick when in retest zone ─────────
+                # If price spiked above trigger (beyond max-chase), reset timer
+                # and wait for pullback before starting fresh 30-s window.
+                if _alive_status == "TRIGGERED" and _in_zone_6p:
                     if _asym not in _6p_confirm:
                         _6p_confirm[_asym] = datetime.now(_IST)
                 else:
@@ -9622,6 +9696,7 @@ with tab_6pillar:
                 _within_cap    = _acap > 0 and _remaining_cap >= _acap
 
                 if (_alive_status == "TRIGGERED" and _6p_confirmed
+                        and _in_zone_6p and _rr_ok_6p
                         and _within_cap
                         and _paper_key_6p not in _6p_triggered
                         and _ar.get("trade_log_id") is None):
