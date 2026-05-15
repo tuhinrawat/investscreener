@@ -498,7 +498,10 @@ def start_ticker(api_key: str, access_token: str, token_symbol_map: dict) -> boo
 
     stop_ticker()   # disconnect any existing socket cleanly
 
-    if not api_key or not access_token or not token_symbol_map:
+    # token_symbol_map may be empty ({}) when called from ws_manager — that is
+    # intentional because ws_manager subscribes tokens after connect via
+    # _deferred_subscribe().  Only block if credentials are missing.
+    if not api_key or not access_token:
         return False
 
     with _TICKER_LOCK:
