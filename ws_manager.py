@@ -130,7 +130,9 @@ def start(api_key: str, access_token: str, token_symbol_map: dict) -> bool:
     # Bulk-subscribe all tokens in batches of 500 once connected
     # Give the socket 1 s to establish before subscribing
     def _deferred_subscribe():
-        time.sleep(1.5)
+        # 0.5s is enough for the WS handshake to complete.
+        # Reducing from 1.5s means prices arrive ~1s sooner on app startup.
+        time.sleep(0.5)
         with _kc._TICKER_LOCK:
             _kc._TICKER_SYM_MAP.update(token_symbol_map)
         _subscribe_all(token_symbol_map)

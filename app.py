@@ -2174,11 +2174,32 @@ _global_ltp_updater()
 # ── Live-price status pill (always visible, tells user if feed is flowing) ────
 @st.fragment(run_every=1)
 def _ltp_status_pill():
-    """1-second fragment: shows a small pill in the top area with feed health."""
+    """
+    1-second fragment: shows a feed health pill so the user can immediately
+    tell if WebSocket prices are flowing or stale.
+
+    States:
+      🟢 LIVE  · N prices    — WS delivering prices, updated < 3s ago
+      🟡 Warming up…         — WS started but _live_ltp not yet populated
+                               (initial subscription window, ~1–3s)
+      🟡 Refreshing…         — last update 3–10s ago
+      🔴 STALE               — no update for > 10s (WS may have dropped)
+      🔴 No live prices      — WS not connected / user not authenticated
+    """
     _ltp = st.session_state.get("_live_ltp", {})
     _ts  = st.session_state.get("_live_ltp_ts")
     _n   = len(_ltp)
-    if _n == 0:
+    _ws_started = _ws_manager.is_started()
+
+    if _n == 0 and _ws_started and _is_market_open():
+        # WS thread is alive but hasn't delivered prices yet → still warming up
+        _pill_html = (
+            '<span style="display:inline-flex;align-items:center;gap:5px;'
+            'background:#1e293b;border:1px solid #334155;border-radius:20px;'
+            'padding:2px 10px;font-size:0.7rem;color:#f59e0b">'
+            '⏳ Warming up — receiving live prices…</span>'
+        )
+    elif _n == 0:
         _pill_html = (
             '<span style="display:inline-flex;align-items:center;gap:5px;'
             'background:#1e293b;border:1px solid #334155;border-radius:20px;'
@@ -2187,15 +2208,16 @@ def _ltp_status_pill():
         )
     else:
         _age = (datetime.now(_IST) - _ts).total_seconds() if _ts else 9999
+        _sub_count = _ws_manager.subscription_count()
         if _age < 3:
             _dot, _col = "●", "#22c55e"
-            _label = f"LIVE · {_n:,} prices"
+            _label = f"LIVE · {_n:,} prices ({_sub_count:,} subscribed)"
         elif _age < 10:
             _dot, _col = "●", "#f59e0b"
-            _label = f"Refreshing… {int(_age)}s ago"
+            _label = f"Refreshing… last tick {int(_age)}s ago"
         else:
             _dot, _col = "●", "#ef4444"
-            _label = f"STALE · last update {int(_age)}s ago"
+            _label = f"STALE · no tick for {int(_age)}s — check WebSocket"
         _pill_html = (
             f'<span style="display:inline-flex;align-items:center;gap:5px;'
             f'background:#0f172a;border:1px solid #1e293b;border-radius:20px;'
@@ -3137,12 +3159,21 @@ with tab_screener:
         _fdf = _base.copy()
         if _q:
             _fdf = _fdf[_fdf["tradingsymbol"].str.contains(_q.strip(), case=False, na=False, regex=False)]
-        # Inject live LTP from WebSocket prices
+        # LTP source strategy:
+        # - Market open  → WebSocket is the single source of truth.
+        #                  No DB fallback. Blank ("—") if WS has no price yet.
+        # - Market closed → DB last-session close is the correct price
+        #                   (market is not trading, WS would be stale/empty anyway).
         _live = st.session_state.get("_live_ltp", {})
-        if _live and "tradingsymbol" in _fdf.columns:
-            _injected = _fdf["tradingsymbol"].map(_live)
-            _fdf = _fdf.copy()
-            _fdf["ltp"] = _injected.combine_first(_fdf["ltp"])
+        _fdf = _fdf.copy()
+        if "tradingsymbol" in _fdf.columns:
+            if _is_market_open():
+                # Override ltp column entirely from WebSocket — NaN = "—" in table
+                _fdf["ltp"] = _fdf["tradingsymbol"].map(_live)
+            elif _live:
+                # Market closed but WS somehow has prices — still use them, fall back to DB
+                _fdf["ltp"] = _fdf["tradingsymbol"].map(_live).combine_first(_fdf["ltp"])
+            # else: market closed, no WS prices → keep DB last-session close (correct)
         _dc = [c for c in _dc if c in _fdf.columns]
         _fmts = {
             "ltp": "₹{:,.2f}",
@@ -5568,17 +5599,33 @@ def _intraday_paper_banner():
     _live_ltp_now  = st.session_state.get("_live_ltp", {})
     _open_mtm      = 0.0
     _capital_deployed = 0
+    _missing_prices: list[str] = []
     for _ppid, _pp in _open_pt.items():
-        _p_ltp    = _live_ltp_now.get(_pp["sym"], _pp.get("entry", 0))
-        _dir      = -1 if _pp.get("signal_type") in ("SELL_BELOW", "SELL_ORB") else 1
+        # WebSocket is the single source of truth for live prices.
+        # If WS has no price yet (e.g. WS warming up), skip the MTM
+        # contribution rather than falling back to entry price (which
+        # would show false 0 P&L and could mislead the daily gate logic).
+        _p_ltp = _live_ltp_now.get(_pp["sym"])
         _slot_cap = _pp.get("cap", config.PAPER_CAP_MODERATE)
-        _p_qty    = max(1, int(_slot_cap / (_pp.get("entry") or 1)))
-        _open_mtm         += _dir * (_p_ltp - _pp["entry"]) * _p_qty
         _capital_deployed += _slot_cap
+        if not _p_ltp:
+            _missing_prices.append(_pp.get("sym", "?"))
+            continue
+        _dir   = -1 if _pp.get("signal_type") in ("SELL_BELOW", "SELL_ORB") else 1
+        _p_qty = max(1, int(_slot_cap / (_pp.get("entry") or 1)))
+        _open_mtm += _dir * (_p_ltp - _pp["entry"]) * _p_qty
 
     _total_pnl   = _today_paper_pnl + _open_mtm   # realised + unrealised
     _total_ret   = (_total_pnl / _cap * 100) if _cap else 0.0
     _pnl_color   = "#22c55e" if _total_pnl >= 0 else "#ef4444"
+    # Show which positions have missing WS prices (excluded from MTM)
+    if _missing_prices:
+        st.warning(
+            f"⚡ Live prices not yet available for: **{', '.join(_missing_prices)}** "
+            "— MTM excludes these positions until WebSocket delivers their prices "
+            "(usually within 2–3 seconds of market open or app load).",
+            icon="📡",
+        )
 
     # ── Update high-water mark (based on realized P&L — stable, not swung by MTM) ─
     _hwm = max(st.session_state.get("paper_day_hwm_pct", 0.0), _ret_pct)
@@ -7962,11 +8009,36 @@ def _activity_log_live():
                 icon="⚠️",
             )
             if st.button("⏰ Force Close All Open Paper Trades (EOD)", type="primary", key="_eod_force_close"):
-                _ltp_snap = _kc_module.get_all_ticker_prices() or st.session_state.get("_live_ltp", {})
-                # Close from session state (in-memory)
+                # Price priority for EOD close:
+                # 1. WebSocket (last tick) — most accurate
+                # 2. Kite REST OHLC close — market-close price
+                # Skip (warn) if neither is available — never fall back to entry
+                _ltp_snap = dict(_kc_module.get_all_ticker_prices() or {})
+                _ltp_snap.update(st.session_state.get("_live_ltp") or {})
+                # Batch REST OHLC for any symbols still missing
+                _all_eod_syms = list({
+                    _t.get("sym") for _t in list(st.session_state.get("paper_open", {}).values())
+                    + list(st.session_state.get("scalp_open", {}).values())
+                    if _t.get("sym") and not _ltp_snap.get(_t.get("sym"))
+                })
+                if _all_eod_syms:
+                    try:
+                        _kc_eod = st.session_state.get("kite_client")
+                        if _kc_eod and getattr(_kc_eod, "authenticated", False):
+                            _ohlc_r = _kc_eod.get_ohlc_batch([f"NSE:{s}" for s in _all_eod_syms])
+                            for _es in _all_eod_syms:
+                                _ep = (_ohlc_r.get(f"NSE:{_es}") or {}).get("last_price")
+                                if _ep:
+                                    _ltp_snap[_es] = float(_ep)
+                    except Exception:
+                        pass
+                _eod_skipped: list[str] = []
                 for _fc_id, _fc_t in list(st.session_state.get("paper_open", {}).items()):
                     _fc_sym = _fc_t.get("sym", "")
-                    _fc_ltp = _ltp_snap.get(_fc_sym) or _fc_t.get("entry", 0)
+                    _fc_ltp = _ltp_snap.get(_fc_sym)
+                    if not _fc_ltp:
+                        _eod_skipped.append(_fc_sym)
+                        continue
                     try:
                         db.close_trade(_fc_id, _fc_ltp, "CLOSED", f"⏰ EOD manual force-close @ ₹{_fc_ltp:.2f}")
                         st.session_state["paper_open"].pop(_fc_id, None)
@@ -7974,7 +8046,10 @@ def _activity_log_live():
                         pass
                 for _fc_id, _fc_t in list(st.session_state.get("scalp_open", {}).items()):
                     _fc_sym = _fc_t.get("sym", "")
-                    _fc_ltp = _ltp_snap.get(_fc_sym) or _fc_t.get("entry", 0)
+                    _fc_ltp = _ltp_snap.get(_fc_sym)
+                    if not _fc_ltp:
+                        _eod_skipped.append(_fc_sym)
+                        continue
                     try:
                         db.close_trade(_fc_id, _fc_ltp, "CLOSED", f"⏰ EOD manual force-close @ ₹{_fc_ltp:.2f}")
                         st.session_state["scalp_open"].pop(_fc_id, None)
@@ -7984,13 +8059,18 @@ def _activity_log_live():
                 try:
                     for _dbt in db.get_open_paper_trades(user_id=_uid):
                         _dbt_sym = _dbt.get("tradingsymbol", "")
-                        _dbt_ltp = _ltp_snap.get(_dbt_sym) or _dbt.get("actual_entry", 0)
+                        _dbt_ltp = _ltp_snap.get(_dbt_sym)
+                        if not _dbt_ltp:
+                            _eod_skipped.append(_dbt_sym + "(DB)")
+                            continue
                         try:
                             db.close_trade(_dbt["id"], _dbt_ltp, "CLOSED", "⏰ EOD manual force-close (DB)")
                         except Exception:
                             pass
                 except Exception:
                     pass
+                if _eod_skipped:
+                    st.warning(f"No live price found for: {', '.join(_eod_skipped)} — not closed. Retry or close manually.")
                 st.session_state["_actlog_stale"] = True
                 st.success("All open paper trades closed.")
                 st.rerun()
