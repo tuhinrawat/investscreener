@@ -9464,7 +9464,7 @@ def _activity_log_live():
 with tab_6pillar:
     _6p_bust = st.session_state.get("_6p_cache_bust", 0)
 
-    @st.fragment(run_every=30)
+    @st.fragment(run_every=2)
     def _6pillar_tab_live():
         import pandas as pd
 
@@ -9535,6 +9535,192 @@ with tab_6pillar:
         live_ltp = st.session_state.get("_live_ltp", {})
         sigs = sigs.copy()
         sigs["LTP"] = sigs["tradingsymbol"].map(live_ltp).fillna(sigs["entry"])
+
+        # ══════════════════════════════════════════════════════════════════════
+        # AUTO-TRADE ENGINE — mirrors existing intraday auto-trade pattern
+        # Fires when: status reaches TRIGGERED + price holds for 30s (false-
+        # breakout filter) + capital available + not already logged today
+        # ══════════════════════════════════════════════════════════════════════
+        _6p_mode    = st.session_state.get("_6p_trade_mode", "paper")
+        _ltp_stale  = st.session_state.get("_ltp_stale", False)
+        _6p_uid     = st.session_state.get("kite_user_id", "")
+        _6p_kc_at   = st.session_state.get("kite_client")
+        _6p_kite_at = _6p_kc_at is not None and getattr(_6p_kc_at, "authenticated", False)
+
+        # Capital tier by grade — same thresholds as pivot confidence tiers
+        def _6p_cap_tier(grade):
+            if grade in ("A+", "A"):
+                return config.PAPER_CAP_STRONG,   "STRONG"
+            if grade == "B":
+                return config.PAPER_CAP_MODERATE, "MODERATE"
+            if grade == "C":
+                return config.PAPER_CAP_MARGINAL, "MARGINAL"
+            return 0, "LOW"   # grade D never auto-trades
+
+        _deployed_6p = sum(
+            v.get("cap", 0) for v in st.session_state.get("_6p_paper_open", {}).values()
+        )
+        _avail_bal = st.session_state.get("_paper_balance", float(config.PAPER_CAPITAL))
+        _6p_confirm = st.session_state.setdefault("_6p_confirm_since", {})
+        _6p_triggered = st.session_state.setdefault("_6p_paper_triggered", {})
+        _today_6p = now_6p.strftime("%Y-%m-%d")
+
+        _market_open_6p = (
+            now_6p.hour > 9 or (now_6p.hour == 9 and now_6p.minute >= 15)
+        ) and (now_6p.hour < 15 or (now_6p.hour == 15 and now_6p.minute < 10))
+
+        if _market_open_6p and not _ltp_stale:
+            for _, _ar in sigs.iterrows():
+                _asym   = _ar["tradingsymbol"]
+                _asig   = _ar.get("signal", "")
+                _astat  = _ar.get("status") or "WATCHING"
+                _aentry = float(_ar.get("entry") or 0)
+                _asl    = float(_ar.get("stop_loss") or 0)
+                _at1    = float(_ar.get("t1") or 0)
+                _at2    = float(_ar.get("t2") or 0)
+                _agrade = _ar.get("grade", "D")
+                _altp   = float(live_ltp.get(_asym) or _aentry or 0)
+                _acap, _atier = _6p_cap_tier(_agrade)
+
+                if _acap == 0 or _asig not in ("BUY", "SHORT"):
+                    continue
+
+                _paper_key_6p = (_today_6p, _asym)
+
+                # ── Compute live status from LTP (same logic as refresh fn) ──
+                _alive_status = _astat
+                if _aentry > 0 and _altp > 0:
+                    if _asig == "BUY":
+                        if _asl and _altp <= _asl:
+                            _alive_status = "HIT_SL"
+                        elif _altp >= _aentry:
+                            _alive_status = "TRIGGERED"
+                        elif _altp >= _aentry * 0.997:
+                            _alive_status = "APPROACHING"
+                    else:
+                        if _asl and _altp >= _asl:
+                            _alive_status = "HIT_SL"
+                        elif _altp <= _aentry:
+                            _alive_status = "TRIGGERED"
+                        elif _altp <= _aentry * 1.003:
+                            _alive_status = "APPROACHING"
+
+                # ── Confirmation timer (false-breakout filter) ────────────────
+                if _alive_status == "TRIGGERED":
+                    if _asym not in _6p_confirm:
+                        _6p_confirm[_asym] = datetime.now(_IST)
+                else:
+                    _6p_confirm.pop(_asym, None)
+
+                _conf_ts  = _6p_confirm.get(_asym)
+                _6p_confirmed = (
+                    _conf_ts is not None and
+                    (datetime.now(_IST) - _conf_ts).total_seconds() >= _ENTRY_CONFIRM_SECS
+                )
+
+                _remaining_cap = _avail_bal - _deployed_6p
+                _within_cap    = _acap > 0 and _remaining_cap >= _acap
+
+                if (_alive_status == "TRIGGERED" and _6p_confirmed
+                        and _within_cap
+                        and _paper_key_6p not in _6p_triggered
+                        and _ar.get("trade_log_id") is None):
+
+                    _tprice = _altp if _altp > 0 else _aentry
+                    _qty_6p = max(1, int(_acap / _tprice)) if _tprice else 1
+                    _sig_t  = "BUY_ABOVE" if _asig == "BUY" else "SELL_BELOW"
+
+                    try:
+                        if _6p_mode == "real" and _6p_kite_at:
+                            _koid = _6p_kc_at.place_order(
+                                tradingsymbol=_asym, exchange="NSE",
+                                transaction_type="BUY" if _asig == "BUY" else "SELL",
+                                quantity=_qty_6p, order_type="MARKET", product="MIS",
+                            )
+                            _notes_6p = (f"💸 Real 6P — auto TRIGGERED @ ₹{_tprice:.2f} "
+                                         f"(Grade {_agrade} · {_atier} · ₹{_acap:,})")
+                            _is_paper_6p = False
+                        else:
+                            _koid = None
+                            _notes_6p = (f"📄 Paper 6P — auto TRIGGERED @ ₹{_tprice:.2f} "
+                                         f"(Grade {_agrade} · {_atier} · ₹{_acap:,})")
+                            _is_paper_6p = True
+
+                        _tid_6p = db.log_trade({
+                            "trade_date":       now_6p.date(),
+                            "tradingsymbol":    _asym,
+                            "instrument_token": int(_ar.get("instrument_token") or 0),
+                            "setup_type":       "6PILLAR",
+                            "signal_type":      _sig_t,
+                            "rec_entry":        _aentry,
+                            "rec_stop":         _asl,
+                            "rec_t1":           _at1,
+                            "rec_t2":           _at2,
+                            "kite_user_id":     _6p_uid,
+                            "kite_order_id":    str(_koid) if _koid else None,
+                            "quantity":         _qty_6p,
+                            "actual_entry":     _tprice,
+                            "status":           "OPEN",
+                            "notes":            _notes_6p,
+                            "is_paper_trade":   _is_paper_6p,
+                        })
+
+                        db.update_intraday_signal_status(
+                            _asym, "TRIGGERED",
+                            trade_log_id=_tid_6p,
+                            trade_mode=_6p_mode,
+                            actual_entry=_tprice,
+                        )
+                        _6p_triggered[_paper_key_6p] = _tid_6p
+                        st.session_state.setdefault("_6p_paper_open", {})[_tid_6p] = {
+                            "sym": _asym, "stop": _asl, "t1": _at1, "t2": _at2,
+                            "signal_type": _sig_t, "entry": _tprice, "cap": _acap,
+                        }
+                        _deployed_6p += _acap
+                        _6p_confirm.pop(_asym, None)
+
+                    except Exception as _ate:
+                        print(f"⚠ 6P auto-trade failed for {_asym}: {_ate}")
+
+        # ── Auto-exit: monitor open 6P trades for SL / T1 hit ────────────────
+        _6p_open = st.session_state.get("_6p_paper_open", {})
+        for _oid, _ot in list(_6p_open.items()):
+            _osym  = _ot.get("sym", "")
+            _oltp  = float(live_ltp.get(_osym) or 0)
+            _osl   = float(_ot.get("stop", 0))
+            _ot1   = float(_ot.get("t1", 0))
+            _ot2   = float(_ot.get("t2", 0))
+            _osigt = _ot.get("signal_type", "BUY_ABOVE")
+            if not _oltp:
+                continue
+            _exit_price = None
+            _exit_stat  = None
+            if _osigt == "BUY_ABOVE":
+                if _osl and _oltp <= _osl:
+                    _exit_price, _exit_stat = _oltp, "HIT_SL"
+                elif _ot2 and _oltp >= _ot2:
+                    _exit_price, _exit_stat = _oltp, "CLOSED_T2"
+                elif _ot1 and _oltp >= _ot1 and not _ot.get("partial_booked"):
+                    _exit_price, _exit_stat = _oltp, "CLOSED_T1"
+                    _ot["partial_booked"] = True
+            else:
+                if _osl and _oltp >= _osl:
+                    _exit_price, _exit_stat = _oltp, "HIT_SL"
+                elif _ot2 and _oltp <= _ot2:
+                    _exit_price, _exit_stat = _oltp, "CLOSED_T2"
+                elif _ot1 and _oltp <= _ot1 and not _ot.get("partial_booked"):
+                    _exit_price, _exit_stat = _oltp, "CLOSED_T1"
+                    _ot["partial_booked"] = True
+
+            if _exit_price and _exit_stat and _exit_stat not in ("CLOSED_T1",):
+                try:
+                    db.close_trade(int(_oid), _exit_price, _exit_stat,
+                                   notes=f"6P auto-exit @ ₹{_exit_price:.2f}")
+                    _sig_stat = "HIT_SL" if _exit_stat == "HIT_SL" else "AT_T2"
+                    db.update_intraday_signal_status(_osym, _sig_stat)
+                    _6p_open.pop(_oid, None)
+                except Exception as _exe:
+                    print(f"⚠ 6P auto-exit failed for {_osym}: {_exe}")
 
         # ── Status color map ─────────────────────────────────────────────────
         _STATUS_COLOR = {
