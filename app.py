@@ -2151,11 +2151,14 @@ def _global_ltp_updater():
                 _nifty_pct = (_nifty_ltp_f - _nf_prev) / _nf_prev * 100
                 st.session_state["_nifty_intraday_pct"] = round(_nifty_pct, 3)
 
-        # Push prices into window.__ltp__ so the JS DOM patcher applies
-        # them to [data-symbol] cells without waiting for a Streamlit rerun.
-        import json as _json_ltp
-        import streamlit.components.v1 as _stc_ltp
-        _prices_json = _json_ltp.dumps(_new_ltp)
+    # Push prices into window.__ltp__ unconditionally — fall back to whatever
+    # is already in session state so the JS DOM patcher always has data even
+    # during brief WebSocket gaps or when _ws_prices is momentarily empty.
+    import json as _json_ltp
+    import streamlit.components.v1 as _stc_ltp
+    _push_ltp = st.session_state.get("_live_ltp") or {}
+    if _push_ltp:
+        _prices_json = _json_ltp.dumps(_push_ltp)
         _stc_ltp.html(f"""
 <script>
 (function(){{
@@ -2167,6 +2170,41 @@ def _global_ltp_updater():
 
 
 _global_ltp_updater()
+
+# ── Live-price status pill (always visible, tells user if feed is flowing) ────
+@st.fragment(run_every=1)
+def _ltp_status_pill():
+    """1-second fragment: shows a small pill in the top area with feed health."""
+    _ltp = st.session_state.get("_live_ltp", {})
+    _ts  = st.session_state.get("_live_ltp_ts")
+    _n   = len(_ltp)
+    if _n == 0:
+        _pill_html = (
+            '<span style="display:inline-flex;align-items:center;gap:5px;'
+            'background:#1e293b;border:1px solid #334155;border-radius:20px;'
+            'padding:2px 10px;font-size:0.7rem;color:#ef4444">'
+            '⚠ No live prices — WebSocket not connected</span>'
+        )
+    else:
+        _age = (datetime.now(_IST) - _ts).total_seconds() if _ts else 9999
+        if _age < 3:
+            _dot, _col = "●", "#22c55e"
+            _label = f"LIVE · {_n:,} prices"
+        elif _age < 10:
+            _dot, _col = "●", "#f59e0b"
+            _label = f"Refreshing… {int(_age)}s ago"
+        else:
+            _dot, _col = "●", "#ef4444"
+            _label = f"STALE · last update {int(_age)}s ago"
+        _pill_html = (
+            f'<span style="display:inline-flex;align-items:center;gap:5px;'
+            f'background:#0f172a;border:1px solid #1e293b;border-radius:20px;'
+            f'padding:2px 10px;font-size:0.7rem;color:{_col}">'
+            f'{_dot} {_label}</span>'
+        )
+    st.markdown(_pill_html, unsafe_allow_html=True)
+
+_ltp_status_pill()
 
 # ── Auto outcome-check for yesterday's signals (runs once per session) ────────
 if not st.session_state.get("_signal_outcomes_checked"):
@@ -2991,6 +3029,17 @@ with tab_screener:
     )
     display_cols = [c for c in display_cols if c in filtered.columns]
 
+    # Persist the base filtered df (BEFORE search) and display metadata so the
+    # live-refresh fragment can re-render the table with current LTP prices without
+    # re-executing the entire filter pipeline.
+    st.session_state["_screener_live_base_df"]   = filtered.copy()
+    st.session_state["_screener_live_meta"] = {
+        "display_cols":  display_cols,
+        "verdict_col":   _verdict_col,
+        "ai_score_col":  _ai_score_col,
+        "style_cols":    _style_cols,
+    }
+
     # Pretty number formatting
     formatters = {
         "ltp": "₹{:,.2f}",
@@ -3070,16 +3119,87 @@ with tab_screener:
 
     _W = config.TREND_WEIGHTS
     _cc = st.column_config
-    st.dataframe(
-    styled,
-    use_container_width=True,
-    height=500,
-    hide_index=True,
-    column_config={
-        "tradingsymbol": _cc.TextColumn(
-            "Symbol",
-            help="NSE ticker symbol. Click the stock name in the detail panel below to see its full chart.",
-        ),
+    # ── Screener table rendered by a live fragment (run_every=2) ─────────────
+    # The fragment re-injects _live_ltp into the ltp column on every fire so
+    # prices stay current without re-running the entire filter pipeline.
+    @st.fragment(run_every=2)
+    def _screener_table_live():
+        _meta = st.session_state.get("_screener_live_meta", {})
+        _base = st.session_state.get("_screener_live_base_df", pd.DataFrame())
+        if _base.empty or not _meta:
+            return
+        _dc    = _meta.get("display_cols", [])
+        _vc    = _meta.get("verdict_col", [])
+        _asc   = _meta.get("ai_score_col", [])
+        _sc    = _meta.get("style_cols", [])
+        # Re-apply symbol search filter using widget session state
+        _q = st.session_state.get("screener_sym_search", "")
+        _fdf = _base.copy()
+        if _q:
+            _fdf = _fdf[_fdf["tradingsymbol"].str.contains(_q.strip(), case=False, na=False, regex=False)]
+        # Inject live LTP from WebSocket prices
+        _live = st.session_state.get("_live_ltp", {})
+        if _live and "tradingsymbol" in _fdf.columns:
+            _injected = _fdf["tradingsymbol"].map(_live)
+            _fdf = _fdf.copy()
+            _fdf["ltp"] = _injected.combine_first(_fdf["ltp"])
+        _dc = [c for c in _dc if c in _fdf.columns]
+        _fmts = {
+            "ltp": "₹{:,.2f}",
+            "blended_score":   "{:.1f}",
+            "composite_score": "{:.1f}",
+            "ai_score":        "{:.1f}",
+            "trend_score": "{:.1f}",
+            "rs_vs_nifty_3m": "{:+.2f}%",
+            "ret_5d": "{:+.2f}%",
+            "ret_1m": "{:+.2f}%",
+            "ret_3m": "{:+.2f}%",
+            "ret_6m": "{:+.2f}%",
+            "ret_1y": "{:+.2f}%",
+            "rsi_14": "{:.1f}",
+            "vol_expansion_ratio": "{:.2f}x",
+            "dist_from_52w_high_pct": "{:.1f}%",
+            "dist_from_50ema_pct": "{:+.1f}%",
+            "avg_turnover_cr": "₹{:.1f} Cr",
+            "support_20d": "₹{:,.2f}",
+            "resistance_20d": "₹{:,.2f}",
+        }
+        _fmts_valid = {k: v for k, v in _fmts.items() if k in _dc}
+        def _cr(val):
+            if pd.isna(val): return ""
+            return f"color: {'#22c55e' if val > 0 else '#ef4444' if val < 0 else ''}; font-weight: 600"
+        def _cvd(val):
+            import ai as _ai_loc
+            return f"color: {_ai_loc.VERDICT_COLOR.get(str(val).upper(), '#94a3b8')}; font-weight: 700"
+        def _cas(val):
+            try:
+                v = float(val)
+                if v >= 8:   return "color: #22c55e; font-weight: 700"
+                if v >= 6.5: return "color: #86efac; font-weight: 600"
+                if v >= 5:   return "color: #f59e0b; font-weight: 600"
+            except Exception:
+                pass
+            return "color: #ef4444; font-weight: 600"
+        _sc_valid  = [c for c in _sc  if c in _dc]
+        _styled = _fdf[_dc].style.format(_fmts_valid, na_rep="—")
+        if _sc_valid:
+            _styled = _styled.map(_cr, subset=_sc_valid)
+        if _vc:
+            _styled = _styled.map(_cvd, subset=[c for c in _vc if c in _dc])
+        if _asc:
+            _styled = _styled.map(_cas, subset=[c for c in _asc if c in _dc])
+        _W2 = config.TREND_WEIGHTS
+        _cc2 = st.column_config
+        st.dataframe(
+            _styled,
+            use_container_width=True,
+            height=500,
+            hide_index=True,
+            column_config={
+                "tradingsymbol": _cc2.TextColumn(
+                    "Symbol",
+                    help="NSE ticker symbol. Click the stock name in the detail panel below to see its full chart.",
+                ),
         "company_name": _cc.TextColumn(
             "Company",
             help="Full registered company name.",
@@ -3268,6 +3388,9 @@ with tab_screener:
         ),
     },
 )
+
+    # ── Invoke the live-refresh fragment — re-renders the table every 2s ──────
+    _screener_table_live()
 
     # Export button
     csv = filtered[display_cols].to_csv(index=False).encode("utf-8")
