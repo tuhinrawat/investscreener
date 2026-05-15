@@ -629,7 +629,7 @@ def compute_trade_charges(
     sell_val = float(exit_price) * int(qty)
     turnover = buy_val + sell_val
 
-    is_intraday = str(setup_type).upper() in ("INTRADAY", "SCALP")
+    is_intraday = str(setup_type).upper() in ("INTRADAY", "SCALP", "6PILLAR")
 
     if is_intraday:
         brokerage = min(20.0, 0.0003 * buy_val) + min(20.0, 0.0003 * sell_val)
