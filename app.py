@@ -3051,17 +3051,6 @@ with tab_screener:
     )
     display_cols = [c for c in display_cols if c in filtered.columns]
 
-    # Persist the base filtered df (BEFORE search) and display metadata so the
-    # live-refresh fragment can re-render the table with current LTP prices without
-    # re-executing the entire filter pipeline.
-    st.session_state["_screener_live_base_df"]   = filtered.copy()
-    st.session_state["_screener_live_meta"] = {
-        "display_cols":  display_cols,
-        "verdict_col":   _verdict_col,
-        "ai_score_col":  _ai_score_col,
-        "style_cols":    _style_cols,
-    }
-
     # Pretty number formatting
     formatters = {
         "ltp": "₹{:,.2f}",
@@ -3107,6 +3096,17 @@ with tab_screener:
     _style_cols  = ["ret_1y", "ret_6m", "ret_3m", "ret_1m", "ret_5d", "rs_vs_nifty_3m"]
     _verdict_col = [c for c in ["ai_verdict"] if c in display_cols]
     _ai_score_col = [c for c in ["ai_score", "blended_score"] if c in display_cols]
+
+    # Persist the base filtered df and display metadata so the live-refresh
+    # fragment can re-render with current WebSocket LTP every 2s without
+    # re-executing the whole filter pipeline.
+    st.session_state["_screener_live_base_df"] = filtered.copy()
+    st.session_state["_screener_live_meta"] = {
+        "display_cols": display_cols,
+        "verdict_col":  _verdict_col,
+        "ai_score_col": _ai_score_col,
+        "style_cols":   _style_cols,
+    }
 
     styled = (
         filtered[display_cols]
