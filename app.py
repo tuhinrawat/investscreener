@@ -2034,7 +2034,6 @@ def _global_ltp_updater():
         return
 
     _ws_prices = _kc_module.get_all_ticker_prices() or {}
-    _ws_alive = _kc_module.is_ticker_alive()
     if _ws_prices:
         _old = st.session_state.get("_live_ltp", {})
         st.session_state["_prev_ltp"] = dict(_old) if _old else {}
@@ -2051,42 +2050,7 @@ def _global_ltp_updater():
                 st.session_state["_nifty_intraday_pct"] = round(_nifty_pct, 3)
         return
 
-    # Fallback path: if WS is not flowing, backfill visible symbols via REST
-    # at low cadence so the app never freezes on stale DB LTPs.
-    if _ws_alive:
-        return
-    _last_rest_ts = float(st.session_state.get("_global_ltp_rest_ts", 0) or 0)
-    if (_now.timestamp() - _last_rest_ts) < 3:
-        return
-    try:
-        _syms = []
-        _bdf = st.session_state.get("_signals_base_df", pd.DataFrame())
-        if _bdf is not None and not _bdf.empty and "tradingsymbol" in _bdf.columns:
-            _syms.extend(_bdf["tradingsymbol"].dropna().astype(str).unique().tolist())
-        _syms.extend([v.get("sym") for v in st.session_state.get("paper_open", {}).values() if v.get("sym")])
-        _syms.extend([v.get("sym") for v in st.session_state.get("scalp_open", {}).values() if v.get("sym")])
-        _syms = sorted(set(_syms))
-        if not _syms:
-            return
-        _rest = _kc_live.get_ltp_batch([f"NSE:{s}" for s in _syms] + ["NSE:NIFTY 50"])
-        if not _rest:
-            return
-        _mapped = {k.split(":", 1)[-1]: float(v) for k, v in _rest.items() if v}
-        if _mapped:
-            _old = st.session_state.get("_live_ltp", {})
-            st.session_state["_prev_ltp"] = dict(_old) if _old else {}
-            st.session_state["_live_ltp"] = _mapped
-            st.session_state["_live_ltp_ts"] = _now
-            _nifty_ltp_f = _mapped.get("NIFTY 50")
-            if _nifty_ltp_f:
-                st.session_state["_nifty_live_ltp"] = float(_nifty_ltp_f)
-                _nf_prev = st.session_state.get("_nifty_prev_close")
-                if _nf_prev and _nf_prev > 0:
-                    _nifty_pct = (float(_nifty_ltp_f) - _nf_prev) / _nf_prev * 100
-                    st.session_state["_nifty_intraday_pct"] = round(_nifty_pct, 3)
-            st.session_state["_global_ltp_rest_ts"] = _now.timestamp()
-    except Exception:
-        pass
+    # Strict realtime mode: no REST fallback writes for global LTP cache.
 
 
 _global_ltp_updater()
@@ -3235,11 +3199,11 @@ with tab_screener:
         if ohlcv.empty:
             st.warning("No historical data cached for this stock.")
         else:
-            # Use live LTP from session state if available, else fall back to cached
-            display_ltp = st.session_state.get(f"live_ltp_{selected}") or stock_row["ltp"]
+            # Strict realtime mode: show blank until a live tick arrives.
+            display_ltp = st.session_state.get(f"live_ltp_{selected}")
 
             m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("LTP", f"₹{display_ltp:,.2f}")
+            m1.metric("LTP", f"₹{display_ltp:,.2f}" if display_ltp else "—")
             m2.metric("Composite",
                       f"{stock_row['composite_score']:.1f}" if pd.notna(stock_row["composite_score"]) else "—")
             m3.metric("RSI(14)",
@@ -4591,7 +4555,7 @@ def _live_signals_header():
     df_c = base_df.copy()
     _ltp_map = st.session_state.get("_live_ltp", {})
     if _ltp_map and "tradingsymbol" in df_c.columns:
-        df_c["ltp"] = df_c["tradingsymbol"].map(_ltp_map).fillna(df_c.get("ltp", 0))
+        df_c["ltp"] = df_c["tradingsymbol"].map(_ltp_map)
 
     _n_sb  = int((df_c["swing_signal"]    == "BUY").sum())
     _n_ss  = int((df_c["swing_signal"]    == "SELL").sum())
@@ -5516,8 +5480,8 @@ def _intraday_scalp_live():
         if _scalp_sym_q and _scalp_sym_q.strip().lower() not in _sym.lower():
             continue
 
-        _ltp_now = _live_ltp_now.get(_sym, 0) or float(_row.get("ltp") or 0)
-        if not _ltp_now:
+        _ltp_now = _fv(_live_ltp_now.get(_sym))
+        if _ltp_now is None:
             continue
 
         # Quality gate: skip low-priced or illiquid stocks — bid-ask spread and
@@ -5968,7 +5932,7 @@ def _intraday_long_live():
     df_l = base_df.copy()
     _ltp_m = st.session_state.get("_live_ltp", {})
     if _ltp_m and "tradingsymbol" in df_l.columns:
-        df_l["ltp"] = df_l["tradingsymbol"].map(_ltp_m).fillna(df_l.get("ltp", 0))
+        df_l["ltp"] = df_l["tradingsymbol"].map(_ltp_m)
 
     _si = (
         df_l[df_l["intraday_signal"] == "BUY_ABOVE"]
@@ -6029,7 +5993,7 @@ def _intraday_long_live():
     _si_rows = []
     for _, r in _si.iterrows():
         sym        = r.get("tradingsymbol", "")
-        ltp_now    = r.get("ltp") or 0
+        ltp_now    = _fv(r.get("ltp")) or 0
         r1_val     = r.get("intraday_r1") or 0
         entry_val  = r.get("intraday_entry") or 0
         s1_val     = float(r.get("intraday_s1") or 0)
@@ -6476,7 +6440,7 @@ def _intraday_short_live():
     df_s = base_df.copy()
     _ltp_ms = st.session_state.get("_live_ltp", {})
     if _ltp_ms and "tradingsymbol" in df_s.columns:
-        df_s["ltp"] = df_s["tradingsymbol"].map(_ltp_ms).fillna(df_s.get("ltp", 0))
+        df_s["ltp"] = df_s["tradingsymbol"].map(_ltp_ms)
 
     _ss = (
         df_s[df_s["intraday_signal"] == "SELL_BELOW"]
@@ -6542,7 +6506,7 @@ def _intraday_short_live():
     _ss_rows = []
     for _, r in _ss.iterrows():
         sym        = r.get("tradingsymbol", "")
-        ltp_now    = r.get("ltp") or 0
+        ltp_now    = _fv(r.get("ltp")) or 0
         s1_val     = r.get("intraday_s1") or 0
         entry_val  = r.get("intraday_entry") or 0
         piv_val    = float(r.get("intraday_pivot") or 0)
@@ -6951,7 +6915,7 @@ def _swing_buy_tab_content():
     df_live = base_df.copy()
     _ltp_sw1 = st.session_state.get("_live_ltp", {})
     if _ltp_sw1 and "tradingsymbol" in df_live.columns:
-        df_live["ltp"] = df_live["tradingsymbol"].map(_ltp_sw1).fillna(df_live.get("ltp", 0))
+        df_live["ltp"] = df_live["tradingsymbol"].map(_ltp_sw1)
 
     _sb = (
         df_live[df_live["swing_signal"] == "BUY"]
@@ -7019,7 +6983,7 @@ def _exit_sell_tab_content():
     df_live = base_df.copy()
     _ltp_vx = st.session_state.get("_live_ltp", {})
     if _ltp_vx and "tradingsymbol" in df_live.columns:
-        df_live["ltp"] = df_live["tradingsymbol"].map(_ltp_vx).fillna(df_live.get("ltp", 0))
+        df_live["ltp"] = df_live["tradingsymbol"].map(_ltp_vx)
 
     _se = (
         df_live[df_live["swing_signal"] == "SELL"]
@@ -7042,7 +7006,7 @@ def _exit_sell_tab_content():
             _exit_sym_q.strip(), case=False, na=False, regex=False)]
     _se_rows = []
     for _, r in _se.iterrows():
-        ltp_v = r.get("ltp") or 0
+        ltp_v = _fv(r.get("ltp")) or 0
         ema_v = r.get("ema_20") or 0
         try:
             dist_ema = f"+{(ltp_v - ema_v) / ema_v * 100:.1f}%" if ema_v > 0 else "—"
@@ -7086,7 +7050,7 @@ def _scaling_tab_content():
     df_live = base_df.copy()
     _ltp_vx = st.session_state.get("_live_ltp", {})
     if _ltp_vx and "tradingsymbol" in df_live.columns:
-        df_live["ltp"] = df_live["tradingsymbol"].map(_ltp_vx).fillna(df_live.get("ltp", 0))
+        df_live["ltp"] = df_live["tradingsymbol"].map(_ltp_vx)
 
     _ssc = (
         df_live[df_live["scale_signal"] == "INITIAL_ENTRY"]
@@ -7177,7 +7141,7 @@ def _signals_main():
     df_live = base_df.copy()
     _ltp_vx = st.session_state.get("_live_ltp", {})
     if _ltp_vx and "tradingsymbol" in df_live.columns:
-        df_live["ltp"] = df_live["tradingsymbol"].map(_ltp_vx).fillna(df_live.get("ltp", 0))
+        df_live["ltp"] = df_live["tradingsymbol"].map(_ltp_vx)
 
     st.markdown("---")
 
@@ -8903,53 +8867,15 @@ def _ticker_banner():
     # So we ALWAYS read the ticker dict first (not gated by is_ticker_alive),
     # falling back to session-state REST cache only if the dict is truly empty
     # (first login, no ticks ever received this session).
-    _ws_prices = _kc_module.get_all_ticker_prices()
-    if _ws_prices:
-        _prices = _ws_prices
-    else:
-        _prices = st.session_state.get("_live_ltp", {})
+    _ws_prices = _kc_module.get_all_ticker_prices() or {}
+    _prices = _ws_prices
 
     _mkt_open = _is_market_open()
 
     # Single-writer rule: global updater owns session LTP writes.
 
     if not _prices:
-        # No WebSocket ticks yet — try fetching last-close prices from Kite REST API
-        # so the banner always shows something useful (works after hours too).
-        _kc_chk  = st.session_state.get("kite_client")
-        _kite_ok = _kc_chk is not None and getattr(_kc_chk, "authenticated", False)
-        if _kite_ok:
-            _cached    = st.session_state.get("_banner_rest_ltp", {})
-            _cache_age = _time_mod.time() - st.session_state.get("_banner_rest_ts", 0)
-            if not _cached or _cache_age > 120:
-                try:
-                    # Use get_ohlc_batch() — already rate-limited, returns last_price.
-                    # Response: {"NSE:NIFTY 50": {"last_price": 24500, "ohlc": {...}}, ...}
-                    _sym_list = ["NSE:NIFTY 50", "NSE:NIFTY BANK"]
-                    _sbase = st.session_state.get("_signals_base_df")
-                    if _sbase is not None and not _sbase.empty and "tradingsymbol" in _sbase.columns:
-                        for _ts in _sbase["tradingsymbol"].dropna().astype(str).unique().tolist():
-                            _sym_list.append(f"NSE:{_ts}")
-                    _ohlc_r  = _kc_chk.get_ohlc_batch(_sym_list)
-                    _fetched = {}
-                    for _full_sym, _data in _ohlc_r.items():
-                        _lp = (_data or {}).get("last_price")
-                        if _lp:
-                            _disp = _full_sym.split(":", 1)[-1]   # "NSE:RELIANCE" → "RELIANCE"
-                            _fetched[_disp] = float(_lp)
-                    if _fetched:
-                        st.session_state["_banner_rest_ltp"] = _fetched
-                        st.session_state["_banner_rest_ts"]  = _time_mod.time()
-                        _prices = _fetched
-                except Exception:
-                    pass
-            else:
-                _prices = _cached
-
-        if not _prices:
-            _banner_msg = ("⏸&nbsp;Market closed — connect Kite to see last prices"
-                           if not _kite_ok else
-                           "⏸&nbsp;Market closed — last prices unavailable")
+            _banner_msg = "⚠&nbsp;No live websocket ticks yet"
             import streamlit.components.v1 as _stc
             _stc.html(f"""
 <script>
@@ -9062,25 +8988,21 @@ def _ticker_banner():
     # Scale scroll duration with number of items for readable speed
     _duration = max(45, len(items) * 2)
 
-    # Determine source badge: live WS, last-known WS (closed), REST
+    # Determine source badge: strictly websocket-driven
     _ticker_live = _kc_module.is_ticker_alive()
-    _had_ws_data = bool(_ws_prices)   # WebSocket dict had prices (even if market closed)
     if _ticker_live:
         _ws_badge_txt   = "⚡&nbsp;LIVE"
         _ws_badge_color = "#22c55e"
-    elif _had_ws_data:
-        _ws_badge_txt   = "📌&nbsp;LAST"    # frozen last-known prices
-        _ws_badge_color = "#f59e0b"
     else:
-        _ws_badge_txt   = "⚠&nbsp;REST"
-        _ws_badge_color = "#64748b"
+        _ws_badge_txt   = "⚠&nbsp;NO TICKS"
+        _ws_badge_color = "#ef4444"
 
     _mkt_badge = ""
     if not _mkt_open:
         _mkt_badge = (
             '<div style="flex-shrink:0;padding:0 10px;border-right:1px solid #1e3a5f;'
             'font-size:12px;color:#64748b;font-family:monospace;white-space:nowrap">'
-            '⏸&nbsp;CLOSED&nbsp;·&nbsp;last prices</div>'
+            '⏸&nbsp;CLOSED&nbsp;·&nbsp;awaiting new ticks</div>'
         )
 
     _ws_badge = (
@@ -9145,8 +9067,14 @@ def _ticker_banner():
     var scroll = p.getElementById('__tb_scroll');
     var badges = p.getElementById('__tb_badges');
     if (scroll && badges) {{
+      var anim = (scroll.getAnimations && scroll.getAnimations()[0]) ? scroll.getAnimations()[0] : null;
+      var ct = anim ? anim.currentTime : null;
       scroll.innerHTML  = {_json.dumps(_content_full)};
       badges.innerHTML  = {_json.dumps(_ws_badge + _mkt_badge)};
+      var anim2 = (scroll.getAnimations && scroll.getAnimations()[0]) ? scroll.getAnimations()[0] : null;
+      if (anim2 && ct !== null) {{
+        try {{ anim2.currentTime = ct; }} catch(e) {{}}
+      }}
     }} else {{
       el.innerHTML = {_json.dumps(_inner_html)};
     }}
