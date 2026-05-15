@@ -1032,6 +1032,19 @@ if st.sidebar.button("🔄 Full Rescan (~3-5 min)", use_container_width=True,
     progress_bar = st.sidebar.progress(0)
     status = st.sidebar.empty()
 
+    # ── Pre-validate token before starting a 3-5 min scan ────────────────
+    _fr_client = st.session_state.get("kite_client")
+    if _fr_client is None:
+        st.sidebar.error("⛔ Kite client not initialised. Please authenticate Kite first.")
+        st.stop()
+    _tok_ok, _tok_err = _fr_client.validate_token()
+    if not _tok_ok:
+        st.sidebar.error(
+            f"⛔ **Token invalid — scan aborted.**\n\n{_tok_err}\n\n"
+            f"➡ Sign out from the sidebar and re-authenticate Kite to get a fresh token."
+        )
+        st.stop()
+
     def update_progress(idx, total, symbol):
         progress_bar.progress((idx + 1) / total)
         status.caption(f"{idx+1}/{total}: {symbol}")
@@ -1039,7 +1052,7 @@ if st.sidebar.button("🔄 Full Rescan (~3-5 min)", use_container_width=True,
     try:
         result = data_pipeline.full_rescan(
             progress_callback=update_progress,
-            client=st.session_state.get("kite_client"),
+            client=_fr_client,
         )
         progress_bar.progress(1.0)
         status.caption("Done")
@@ -1082,13 +1095,26 @@ if st.sidebar.button("⚡ 6-Pillar Intraday Scan", use_container_width=True,
     _scan_progress = st.sidebar.progress(0)
     _scan_status   = st.sidebar.empty()
 
+    # ── Pre-validate token ────────────────────────────────────────────────
+    _6p_client = st.session_state.get("kite_client")
+    if _6p_client is None:
+        st.sidebar.error("⛔ Kite client not initialised. Please authenticate Kite first.")
+        st.stop()
+    _6p_tok_ok, _6p_tok_err = _6p_client.validate_token()
+    if not _6p_tok_ok:
+        st.sidebar.error(
+            f"⛔ **Token invalid — scan aborted.**\n\n{_6p_tok_err}\n\n"
+            f"➡ Sign out and re-authenticate Kite from the sidebar."
+        )
+        st.stop()
+
     def _6p_progress(idx, total, symbol):
         _scan_progress.progress((idx + 1) / total)
         _scan_status.caption(f"{idx+1}/{total}: {symbol}")
 
     try:
         _6p_result = data_pipeline.intraday_scan(
-            client=st.session_state.get("kite_client"),
+            client=_6p_client,
             progress_callback=_6p_progress,
         )
         _scan_progress.progress(1.0)
@@ -1126,6 +1152,16 @@ if _kc_live and _kc_live.authenticated:
         f'</div>',
         unsafe_allow_html=True,
     )
+    if st.sidebar.button("🔍 Test Kite Token", use_container_width=True,
+                         help="Makes one live API call to confirm the token is valid before scanning."):
+        _tv_ok, _tv_err = _kc_live.validate_token()
+        if _tv_ok:
+            st.sidebar.success("✓ Token is valid — ready to scan.")
+        else:
+            st.sidebar.error(
+                f"⛔ Token INVALID.\n\n{_tv_err}\n\n"
+                "Sign out and re-authenticate Kite to get a fresh token."
+            )
 else:
     st.sidebar.markdown(
         '<div style="font-size:12px;color:#f59e0b;padding:2px 0 4px 0;">'

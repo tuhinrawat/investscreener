@@ -196,6 +196,29 @@ class KiteClient:
         except Exception:
             return {}
 
+    def validate_token(self) -> tuple[bool, str]:
+        """
+        Make a live API call to verify the access token is actually accepted
+        by Zerodha's servers right now.
+
+        Returns (True, "") if valid, (False, reason) if invalid.
+        Use this before starting any long-running scan to avoid wasting 3-5
+        minutes only to fail on the first real API call.
+        """
+        if self.kite is None or not self.authenticated:
+            return False, "Kite client not initialised or not authenticated."
+        try:
+            profile = self.kite.profile()
+            if profile and profile.get("user_id"):
+                return True, ""
+            return False, "Empty profile response — token may be invalid."
+        except Exception as e:
+            err = str(e).lower()
+            if "token" in err or "unauthori" in err or "invalid" in err or "403" in err or "401" in err:
+                return False, ("Access token rejected by Zerodha. "
+                               "Please sign out and re-authenticate Kite from the sidebar.")
+            return False, f"Token validation failed: {e}"
+
     # ----------------------------------------------------------
     # INSTRUMENTS — full master list of NSE securities
     # ----------------------------------------------------------
