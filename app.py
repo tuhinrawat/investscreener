@@ -2188,11 +2188,18 @@ def _global_ltp_updater():
         _prices_json = _json_ltp.dumps(_push_ltp)
 
         # Build reference-price map (prev-day close) from screener base df.
-        # Push once per session — used by the JS patcher to compute daily % change.
+        # Pushed once per session into window.__ref_ltp__ so JS can compute
+        # daily % change for any symbol (used by the patcher AND the ticker banner).
+        # Two-stage bootstrap:
+        #   Stage 1: screener df is loaded → full map (all ~2700 symbols)
+        #   Stage 2: if screener df not yet loaded, push Nifty 50 symbols
+        #            only using the current live prices as a temporary ref.
+        #            This ensures the ticker banner is colored immediately.
         _ref_js = ""
         if not st.session_state.get("_ref_ltp_pushed"):
             _base_sc = st.session_state.get("_screener_live_base_df")
             if _base_sc is not None and not _base_sc.empty and "tradingsymbol" in _base_sc.columns:
+                # Full map from DB (most accurate — yesterday's close for all symbols)
                 _ref_map = {
                     str(sym): float(ltp)
                     for sym, ltp in zip(_base_sc["tradingsymbol"], _base_sc["ltp"])
@@ -2201,6 +2208,17 @@ def _global_ltp_updater():
                 if _ref_map:
                     _ref_js = f"p.__ref_ltp__ = {_json_ltp.dumps(_ref_map)};"
                     st.session_state["_ref_ltp_pushed"] = True
+            elif not st.session_state.get("_ref_ltp_nifty_pushed"):
+                # Screener df not loaded yet — bootstrap with Nifty 50 live prices
+                # so the ticker banner can show colors immediately on first ticks.
+                _n50_ref = {
+                    sym: float(px)
+                    for sym in config.NIFTY50_SYMBOLS
+                    if (px := _push_ltp.get(sym)) and px > 0
+                }
+                if _n50_ref:
+                    _ref_js = f"if(!window.parent.__ref_ltp__||!Object.keys(window.parent.__ref_ltp__).length){{p.__ref_ltp__={_json_ltp.dumps(_n50_ref)};}}"
+                    st.session_state["_ref_ltp_nifty_pushed"] = True
 
         _stc_ltp.html(f"""
 <script>
@@ -9616,14 +9634,18 @@ def _ticker_banner():
   p.__tb_config__ = {{ nifty50: {_nifty50_json} }};
   p.__tb_extra__  = {_extra_json};
 
-  // ── Render function — rebuilds content from window.__ltp__ ──────────
+  // ── Render function — rebuilds content from window.__ltp__ ──────────────
+  // Runs every 1 s. ALL 50 Nifty symbols are always shown.
+  // Color = daily % change vs window.__ref_ltp__ (prev-day close), just like
+  // TradingView / Kite: green = above yesterday, red = below.
+  // If live price not yet received, shows ref price in dim grey.
   function _tbRender() {{
-    var ltp  = p.__ltp__ || {{}};
-    var prev = p.__prev_ltp__ || {{}};
-    var cfg  = p.__tb_config__ || {{}};
-    var extra = p.__tb_extra__ || {{}};
-    var syms = cfg.nifty50 || [];
-    var sep  = '\\u00a0\\u00a0<span style="color:#1e3a5f">|</span>\\u00a0\\u00a0';
+    var ltp   = p.__ltp__     || {{}};
+    var ref   = p.__ref_ltp__ || {{}};   // prev-day close injected by Python
+    var cfg   = p.__tb_config__ || {{}};
+    var extra = p.__tb_extra__  || {{}};
+    var syms  = cfg.nifty50 || [];
+    var sep   = '\\u00a0\\u00a0<span style="color:#1e3a5f">|</span>\\u00a0\\u00a0';
 
     function fmtNum(n) {{
       return n >= 1000
@@ -9631,33 +9653,54 @@ def _ticker_banner():
         : n.toFixed(2);
     }}
 
-    function mkItem(sym, price, cls) {{
-      var p0 = prev[sym];
-      var col = '#94a3b8';
+    // Build one ticker chip.
+    // price    = live LTP (or ref-close if WS hasn't arrived yet)
+    // refPrice = previous day's closing price (for daily % change)
+    // hasLive  = true if price came from WebSocket
+    function mkItem(sym, price, cls, refPrice, hasLive) {{
+      var col   = '#94a3b8';   // default: neutral grey
       var badge = '';
-      if (p0 && Math.abs(price - p0) > 0.001) {{
-        var pct = (price - p0) / p0 * 100;
-        col   = pct >= 0 ? '#22c55e' : '#ef4444';
-        badge = '\\u00a0<span style="color:' + col + '">' + (pct >= 0 ? '\\u25b2' : '\\u25bc') + Math.abs(pct).toFixed(2) + '%</span>';
+      if (refPrice && refPrice > 0 && price && price > 0) {{
+        var chgPct = (price - refPrice) / refPrice * 100;
+        col = chgPct > 0.005  ? '#22c55e'
+            : chgPct < -0.005 ? '#ef4444'
+            : '#94a3b8';
+        var arrow = chgPct >= 0 ? '\\u25b2' : '\\u25bc';
+        var sign  = chgPct >= 0 ? '+' : '';
+        badge = '\\u00a0<span style="color:' + col + ';font-size:0.85em">'
+              + arrow + sign + chgPct.toFixed(2) + '%</span>';
       }}
-      return '<span class="' + cls + '">' + sym + '\\u00a0<span style="color:' + col + '">' + fmtNum(price) + badge + '</span></span>';
+      // Dim price slightly if showing ref (no live tick yet)
+      var priceCol = hasLive ? col : '#4b5563';
+      var priceStr = (price && price > 0) ? fmtNum(price) : '\\u2014';
+      return '<span class="' + cls + '">'
+           + sym + '\\u00a0'
+           + '<span style="color:' + priceCol + '">' + priceStr + badge + '</span>'
+           + '</span>';
     }}
 
     var items = [];
 
-    // Indices
+    // ── Indices (NIFTY 50 / NIFTY BANK) ─────────────────────────────────────
     ['NIFTY 50','NIFTY BANK'].forEach(function(s) {{
-      if (ltp[s]) items.push(mkItem(s, ltp[s], 'tb-idx'));
+      var price   = ltp[s] || 0;
+      var refPrice = ref[s] || 0;
+      if (price || refPrice) {{
+        items.push(mkItem(s, price || refPrice, 'tb-idx', refPrice, !!price));
+      }}
     }});
 
-    // Nifty 50 stocks
+    // ── All Nifty 50 stocks — always shown, even if live price not yet in ───
     syms.forEach(function(s) {{
-      if (ltp[s]) items.push(mkItem(s, ltp[s], 'tb-stk'));
+      var price    = ltp[s]  || 0;
+      var refPrice = ref[s]  || 0;
+      // Always render: live price preferred; ref price as fallback; "—" if neither
+      items.push(mkItem(s, price || refPrice, 'tb-stk', refPrice, !!price));
     }});
 
-    // Macro extras
-    if (extra.usdinr)   items.push('<span class="tb-fx">USD/INR\\u00a0<span style="color:#f59e0b">\\u20b9' + extra.usdinr.toFixed(2) + '</span></span>');
-    if (extra.wti_usd)  items.push('<span class="tb-cx">WTI\\u00a0<span style="color:#f59e0b">$' + fmtNum(extra.wti_usd) + '</span>' + (extra.wti_inr ? '\\u00a0<span style="color:#94a3b8">\\u20b9' + Math.round(extra.wti_inr) + '</span>' : '') + '</span>');
+    // ── Macro extras ─────────────────────────────────────────────────────────
+    if (extra.usdinr)    items.push('<span class="tb-fx">USD/INR\\u00a0<span style="color:#f59e0b">\\u20b9' + extra.usdinr.toFixed(2) + '</span></span>');
+    if (extra.wti_usd)   items.push('<span class="tb-cx">WTI\\u00a0<span style="color:#f59e0b">$' + fmtNum(extra.wti_usd) + '</span>' + (extra.wti_inr ? '\\u00a0<span style="color:#94a3b8">\\u20b9' + Math.round(extra.wti_inr) + '</span>' : '') + '</span>');
     if (extra.brent_usd) items.push('<span class="tb-cx">Brent\\u00a0<span style="color:#f97316">$' + fmtNum(extra.brent_usd) + '</span></span>');
     if (extra.natgas_usd) items.push('<span class="tb-cx">NatGas\\u00a0<span style="color:#a78bfa">$' + extra.natgas_usd.toFixed(3) + '</span></span>');
     if (extra.pcr) {{
@@ -9668,24 +9711,27 @@ def _ticker_banner():
 
     if (!items.length) return;
 
-    var content = items.join(sep);
-    var contentFull = content + sep + content;
-    var duration = Math.max(45, items.length * 2);
+    var content     = items.join(sep);
+    // Duplicate content so the seamless loop always has enough to fill the screen
+    var contentFull = content + sep + content + sep + content;
+    // Speed: ~2s per item looks smooth; 50+ items = 100s+ scroll
+    var duration    = Math.max(60, items.length * 2.2);
 
-    // Badge
-    var wsAlive = p.__tb_alive__ || false;
-    var badgeTxt   = wsAlive ? '\\u26a1\\u00a0LIVE'    : '\\u26a0\\u00a0NO TICKS';
+    // LIVE / NO TICKS badge
+    var wsAlive    = p.__tb_alive__ || false;
+    var badgeTxt   = wsAlive ? '\\u26a1\\u00a0LIVE' : '\\u26a0\\u00a0NO TICKS';
     var badgeColor = wsAlive ? '#22c55e' : '#ef4444';
-    var badgeHTML = '<div style="flex-shrink:0;padding:0 8px;border-right:1px solid #1e3a5f;font-size:12px;font-family:monospace;white-space:nowrap;color:' + badgeColor + '">' + badgeTxt + '</div>';
+    var badgeHTML  = '<div style="flex-shrink:0;padding:0 8px;border-right:1px solid #1e3a5f;'
+                   + 'font-size:12px;font-family:monospace;white-space:nowrap;color:' + badgeColor + '">'
+                   + badgeTxt + '</div>';
 
-    var tb = pd.getElementById('__tb');
+    var tb     = pd.getElementById('__tb');
     if (!tb) return;
-
     var scroll = pd.getElementById('__tb_scroll');
     var badges = pd.getElementById('__tb_badges');
 
     if (!scroll) {{
-      // Build structure on first real tick
+      // Build DOM structure on first tick
       tb.innerHTML =
         '<div id="__tb_badges" style="display:contents">' + badgeHTML + '</div>' +
         '<div style="flex:1;overflow:hidden;height:100%;display:flex;align-items:center">' +
@@ -9693,27 +9739,34 @@ def _ticker_banner():
         'animation:_tbsc ' + duration + 's linear infinite;will-change:transform">' +
         contentFull + '</div></div>';
     }} else {{
-      // Update content only — preserve animation state
+      // Update content in-place — preserve the CSS animation playback position
       var anim = scroll.getAnimations ? scroll.getAnimations()[0] : null;
       var ct   = anim ? anim.currentTime : null;
       scroll.innerHTML = contentFull;
+      // Restore animation time so the scroll doesn't jump/reset
       var anim2 = scroll.getAnimations ? scroll.getAnimations()[0] : null;
       if (anim2 && ct !== null) {{ try {{ anim2.currentTime = ct; }} catch(e) {{}} }}
       if (badges) badges.innerHTML = badgeHTML;
     }}
   }}
 
-  // ── Poll window.__ltp__ every second ─────────────────────────────────
+  // Set alive flag (updated every rerun via the else-branch too)
+  p.__tb_alive__ = {"true" if _ws_manager.is_alive() else "false"};
+
+  // ── Poll window.__ltp__ every second, fire immediately on install ────
   if (!p.__tb_interval__) {{
     p.__tb_interval__ = setInterval(_tbRender, 1000);
   }}
+  // Render once right now so the banner fills in without waiting 1 s
+  _tbRender();
 }})();
 </script>
 """, height=0, scrolling=False)
         st.session_state["_ticker_banner_ready"] = True
 
     else:
-        # Subsequent runs: only update macro extra data (WS prices go via window.__ltp__)
+        # Subsequent runs: only update macro extra data and alive flag.
+        # WS prices flow via window.__ltp__ (updated every second by _global_ltp_updater).
         _stc.html(f"""
 <script>
 (function() {{
