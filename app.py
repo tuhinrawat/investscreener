@@ -4554,7 +4554,7 @@ def _live_signals_header():
     # Apply live LTP for metric pill counts
     df_c = base_df.copy()
     _ltp_map = st.session_state.get("_live_ltp", {})
-    if _ltp_map and "tradingsymbol" in df_c.columns:
+    if "tradingsymbol" in df_c.columns:
         df_c["ltp"] = df_c["tradingsymbol"].map(_ltp_map)
 
     _n_sb  = int((df_c["swing_signal"]    == "BUY").sum())
@@ -5931,7 +5931,7 @@ def _intraday_long_live():
 
     df_l = base_df.copy()
     _ltp_m = st.session_state.get("_live_ltp", {})
-    if _ltp_m and "tradingsymbol" in df_l.columns:
+    if "tradingsymbol" in df_l.columns:
         df_l["ltp"] = df_l["tradingsymbol"].map(_ltp_m)
 
     _si = (
@@ -6439,7 +6439,7 @@ def _intraday_short_live():
 
     df_s = base_df.copy()
     _ltp_ms = st.session_state.get("_live_ltp", {})
-    if _ltp_ms and "tradingsymbol" in df_s.columns:
+    if "tradingsymbol" in df_s.columns:
         df_s["ltp"] = df_s["tradingsymbol"].map(_ltp_ms)
 
     _ss = (
@@ -6914,7 +6914,7 @@ def _swing_buy_tab_content():
         return
     df_live = base_df.copy()
     _ltp_sw1 = st.session_state.get("_live_ltp", {})
-    if _ltp_sw1 and "tradingsymbol" in df_live.columns:
+    if "tradingsymbol" in df_live.columns:
         df_live["ltp"] = df_live["tradingsymbol"].map(_ltp_sw1)
 
     _sb = (
@@ -6982,7 +6982,7 @@ def _exit_sell_tab_content():
         return
     df_live = base_df.copy()
     _ltp_vx = st.session_state.get("_live_ltp", {})
-    if _ltp_vx and "tradingsymbol" in df_live.columns:
+    if "tradingsymbol" in df_live.columns:
         df_live["ltp"] = df_live["tradingsymbol"].map(_ltp_vx)
 
     _se = (
@@ -7049,7 +7049,7 @@ def _scaling_tab_content():
         return
     df_live = base_df.copy()
     _ltp_vx = st.session_state.get("_live_ltp", {})
-    if _ltp_vx and "tradingsymbol" in df_live.columns:
+    if "tradingsymbol" in df_live.columns:
         df_live["ltp"] = df_live["tradingsymbol"].map(_ltp_vx)
 
     _ssc = (
@@ -7140,7 +7140,7 @@ def _signals_main():
     # Apply most-recent live LTP (updated by the header fragment every 2 s)
     df_live = base_df.copy()
     _ltp_vx = st.session_state.get("_live_ltp", {})
-    if _ltp_vx and "tradingsymbol" in df_live.columns:
+    if "tradingsymbol" in df_live.columns:
         df_live["ltp"] = df_live["tradingsymbol"].map(_ltp_vx)
 
     st.markdown("---")
