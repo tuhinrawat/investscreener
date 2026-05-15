@@ -578,7 +578,7 @@ if (_kc_ticker_client and getattr(_kc_ticker_client, "authenticated", False)
 # Keep the running ticker subscribed to the full stock universe even across
 # reruns/auth refreshes where start_ticker() doesn't re-run.
 if _kc_ticker_client and getattr(_kc_ticker_client, "authenticated", False):
-    _today_sync = _dt.date.today().isoformat()
+    _today_sync = datetime.now(_IST).date().isoformat()
     _full_sync_date = st.session_state.get("_ticker_full_sync_date")
     if _full_sync_date != _today_sync:
         try:
