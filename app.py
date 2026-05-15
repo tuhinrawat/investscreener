@@ -2016,6 +2016,44 @@ def _market_pulse_header():
 
 _market_pulse_header()
 
+# ── Global LTP updater (app-wide, independent of active tab) ─────────────────
+# Keeps session LTP cache fresh every second so all pages/tabs read the same
+# live prices without depending on Trade Signals fragments being active.
+@st.fragment(run_every=1)
+def _global_ltp_updater():
+    _kc_live = st.session_state.get("kite_client")
+    if not (_kc_live and getattr(_kc_live, "authenticated", False)):
+        return
+    _now = datetime.now(_IST)
+    _mkt_open = (
+        _now.weekday() < 5 and
+        _now.replace(hour=9, minute=15, second=0, microsecond=0) <= _now <=
+        _now.replace(hour=15, minute=30, second=0, microsecond=0)
+    )
+    if not _mkt_open:
+        return
+
+    _ws_prices = _kc_module.get_all_ticker_prices() or {}
+    if not _ws_prices:
+        return
+
+    _old = st.session_state.get("_live_ltp", {})
+    st.session_state["_prev_ltp"] = dict(_old) if _old else {}
+    st.session_state["_live_ltp"] = {str(k): float(v) for k, v in _ws_prices.items()}
+    st.session_state["_live_ltp_ts"] = _now
+
+    _nifty_ltp = _ws_prices.get("NIFTY 50")
+    if _nifty_ltp:
+        _nifty_ltp_f = float(_nifty_ltp)
+        st.session_state["_nifty_live_ltp"] = _nifty_ltp_f
+        _nf_prev = st.session_state.get("_nifty_prev_close")
+        if _nf_prev and _nf_prev > 0:
+            _nifty_pct = (_nifty_ltp_f - _nf_prev) / _nf_prev * 100
+            st.session_state["_nifty_intraday_pct"] = round(_nifty_pct, 3)
+
+
+_global_ltp_updater()
+
 # ── Auto outcome-check for yesterday's signals (runs once per session) ────────
 if not st.session_state.get("_signal_outcomes_checked"):
     try:
