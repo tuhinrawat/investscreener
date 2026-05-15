@@ -551,11 +551,14 @@ def init_schema():
                 signal_generated_at     TIMESTAMP           DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Migration: add scan_date column if it doesn't exist yet
-        cur.execute("""
-            ALTER TABLE intraday_signals
-            ADD COLUMN IF NOT EXISTS scan_date DATE
-        """)
+        # Migrations: add columns that may not exist in older deployments
+        cur.execute("ALTER TABLE intraday_signals ADD COLUMN IF NOT EXISTS scan_date DATE")
+        cur.execute("ALTER TABLE intraday_signals ADD COLUMN IF NOT EXISTS status VARCHAR DEFAULT 'WATCHING'")
+        cur.execute("ALTER TABLE intraday_signals ADD COLUMN IF NOT EXISTS status_updated_at TIMESTAMP")
+        cur.execute("ALTER TABLE intraday_signals ADD COLUMN IF NOT EXISTS trade_log_id INTEGER")
+        cur.execute("ALTER TABLE intraday_signals ADD COLUMN IF NOT EXISTS trade_mode VARCHAR")
+        cur.execute("ALTER TABLE intraday_signals ADD COLUMN IF NOT EXISTS actual_entry DOUBLE PRECISION")
+        cur.execute("ALTER TABLE intraday_signals ADD COLUMN IF NOT EXISTS pnl_pct DOUBLE PRECISION")
 
         # One-time migration: UTC → IST shift on logged_at
         cur.execute("SELECT value FROM _db_meta WHERE key = 'logged_at_utc_to_ist_done'")
@@ -2980,6 +2983,74 @@ def update_news_catalyst(tradingsymbol: str, enable: bool) -> None:
     except Exception:
         conn.rollback()
         raise
+    finally:
+        cur.close()
+        release_conn(conn)
+
+
+# ── 6-Pillar signal status lifecycle ─────────────────────────────────────────
+
+def update_intraday_signal_status(
+    tradingsymbol: str,
+    status: str,
+    trade_log_id: int = None,
+    trade_mode: str = None,
+    actual_entry: float = None,
+    pnl_pct: float = None,
+) -> None:
+    """Atomically update live status of a 6-pillar signal row."""
+    import datetime as _dt
+    _IST = _dt.timezone(_dt.timedelta(hours=5, minutes=30))
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        sets   = ["status = %s", "status_updated_at = %s"]
+        params: list = [status, _dt.datetime.now(_IST)]
+        if trade_log_id is not None:
+            sets.append("trade_log_id = %s");  params.append(trade_log_id)
+        if trade_mode is not None:
+            sets.append("trade_mode = %s");    params.append(trade_mode)
+        if actual_entry is not None:
+            sets.append("actual_entry = %s");  params.append(actual_entry)
+        if pnl_pct is not None:
+            sets.append("pnl_pct = %s");       params.append(pnl_pct)
+        params.append(tradingsymbol)
+        cur.execute(
+            f"UPDATE intraday_signals SET {', '.join(sets)} WHERE tradingsymbol = %s",
+            params,
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        release_conn(conn)
+
+
+def get_intraday_signal_statuses() -> dict:
+    """
+    Returns {tradingsymbol: {status, trade_log_id, trade_mode, actual_entry, pnl_pct}}
+    for all current intraday_signals rows.
+    """
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT tradingsymbol, status, trade_log_id, trade_mode, "
+            "       actual_entry, pnl_pct "
+            "FROM intraday_signals"
+        )
+        return {
+            r[0]: {
+                "status":       r[1] or "WATCHING",
+                "trade_log_id": r[2],
+                "trade_mode":   r[3],
+                "actual_entry": r[4],
+                "pnl_pct":      r[5],
+            }
+            for r in cur.fetchall()
+        }
     finally:
         cur.close()
         release_conn(conn)

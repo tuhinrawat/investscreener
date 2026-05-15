@@ -9534,96 +9534,250 @@ with tab_6pillar:
         # ── Inject live LTP ──────────────────────────────────────────────────
         live_ltp = st.session_state.get("_live_ltp", {})
         sigs = sigs.copy()
-        sigs["_db_entry"]  = sigs["entry"].copy()
-        for col in ("entry", "stop_loss", "t1", "t2", "t3"):
-            if col in sigs.columns:
-                sigs[f"_orig_{col}"] = sigs[col].copy()
+        sigs["LTP"] = sigs["tradingsymbol"].map(live_ltp).fillna(sigs["entry"])
 
-        sigs["LTP"] = sigs["tradingsymbol"].apply(
-            lambda s: live_ltp.get(s, sigs.loc[sigs["tradingsymbol"] == s, "entry"].values[0]
-                                   if len(sigs.loc[sigs["tradingsymbol"] == s]) else None)
-        )
+        # ── Status color map ─────────────────────────────────────────────────
+        _STATUS_COLOR = {
+            "WATCHING":   ("#64748b", "⚪"),
+            "APPROACHING":("#f59e0b", "🟡"),
+            "TRIGGERED":  ("#22c55e", "🟢"),
+            "AT_T1":      ("#3b82f6", "🔵"),
+            "AT_T2":      ("#8b5cf6", "🟣"),
+            "RUNNER":     ("#06b6d4", "🔷"),
+            "HIT_SL":     ("#ef4444", "🔴"),
+            "REVERSED":   ("#f97316", "🟠"),
+            "EXPIRED":    ("#6b7280", "⬛"),
+        }
 
-        # ── Grade badge ──────────────────────────────────────────────────────
+        def _status_badge(s):
+            s = s or "WATCHING"
+            color, icon = _STATUS_COLOR.get(s, ("#6b7280", "⚪"))
+            return (f'<span style="background:{color}22;color:{color};font-weight:700;'
+                    f'padding:2px 7px;border-radius:8px;font-size:11px;white-space:nowrap">'
+                    f'{icon} {s}</span>')
+
         GRADE_COLOR = {"A+": "#16a34a", "A": "#22c55e", "B": "#3b82f6", "C": "#f59e0b", "D": "#ef4444"}
 
-        def _grade_chip(g):
-            bg = GRADE_COLOR.get(g, "#6b7280")
-            return (f'<span style="background:{bg};color:#fff;font-weight:700;'
-                    f'padding:2px 8px;border-radius:8px;font-size:12px">{g}</span>')
+        # ── Trade mode config ─────────────────────────────────────────────────
+        _6p_kc          = st.session_state.get("kite_client")
+        _6p_kite_ok     = _6p_kc is not None and getattr(_6p_kc, "authenticated", False)
+        _6p_user_id     = st.session_state.get("kite_user_id", "")
+        _6p_trade_mode  = st.session_state.get("_6p_trade_mode", "paper")
+
+        _tm_col1, _tm_col2 = st.columns([3, 1])
+        with _tm_col2:
+            _6p_trade_mode = st.radio(
+                "Trade mode", ["paper", "real"],
+                index=0 if _6p_trade_mode == "paper" else 1,
+                horizontal=True,
+                key="6p_trade_mode_radio",
+                label_visibility="collapsed",
+            )
+            st.session_state["_6p_trade_mode"] = _6p_trade_mode
+        with _tm_col1:
+            if _6p_trade_mode == "paper":
+                st.caption("📄 **Paper mode** — trades logged to Activity Log for tracking")
+            else:
+                st.caption("💸 **Real mode** — orders placed via Kite Connect")
 
         # ── Split BUY / SHORT ─────────────────────────────────────────────────
         buy_df   = sigs[sigs["signal"] == "BUY"].sort_values("total_score", ascending=False)
         short_df = sigs[sigs["signal"] == "SHORT"].sort_values("total_score", ascending=False)
 
-        # ── Display columns ───────────────────────────────────────────────────
         DISPLAY_COLS = [
-            "tradingsymbol", "grade", "total_score",
+            "tradingsymbol", "status", "grade", "total_score",
             "p1_adx", "p2_daily", "p3_trend", "p4_momentum", "p5_volume", "p6_trigger",
             "LTP", "entry", "stop_loss", "t1", "t2", "t3",
-            "atr_pct", "rr_at_t2", "adx_gate", "gap_invalidated",
+            "atr_pct", "rr_at_t2",
         ]
 
-        def _render_signal_table(df_in, signal_label, signal_color):
+        def _render_6p_table(df_in, signal_dir):
             if df_in.empty:
-                st.caption(f"No {signal_label} signals.")
+                st.caption(f"No {signal_dir} signals.")
                 return
+
+            signal_color = "#22c55e" if signal_dir == "BUY" else "#ef4444"
             df_disp = df_in[[c for c in DISPLAY_COLS if c in df_in.columns]].copy()
-
-            # Rename for display
             df_disp.rename(columns={
-                "tradingsymbol": "Symbol",
+                "tradingsymbol": "Symbol", "status": "Status",
                 "total_score": "Score",
-                "p1_adx": "P1-ADX", "p2_daily": "P2-Daily", "p3_trend": "P3-Trend",
-                "p4_momentum": "P4-Mom", "p5_volume": "P5-Vol", "p6_trigger": "P6-Trig",
-                "stop_loss": "SL", "atr_pct": "ATR%", "rr_at_t2": "R:R@T2",
-                "adx_gate": "ADX✓", "gap_invalidated": "Gap⚠",
+                "p1_adx": "P1", "p2_daily": "P2", "p3_trend": "P3",
+                "p4_momentum": "P4", "p5_volume": "P5", "p6_trigger": "P6",
+                "stop_loss": "SL", "atr_pct": "ATR%", "rr_at_t2": "R:R",
             }, inplace=True)
-
-            num_fmts = {c: "%.2f" for c in ("LTP", "entry", "SL", "t1", "t2", "t3", "ATR%", "R:R@T2")}
 
             col_cfg = {
                 "Symbol": st.column_config.TextColumn("Symbol", width=90),
-                "grade":  st.column_config.TextColumn("Grade", width=55),
-                "Score":  st.column_config.NumberColumn("Score", format="%d", width=55),
-                "P1-ADX": st.column_config.NumberColumn("P1", format="%d", width=40),
-                "P2-Daily": st.column_config.NumberColumn("P2", format="%d", width=40),
-                "P3-Trend": st.column_config.NumberColumn("P3", format="%d", width=40),
-                "P4-Mom":   st.column_config.NumberColumn("P4", format="%d", width=40),
-                "P5-Vol":   st.column_config.NumberColumn("P5", format="%d", width=40),
-                "P6-Trig":  st.column_config.NumberColumn("P6", format="%d", width=40),
-                "LTP":    st.column_config.NumberColumn("LTP ₹", format="%.2f"),
-                "entry":  st.column_config.NumberColumn("Entry ₹", format="%.2f"),
-                "SL":     st.column_config.NumberColumn("SL ₹", format="%.2f"),
-                "t1":     st.column_config.NumberColumn("T1 ₹", format="%.2f"),
-                "t2":     st.column_config.NumberColumn("T2 ₹", format="%.2f"),
-                "t3":     st.column_config.NumberColumn("T3 ₹", format="%.2f"),
-                "ATR%":   st.column_config.NumberColumn("ATR%", format="%.2f"),
-                "R:R@T2": st.column_config.NumberColumn("R:R", format="%.2f"),
-                "ADX✓":   st.column_config.CheckboxColumn("ADX✓", width=50),
-                "Gap⚠":   st.column_config.CheckboxColumn("Gap⚠", width=50),
+                "Status": st.column_config.TextColumn("Status", width=110),
+                "grade":  st.column_config.TextColumn("Grade", width=50),
+                "Score":  st.column_config.NumberColumn("Score", format="%d", width=50),
+                "P1": st.column_config.NumberColumn("P1", format="%d", width=36),
+                "P2": st.column_config.NumberColumn("P2", format="%d", width=36),
+                "P3": st.column_config.NumberColumn("P3", format="%d", width=36),
+                "P4": st.column_config.NumberColumn("P4", format="%d", width=36),
+                "P5": st.column_config.NumberColumn("P5", format="%d", width=36),
+                "P6": st.column_config.NumberColumn("P6", format="%d", width=36),
+                "LTP":   st.column_config.NumberColumn("LTP ₹",   format="%.2f"),
+                "entry": st.column_config.NumberColumn("Entry ₹", format="%.2f"),
+                "SL":    st.column_config.NumberColumn("SL ₹",    format="%.2f"),
+                "t1":    st.column_config.NumberColumn("T1 ₹",    format="%.2f"),
+                "t2":    st.column_config.NumberColumn("T2 ₹",    format="%.2f"),
+                "t3":    st.column_config.NumberColumn("T3 ₹",    format="%.2f"),
+                "ATR%":  st.column_config.NumberColumn("ATR%",    format="%.2f"),
+                "R:R":   st.column_config.NumberColumn("R:R",     format="%.2f"),
             }
 
-            def _style_row(row):
-                return [f"color:{signal_color}" if col == "Symbol" else "" for col in row.index]
+            def _style_status(row):
+                status = row.get("Status", "WATCHING") or "WATCHING"
+                color, _ = _STATUS_COLOR.get(status, ("#6b7280", ""))
+                return [
+                    f"color:{signal_color};font-weight:700" if col == "Symbol"
+                    else f"color:{color};font-weight:600" if col == "Status"
+                    else "" for col in row.index
+                ]
 
             st.dataframe(
-                df_disp.style.apply(_style_row, axis=1),
+                df_disp.style.apply(_style_status, axis=1),
                 column_config=col_cfg,
                 use_container_width=True,
                 hide_index=True,
             )
 
+            # ── Per-signal trade action cards ─────────────────────────────────
+            st.markdown("---")
+            st.caption(f"{'📄 Paper' if _6p_trade_mode == 'paper' else '💸 Real'} trade actions:")
+            _card_cols = st.columns(min(len(df_in), 4))
+            for _ci, (_, _sr) in enumerate(df_in.iterrows()):
+                _sym    = _sr["tradingsymbol"]
+                _status = (_sr.get("status") or "WATCHING")
+                _ltp    = float(live_ltp.get(_sym) or _sr.get("entry") or 0)
+                _entry  = float(_sr.get("entry") or 0)
+                _sl     = float(_sr.get("stop_loss") or 0)
+                _t1     = float(_sr.get("t1") or 0)
+                _t2     = float(_sr.get("t2") or 0)
+                _grade  = _sr.get("grade", "D")
+                _score  = int(_sr.get("total_score") or 0)
+                _gcolor = GRADE_COLOR.get(_grade, "#6b7280")
+                _stcolor, _sticon = _STATUS_COLOR.get(_status, ("#6b7280", "⚪"))
+                _tid    = _sr.get("trade_log_id")
+
+                with _card_cols[_ci % 4]:
+                    st.markdown(
+                        f'<div style="border:1px solid {_stcolor}44;border-radius:10px;'
+                        f'padding:10px 12px;margin-bottom:6px">'
+                        f'<div style="display:flex;justify-content:space-between;align-items:center">'
+                        f'<b style="color:{signal_color};font-size:14px">{_sym}</b>'
+                        f'<span style="background:{_gcolor}33;color:{_gcolor};font-weight:700;'
+                        f'padding:2px 6px;border-radius:6px;font-size:11px">{_grade} {_score}</span>'
+                        f'</div>'
+                        f'<div style="font-size:11px;color:{_stcolor};margin:3px 0">{_sticon} {_status}</div>'
+                        f'<div style="font-size:12px;color:#94a3b8">LTP ₹{_ltp:.2f} · Entry ₹{_entry:.2f} · SL ₹{_sl:.2f}</div>'
+                        f'<div style="font-size:11px;color:#64748b">T1 ₹{_t1:.2f} · T2 ₹{_t2:.2f}</div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                    TERMINAL_6P = {"HIT_SL", "AT_T2", "RUNNER", "EXPIRED", "REVERSED"}
+                    _already_traded = bool(_tid)
+                    _is_terminal    = _status in TERMINAL_6P
+
+                    if not _already_traded and not _is_terminal:
+                        _btn_label = (
+                            f"{'📄 Paper' if _6p_trade_mode == 'paper' else '💸 Real'} "
+                            f"{'BUY' if signal_dir == 'BUY' else 'SHORT'} {_sym}"
+                        )
+                        if st.button(_btn_label, key=f"6p_trade_{_sym}_{_6p_bust}",
+                                     use_container_width=True):
+                            _trigger_price = _ltp if _ltp > 0 else _entry
+                            _qty = max(1, int(50000 / _trigger_price)) if _trigger_price else 1
+                            _sig_type = "BUY_ABOVE" if signal_dir == "BUY" else "SELL_BELOW"
+                            try:
+                                if _6p_trade_mode == "real" and _6p_kite_ok:
+                                    # Place real order via Kite
+                                    _order_id = _6p_kc.place_order(
+                                        tradingsymbol=_sym,
+                                        exchange="NSE",
+                                        transaction_type="BUY" if signal_dir == "BUY" else "SELL",
+                                        quantity=_qty,
+                                        order_type="MARKET",
+                                        product="MIS",
+                                    )
+                                    _trade_id = db.log_trade({
+                                        "trade_date":    now_6p.date(),
+                                        "tradingsymbol": _sym,
+                                        "instrument_token": int(_sr.get("instrument_token") or 0),
+                                        "setup_type":    "6PILLAR",
+                                        "signal_type":   _sig_type,
+                                        "rec_entry":     _entry,
+                                        "rec_stop":      _sl,
+                                        "rec_t1":        _t1,
+                                        "rec_t2":        _t2,
+                                        "kite_user_id":  _6p_user_id,
+                                        "kite_order_id": str(_order_id),
+                                        "quantity":      _qty,
+                                        "actual_entry":  _trigger_price,
+                                        "status":        "OPEN",
+                                        "notes":         f"💸 Real 6P — {signal_dir} @ ₹{_trigger_price:.2f} · Grade {_grade} · Score {_score}",
+                                        "is_paper_trade": False,
+                                    })
+                                else:
+                                    _trade_id = db.log_trade({
+                                        "trade_date":    now_6p.date(),
+                                        "tradingsymbol": _sym,
+                                        "instrument_token": int(_sr.get("instrument_token") or 0),
+                                        "setup_type":    "6PILLAR",
+                                        "signal_type":   _sig_type,
+                                        "rec_entry":     _entry,
+                                        "rec_stop":      _sl,
+                                        "rec_t1":        _t1,
+                                        "rec_t2":        _t2,
+                                        "kite_user_id":  _6p_user_id,
+                                        "quantity":      _qty,
+                                        "actual_entry":  _trigger_price,
+                                        "status":        "OPEN",
+                                        "notes":         f"📄 Paper 6P — {signal_dir} @ ₹{_trigger_price:.2f} · Grade {_grade} · Score {_score}",
+                                        "is_paper_trade": True,
+                                    })
+                                db.update_intraday_signal_status(
+                                    _sym, "TRIGGERED",
+                                    trade_log_id=_trade_id,
+                                    trade_mode=_6p_trade_mode,
+                                    actual_entry=_trigger_price,
+                                )
+                                st.success(f"✓ {_sym} {'paper' if _6p_trade_mode == 'paper' else 'real'} trade logged (ID {_trade_id})")
+                                st.rerun()
+                            except Exception as _te:
+                                st.error(f"Trade failed: {_te}")
+
+                    elif _already_traded and _status not in ("HIT_SL", "EXPIRED", "REVERSED"):
+                        # Exit button for open trades
+                        if st.button(f"🚪 Exit {_sym}", key=f"6p_exit_{_sym}_{_6p_bust}",
+                                     use_container_width=True):
+                            _exit_price = _ltp
+                            _exit_status = "CLOSED_T1" if (_t1 and _ltp >= _t1 * 0.998) else "MANUAL_EXIT"
+                            try:
+                                if _6p_trade_mode == "real" and _6p_kite_ok and _tid:
+                                    _6p_kc.place_order(
+                                        tradingsymbol=_sym, exchange="NSE",
+                                        transaction_type="SELL" if signal_dir == "BUY" else "BUY",
+                                        quantity=_qty, order_type="MARKET", product="MIS",
+                                    )
+                                if _tid:
+                                    db.close_trade(_tid, _exit_price, _exit_status,
+                                                   notes=f"6P exit @ ₹{_exit_price:.2f}")
+                                db.update_intraday_signal_status(_sym, "AT_T1" if _exit_status == "CLOSED_T1" else "REVERSED")
+                                st.rerun()
+                            except Exception as _xe:
+                                st.error(f"Exit failed: {_xe}")
+
         _buy_tab, _short_tab = st.tabs([
             f"🟢 BUY  ({len(buy_df)})",
             f"🔴 SHORT  ({len(short_df)})",
         ])
-
         with _buy_tab:
-            _render_signal_table(buy_df, "BUY", "#22c55e")
-
+            _render_6p_table(buy_df, "BUY")
         with _short_tab:
-            _render_signal_table(short_df, "SHORT", "#ef4444")
+            _render_6p_table(short_df, "SHORT")
 
         # ── News catalyst toggles ─────────────────────────────────────────────
         st.markdown("---")

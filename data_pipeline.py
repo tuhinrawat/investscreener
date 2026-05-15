@@ -618,6 +618,120 @@ def full_rescan(progress_callback=None, client: "KiteClient | None" = None) -> d
     return result
 
 
+def refresh_intraday_signal_statuses(live_ltp: dict) -> int:
+    """
+    Compare live LTP against each active 6-pillar signal's entry/SL/T1/T2/T3
+    and update the status column in intraday_signals.
+
+    Status lifecycle:
+        WATCHING    → generated, waiting for entry level to be hit
+        APPROACHING → LTP within 0.3% of entry
+        TRIGGERED   → LTP crossed entry (for BUY: ltp >= entry; SHORT: ltp <= entry)
+        AT_T1       → LTP reached T1
+        AT_T2       → LTP reached T2
+        RUNNER      → T2 hit, runner position tracking
+        HIT_SL      → stop loss hit → closed
+        REVERSED    → price re-crossed back through ORH/ORL invalidating the setup
+        EXPIRED     → 15:15 reached
+
+    Called from quick_refresh() every ~15 s during market hours.
+    Also respects already-terminal statuses (HIT_SL, EXPIRED) — won't overwrite.
+    Returns count of status changes made.
+    """
+    IST  = timezone(timedelta(hours=5, minutes=30))
+    now  = datetime.now(tz=IST)
+
+    # After 15:15, mark all non-terminal WATCHING/APPROACHING as EXPIRED
+    market_closed = now.hour > 15 or (now.hour == 15 and now.minute >= 15)
+
+    try:
+        sigs = db.load_intraday_signals(include_no_signal=False)
+    except Exception:
+        return 0
+    if sigs.empty:
+        return 0
+
+    changes = 0
+    TERMINAL = {"HIT_SL", "RUNNER", "AT_T2", "EXPIRED", "REVERSED"}
+
+    for _, row in sigs.iterrows():
+        sym     = row["tradingsymbol"]
+        signal  = row.get("signal", "")        # BUY or SHORT
+        status  = row.get("status") or "WATCHING"
+        entry   = row.get("entry")
+        sl      = row.get("stop_loss")
+        t1      = row.get("t1")
+        t2      = row.get("t2")
+        orh     = row.get("orh")
+        orl     = row.get("orl")
+
+        if status in TERMINAL:
+            # Already done — only apply market-close EXPIRED to WATCHING/APPROACHING
+            continue
+        if not entry or signal not in ("BUY", "SHORT"):
+            continue
+
+        ltp = live_ltp.get(sym)
+        if not ltp or ltp <= 0:
+            continue
+
+        entry = float(entry)
+        sl    = float(sl)   if sl   else None
+        t1    = float(t1)   if t1   else None
+        t2    = float(t2)   if t2   else None
+        orh   = float(orh)  if orh  else None
+        orl   = float(orl)  if orl  else None
+        ltp   = float(ltp)
+
+        new_status = status
+
+        if market_closed:
+            if status in ("WATCHING", "APPROACHING", "TRIGGERED", "AT_T1"):
+                new_status = "EXPIRED"
+        elif signal == "BUY":
+            # Stop hit?
+            if sl and ltp <= sl:
+                new_status = "HIT_SL"
+            # Reversed back below ORH?
+            elif orh and ltp < orh * 0.998 and status == "TRIGGERED":
+                new_status = "REVERSED"
+            # Progress through targets
+            elif t2 and ltp >= t2:
+                new_status = "AT_T2"
+            elif t1 and ltp >= t1:
+                new_status = "AT_T1"
+            elif ltp >= entry:
+                new_status = "TRIGGERED"
+            elif ltp >= entry * 0.997:
+                new_status = "APPROACHING"
+            else:
+                new_status = "WATCHING"
+        else:  # SHORT
+            if sl and ltp >= sl:
+                new_status = "HIT_SL"
+            elif orl and ltp > orl * 1.002 and status == "TRIGGERED":
+                new_status = "REVERSED"
+            elif t2 and ltp <= t2:
+                new_status = "AT_T2"
+            elif t1 and ltp <= t1:
+                new_status = "AT_T1"
+            elif ltp <= entry:
+                new_status = "TRIGGERED"
+            elif ltp <= entry * 1.003:
+                new_status = "APPROACHING"
+            else:
+                new_status = "WATCHING"
+
+        if new_status != status:
+            try:
+                db.update_intraday_signal_status(sym, new_status)
+                changes += 1
+            except Exception as _ue:
+                print(f"⚠ 6-pillar status update failed for {sym}: {_ue}")
+
+    return changes
+
+
 def quick_refresh(client: "KiteClient | None" = None) -> dict:
     """
     Fast intra-day refresh. Updates LTP + today's stats, re-ranks composite,
@@ -723,10 +837,26 @@ def quick_refresh(client: "KiteClient | None" = None) -> dict:
     except Exception:
         pass
 
+    # ── Refresh 6-pillar intraday signal statuses against live LTP ──────────
+    _6p_changes = 0
+    try:
+        ltp_map = {f"NSE:{row['tradingsymbol']}": quotes.get(f"NSE:{row['tradingsymbol']}", {}).get("last_price")
+                   for _, row in metrics.iterrows()}
+        # Build a plain {symbol: ltp} map
+        _sym_ltp = {}
+        for _, row in metrics.iterrows():
+            _q = quotes.get(f"NSE:{row['tradingsymbol']}")
+            if _q:
+                _sym_ltp[row["tradingsymbol"]] = _q.get("last_price")
+        _6p_changes = refresh_intraday_signal_statuses(_sym_ltp)
+    except Exception as _6pe:
+        print(f"⚠ 6-pillar status refresh failed: {_6pe}")
+
     return {
         "stocks_updated": updated,
         "signals_recomputed": sigs_updated,
         "total_in_cache": len(metrics),
+        "sixpillar_status_updates": _6p_changes,
         "elapsed_sec": round(time.time() - t0, 1),
     }
 
