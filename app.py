@@ -2190,8 +2190,16 @@ def _ltp_status_pill():
     _ts  = st.session_state.get("_live_ltp_ts")
     _n   = len(_ltp)
     _ws_started = _ws_manager.is_started()
+    # _is_market_open() is defined later in app.py — inline the check
+    _pill_now = datetime.now(_IST)
+    _pill_mkt_open = (
+        _pill_now.weekday() < 5
+        and _pill_now.replace(hour=9,  minute=15, second=0, microsecond=0)
+        <= _pill_now
+        <= _pill_now.replace(hour=15, minute=30, second=0, microsecond=0)
+    )
 
-    if _n == 0 and _ws_started and _is_market_open():
+    if _n == 0 and _ws_started and _pill_mkt_open:
         # WS thread is alive but hasn't delivered prices yet → still warming up
         _pill_html = (
             '<span style="display:inline-flex;align-items:center;gap:5px;'
@@ -3164,14 +3172,23 @@ with tab_screener:
         #                  No DB fallback. Blank ("—") if WS has no price yet.
         # - Market closed → DB last-session close is the correct price
         #                   (market is not trading, WS would be stale/empty anyway).
+        # Note: _is_market_open() is defined later in app.py so we inline the
+        # check here using datetime/_IST which are imported at module level.
+        _now_sc   = datetime.now(_IST)
+        _mkt_open_sc = (
+            _now_sc.weekday() < 5
+            and _now_sc.replace(hour=9,  minute=15, second=0, microsecond=0)
+            <= _now_sc
+            <= _now_sc.replace(hour=15, minute=30, second=0, microsecond=0)
+        )
         _live = st.session_state.get("_live_ltp", {})
         _fdf = _fdf.copy()
         if "tradingsymbol" in _fdf.columns:
-            if _is_market_open():
+            if _mkt_open_sc:
                 # Override ltp column entirely from WebSocket — NaN = "—" in table
                 _fdf["ltp"] = _fdf["tradingsymbol"].map(_live)
             elif _live:
-                # Market closed but WS somehow has prices — still use them, fall back to DB
+                # Market closed but WS somehow has prices — use them, fall back to DB
                 _fdf["ltp"] = _fdf["tradingsymbol"].map(_live).combine_first(_fdf["ltp"])
             # else: market closed, no WS prices → keep DB last-session close (correct)
         _dc = [c for c in _dc if c in _fdf.columns]
